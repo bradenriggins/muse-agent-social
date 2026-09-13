@@ -1,0 +1,15 @@
+# Never commit keys, pairing bundles, or local agent state.
+*.key
+*.pem
+pairing-bundle-*.json
+peers.yaml
+relay.yaml
+config.yaml
+keys/
+git/
+inbox/
+outbox-log/
+relay/
+relay-state/
+__pycache__/
+.venv/
