@@ -41,9 +41,7 @@ from muse_agent_social.crypto.rotation import (
     build_confirm,
     build_prepare,
     rotate_identity_key,
-    unwrap_cek,
     verify_identity_rotation,
-    wrap_cek,
 )
 from muse_agent_social.model.cards import create_card, verify_card
 from muse_agent_social.store.migrations import migrate
@@ -192,20 +190,10 @@ def test_full_rotation_round_trip(tmp_path):
     mi.on_ack(rid, ack, now=T0)
     assert rotation_row(ctx["conn_i"], rid, 2)["phase"] == "acknowledged"
 
-    # 3. Dual-wrap: the peer wraps to both the old and new keys.
+    # 3. Dual-wrap keys: the transport wraps to both the old and new keys.
     keys = ma.dual_wrap_keys(rid)
     assert set(keys) == {1, 2}
     assert keys[1] == ctx["pub_i"] and keys[2] == prepare["new_agreement_key"]
-    cek = os.urandom(32)
-    wraps = wrap_cek(cek, keys)
-
-    # The rotating side decrypts the new-epoch wrap with its new key.
-    new_priv = X25519PrivateKey.from_private_bytes(
-        open(keyrow(ctx["conn_i"], rid, 2)["private_key_ref"], "rb").read()
-    )
-    assert unwrap_cek(wraps, 2, new_priv) == cek
-    # ... and the old-epoch wrap with its old key.
-    assert unwrap_cek(wraps, 1, ctx["priv_i"]) == cek
     mi.note_decrypted_new_wrap(rid, 2, now=T0)
 
     # 4. Confirm.
@@ -482,29 +470,11 @@ def test_old_key_deleted_after_100_events(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# CEK wrap primitives
+# CEK wrap primitives were deleted: rotation.py no longer ships wrap_cek /
+# unwrap_cek (dead code; the transport seals via crypto.sealing). The
+# per-epoch recipient keys come from RotationManager.dual_wrap_keys,
+# covered by the handshake test above.
 # ---------------------------------------------------------------------------
-
-def test_wrap_cek_round_trip_single_epoch():
-    priv = X25519PrivateKey.generate()
-    pub = agreement_key_multibase_from_pubkey(priv.public_key().public_bytes_raw())
-    cek = os.urandom(32)
-    wraps = wrap_cek(cek, {1: pub})
-    assert set(wraps) == {"1"}
-    assert unwrap_cek(wraps, 1, priv) == cek
-
-
-def test_wrap_cek_rejects_bad_inputs():
-    priv = X25519PrivateKey.generate()
-    pub = agreement_key_multibase_from_pubkey(priv.public_key().public_bytes_raw())
-    with pytest.raises(RotationError):
-        wrap_cek(b"short", {1: pub})
-    with pytest.raises(RotationError):
-        wrap_cek(os.urandom(32), {})
-    with pytest.raises(RotationError):
-        unwrap_cek({"1": {"ephemeral_public_key": "zz", "wrapped_cek": "e30"}}, 1, priv)
-    with pytest.raises(RotationError):
-        unwrap_cek({}, 9, priv)
 
 
 # ---------------------------------------------------------------------------
