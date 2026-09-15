@@ -101,6 +101,15 @@ limits, stated explicitly:
 
 These are properties of the design, not bugs in the implementation. The release
 invariant holds regardless: no sender can cause remote execution, enable
-notifications, publish to Feed, claim a human decision, or expand a
-relationship's permissions. Received content is always inert data, and all
-relationship changes are signed, logged, visible, and reversible.
+notifications, publish to Feed, or expand a relationship's permissions.
+Received content is always inert data, and all relationship changes are
+signed, logged, visible, and reversible.
+
+One claim is deliberately narrower than it sounds. A human.responded event
+carries the sender's attestation that a human approved, and the honest sender
+CLI verifies a real local approval record before sending. The receiver can
+authenticate the peer's attestation (the envelope signature) but cannot audit
+the peer's local approval store. Against a malicious peer, a claimed human
+approval is a trust assumption, not a protocol guarantee: the projection
+records whether each claim is attested 'local' (verified against the local
+store) or 'peer' (the peer's word only).

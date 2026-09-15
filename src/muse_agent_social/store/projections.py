@@ -61,8 +61,9 @@ __all__ = [
 ]
 
 # Schema version owned by this track. The skeleton track owns version 1;
-# this migration is version 2. See INTERFACE.md for the bump contract.
-PROJECTIONS_SCHEMA_VERSION = 2
+# this migration is version 2, and the human-approval attestation column
+# is version 3. See INTERFACE.md for the bump contract.
+PROJECTIONS_SCHEMA_VERSION = 3
 
 # Seven days, in seconds, before a missing projection target expires.
 PENDING_TARGET_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -287,6 +288,26 @@ CREATE TABLE IF NOT EXISTS sequence_gaps (
 );
 """
 
+# Migration 3: human approval attestation on human_requests.
+#
+# A peer's fabricated approval_record_id must never be stored as locally
+# verified. New human.responded events are classified by
+# _human_response_attestation(); this migration backfills existing rows:
+# only rows whose approval_record_id resolves to a real local
+# human_approvals record become 'local'; everything else stays 'peer'.
+_V3_DDL = """
+-- Attestation for human.responded: 'peer' means the peer's claim (not
+-- locally verifiable); 'local' means the approval record was verified
+-- against the local human_approvals table.
+ALTER TABLE human_requests ADD COLUMN attestation TEXT NOT NULL DEFAULT 'peer'
+    CHECK(attestation IN ('local', 'peer'));
+UPDATE human_requests SET attestation = 'local'
+    WHERE approval_record_id IS NOT NULL
+    AND EXISTS (SELECT 1 FROM human_approvals
+                WHERE human_approvals.approval_id
+                    = human_requests.approval_record_id);
+"""
+
 
 class ProjectionError(Exception):
     """A projection rule rejected an event.
@@ -327,13 +348,13 @@ def _exec_ddl(conn: sqlite3.Connection, ddl: str) -> None:
 
 
 def migrate_projections(conn: sqlite3.Connection) -> int:
-    """Apply the projection-track migration (schema version 2).
+    """Apply the projection-track migrations (schema version 3).
 
     Idempotent: safe to run repeatedly. Requires the skeleton migration
-    (version 1) to be applied first. Refuses databases newer than version 2.
+    (version 1) to be applied first. Refuses databases newer than version 3.
     Must be called outside any open transaction.
 
-    Returns the schema version (2).
+    Returns the schema version (3).
     """
     current = get_user_version(conn)
     if current < 1:
@@ -348,13 +369,16 @@ def migrate_projections(conn: sqlite3.Connection) -> int:
         )
     with transaction(conn):
         _exec_ddl(conn, _V2_DDL)
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(human_requests);")]
+        if "attestation" not in cols:
+            _exec_ddl(conn, _V3_DDL)
         if current < PROJECTIONS_SCHEMA_VERSION:
             conn.execute(
                 f"PRAGMA user_version = {PROJECTIONS_SCHEMA_VERSION};"
             )
             conn.execute(
                 "INSERT OR REPLACE INTO migration_state(key, value) "
-                "VALUES ('projections_migration', '2');"
+                "VALUES ('projections_migration', '3');"
             )
     return PROJECTIONS_SCHEMA_VERSION
 
@@ -1116,6 +1140,36 @@ def _handle_human_requested(
     return mutations
 
 
+def _human_response_attestation(
+    conn: sqlite3.Connection, ev: Mapping[str, Any], payload: Mapping[str, Any]
+) -> str:
+    """Classify who vouches for a human.responded approval claim.
+
+    Returns 'peer' when the event sender is the relationship's peer: the
+    receiver can authenticate the peer's attestation (the envelope
+    signature) but cannot audit the peer's local approval store, so a
+    fabricated approval_record_id from the peer is stored as the peer's
+    claim, never as locally verified.
+
+    Returns 'local' only when the response was generated locally AND its
+    approval_record_id resolves to a real row in human_approvals. Anything
+    else (including a local send with no matching record, which the honest
+    CLI path never produces) is 'peer': not locally verifiable, so it must
+    not be presented as locally verified.
+    """
+    rel = conn.execute(
+        "SELECT peer_identity_id FROM relationships WHERE relationship_id = ?;",
+        (ev["relationship_id"],),
+    ).fetchone()
+    if rel is not None and ev["sender"] == rel["peer_identity_id"]:
+        return "peer"
+    record = conn.execute(
+        "SELECT 1 FROM human_approvals WHERE approval_id = ?;",
+        (payload.get("approval_record_id"),),
+    ).fetchone()
+    return "local" if record is not None else "peer"
+
+
 def _handle_human_responded(
     conn: sqlite3.Connection, ev: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
@@ -1131,14 +1185,15 @@ def _handle_human_responded(
         return [_add_pending(conn, ev, request_id, "human_response")]
     conn.execute(
         "UPDATE human_requests SET state = 'responded', answer = ?, approved = ?,"
-        " responded_at = ?, response_event_id = ?, approval_record_id = ?"
-        " WHERE request_id = ?;",
+        " responded_at = ?, response_event_id = ?, approval_record_id = ?,"
+        " attestation = ? WHERE request_id = ?;",
         (
             payload["answer"],
             1 if payload["approved"] else 0,
             ev["created_at"],
             ev["event_id"],
             payload["approval_record_id"],
+            _human_response_attestation(conn, ev, payload),
             request_id,
         ),
     )

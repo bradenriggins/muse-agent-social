@@ -31,8 +31,15 @@ it has not had an independent cryptographic audit.
 - Every relationship change (pairing, rotation, revocation, expiry) is signed,
   logged, visible to the local operator, and reversible through defined state
   transitions. Received content is always inert data: no sender can cause
-  remote execution, enable notifications, publish to Feed, claim a human
-  decision, or expand a relationship's permissions.
+  remote execution, enable notifications, publish to Feed, or expand a
+  relationship's permissions.
+- Human approval is a trust assumption, not a protocol guarantee. The honest
+  sender CLI verifies a real local approval record before sending
+  human.responded, and each projected claim records its attestation: 'local'
+  (verified against the local approval store) or 'peer'. The receiver can
+  authenticate the peer's attestation but cannot audit the peer's local
+  approval store, so a malicious peer's claimed human approval is
+  unverifiable.
 - Replay is rejected by nonce and per-sender sequence; tampering with the
   header, wrap, body, or signature fails closed; unknown versions, algorithms,
   and state transitions are rejected or quarantined, never guessed.

@@ -130,7 +130,7 @@ from .policy.limits import (
     add_seconds,
 )
 from .transports.base import OBJECT_MAX_BYTES
-from .store.db import open_db, utcnow
+from .store.db import open_db, transaction, utcnow
 from .store.migrations import migrate
 from .store.projections import (
     ProjectionError,
@@ -2040,8 +2040,15 @@ def _receive_object_inner(
             7 * 24 * 3600,
         ),
     )
+    # The receive commit must be one real transaction: the event row, the
+    # replay guard, the staged projection input, the projection queue row,
+    # the surface queue row, and the accepted receipt all commit or roll
+    # back together. ``with ctx.conn:`` is not enough: every connection is
+    # opened with isolation_level=None (autocommit), so the context manager
+    # commits nothing and a crash between statements used to leave the
+    # event stored but never projected or surfaced (silent loss).
     try:
-        with ctx.conn:
+        with transaction(ctx.conn):
             ctx.conn.execute(
                 "INSERT OR IGNORE INTO conversations (conversation_id) VALUES (?)",
                 (protected["conversation_id"],),
@@ -2142,7 +2149,9 @@ def _receive_object_inner(
         event_row["reply_to"] = protected.get("reply_to")
         apply_event(ctx.conn, event_row)
     except ProjectionError as exc:
-        with ctx.conn:
+        # Quarantine insert and projection-queue delete must be atomic for
+        # the same autocommit reason as the receive commit above.
+        with transaction(ctx.conn):
             quarantine_event(
                 ctx.conn, rid, peer_id, new_seq, event_id, f"projection_{exc.code}"
             )
