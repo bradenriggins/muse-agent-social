@@ -263,6 +263,7 @@ class TestGitHubTransport:
 
         class AlwaysConflictRunner(GitRunner):
             def __init__(self):
+                super().__init__()
                 self.pushes = 0
 
             def run(self, args, cwd, timeout):

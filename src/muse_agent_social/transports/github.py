@@ -102,8 +102,17 @@ from .tables import TRANSPORT_DDL as _TRANSPORT_DDL
 
 
 def ensure_transport_tables(conn: sqlite3.Connection) -> None:
-    """Create transport state tables if absent (idempotent)."""
-    conn.executescript(_TRANSPORT_DDL)
+    """Create transport state tables if absent (idempotent).
+
+    Uses plain ``execute`` calls, never ``executescript``: executescript
+    implicitly commits any pending transaction, which would break callers
+    that queue mutations inside an explicit transaction (e.g. the
+    scheduler's transactional release).
+    """
+    for statement in _TRANSPORT_DDL.split(";"):
+        statement = statement.strip()
+        if statement:
+            conn.execute(statement)
 
 
 def queue_mutation(
@@ -250,15 +259,32 @@ def check_repo_size(size_bytes: int, has_uploads: bool) -> str | None:
 class GitRunner:
     """Runs git as a subprocess. Override run() to stub git in tests."""
 
+    def __init__(self, ssh_key_path: str | Path | None = None) -> None:
+        self.ssh_key_path = Path(ssh_key_path) if ssh_key_path else None
+
+    def _ssh_env(self) -> dict[str, str]:
+        if not self.ssh_key_path:
+            return {}
+        return {
+            "GIT_SSH_COMMAND": (
+                f"ssh -i {self.ssh_key_path} -o IdentitiesOnly=yes "
+                "-o StrictHostKeyChecking=accept-new"
+            )
+        }
+
     def run(
         self, args: list[str], cwd: str | Path, timeout: int
     ) -> "subprocess.CompletedProcess[bytes]":
+        import os
+
         try:
+            env = {**os.environ, **self._ssh_env()}
             return subprocess.run(
                 ["git", *args],
                 cwd=str(cwd),
                 capture_output=True,
                 timeout=timeout,
+                env=env,
             )
         except subprocess.TimeoutExpired as exc:
             raise TransportError(
@@ -284,12 +310,23 @@ class GitHubTransport(Transport):
         branch: str = "main",
         runner: GitRunner | None = None,
         sleeper: Callable[[float], None] | None = None,
+        ssh_key_path: str | Path | None = None,
     ) -> None:
         self.state_dir = Path(state_dir).resolve()
         self.relationship_id = relationship_id
         self.repo_url = repo_url
         self.branch = branch
-        self._runner = runner or GitRunner()
+        self.ssh_key_path = Path(ssh_key_path) if ssh_key_path else None
+        # Deploy keys authenticate over SSH; convert HTTPS relay URLs to the
+        # SSH form when we have a key to use.
+        if self.ssh_key_path and self.repo_url.startswith(
+            "https://github.com/"
+        ):
+            rest = self.repo_url[len("https://github.com/") :].removesuffix(
+                ".git"
+            )
+            self.repo_url = f"git@github.com:{rest}.git"
+        self._runner = runner or GitRunner(ssh_key_path=self.ssh_key_path)
         self._sleeper = sleeper or _default_sleep
         self._conn: sqlite3.Connection | None = None
         # Test hook: called immediately before `git push` in _push_once.

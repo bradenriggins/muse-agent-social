@@ -226,6 +226,7 @@ CREATE TABLE IF NOT EXISTS relay_config (
     slots_json      TEXT,
     local_dir       TEXT,
     role            TEXT,
+    ssh_key_path    TEXT,
     created_at      TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS receive_quarantine (
@@ -249,6 +250,11 @@ def _ensure_cli_tables(conn: sqlite3.Connection) -> None:
     # Older installs predate the role column; add it idempotently.
     try:
         conn.execute("ALTER TABLE relay_config ADD COLUMN role TEXT")
+    except sqlite3.OperationalError:
+        pass
+    # Older installs predate the ssh_key_path column; add it idempotently.
+    try:
+        conn.execute("ALTER TABLE relay_config ADD COLUMN ssh_key_path TEXT")
     except sqlite3.OperationalError:
         pass
     ensure_transport_tables(conn)
@@ -441,6 +447,7 @@ def _transport_for(ctx: Ctx, relationship_id: str, direction: str):
             _transport_scope(relationship_id, direction),
             row["repo_url"],
             branch=slot,
+            ssh_key_path=row.get("ssh_key_path"),
         )
     raise CliError("no_relay_config", f"unknown relay provider {provider!r}")
 
@@ -458,11 +465,12 @@ def _save_relay_config(
     slots: Optional[dict],
     local_dir: Optional[str],
     role: Optional[str] = None,
+    ssh_key_path: Optional[str] = None,
 ) -> None:
     ctx.conn.execute(
         "INSERT OR REPLACE INTO relay_config "
         "(relationship_id, provider, repo_url, slots_json, local_dir, role,"
-        " created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        " ssh_key_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             relationship_id,
             provider,
@@ -470,6 +478,7 @@ def _save_relay_config(
             json.dumps(slots) if slots else None,
             local_dir,
             role,
+            ssh_key_path,
             utcnow(),
         ),
     )
@@ -843,13 +852,15 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
         relationship_id = commit["relationship_id"]
         deploy_keys: list = []
         repos: list = []
+        ssh_key_path: Optional[str] = None
         if provider == "github":
             repo = _parse_github_repo(relay_url)
             token = _github_token(args)
+            # Register the acceptor's (peer) public deploy key.
             try:
                 reg = register_peer_deploy_key(
                     repo,
-                    acceptance["ssh_deploy_pubkey"],
+                    acceptance["deploy_public_key"],
                     deploy_key_title(relationship_id),
                     lambda: token,
                 )
@@ -860,15 +871,42 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
                 {
                     "id": key_id,
                     "title": deploy_key_title(relationship_id),
-                    "key": acceptance["ssh_deploy_pubkey"],
+                    "key": acceptance["deploy_public_key"],
                     "role": "peer",
                 }
             )
+            # The inviter also needs git access: generate our own deploy
+            # keypair, register the public half, keep the private half.
+            from muse_agent_social.model.invites import generate_deploy_keypair
+
+            inviter_key_path = (
+                ctx.keys_dir / "pairing" / invite_id / "deploy-inviter"
+            )
+            inviter_pub = generate_deploy_keypair(str(inviter_key_path))
+            try:
+                reg_self = register_peer_deploy_key(
+                    repo,
+                    inviter_pub,
+                    deploy_key_title(relationship_id) + "-inviter",
+                    lambda: token,
+                )
+            except ProvisioningError as exc:
+                raise CliError("provisioning_error", f"{exc.code}: {exc}")
+            deploy_keys.append(
+                {
+                    "id": reg_self.get("id"),
+                    "title": deploy_key_title(relationship_id) + "-inviter",
+                    "key": inviter_pub,
+                    "role": "self",
+                }
+            )
+            ssh_key_path = str(inviter_key_path)
             repos.append({"repo": repo, "transport": "github"})
         _write_relay_json(ctx, deploy_keys, repos)
         _save_relay_config(
             ctx, relationship_id, provider, relay_url, slots, local_dir,
             role="inviter",
+            ssh_key_path=ssh_key_path,
         )
         eph_path = ctx.keys_dir / "invites" / invite_id / "ephemeral.key"
         try:
@@ -962,7 +1000,12 @@ def cmd_pair_ingest(args: argparse.Namespace) -> int:
                     repo, deploy_pub, deploy_key_title(rid), lambda: token
                 )
             except ProvisioningError as exc:
-                raise CliError("provisioning_error", f"{exc.code}: {exc}")
+                # Idempotent: the inviter registered this same key during
+                # commit, so "already in use" means the desired end state.
+                if exc.code == "key_rejected" and "already in use" in str(exc):
+                    reg = {"id": None, "title": deploy_key_title(rid)}
+                else:
+                    raise CliError("provisioning_error", f"{exc.code}: {exc}")
             deploy_keys.append(
                 {
                     "id": reg.get("id"),
@@ -976,6 +1019,7 @@ def cmd_pair_ingest(args: argparse.Namespace) -> int:
         _save_relay_config(
             ctx, rid, provider, relay_url, commit["slots"], local_dir,
             role="acceptor",
+            ssh_key_path=meta["deploy_priv_path"],
         )
         print(rid)
         print(
