@@ -119,9 +119,15 @@ from .model.invites import (
     validate_invite,
 )
 from .policy.delivery import (
+    DELIVERY_MODES,
+    EXPIRY_HANDLINGS,
     accepted_receipt_permitted,
     get_policy,
     policy_snapshot,
+    set_accepted_receipts_enabled,
+    set_expiry_policy,
+    set_policy,
+    set_seen_receipts_enabled,
     surface_action,
 )
 from .policy.limits import (
@@ -2800,6 +2806,128 @@ def cmd_inspect_policy(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Delivery policy CLI (H10)
+# ---------------------------------------------------------------------------
+
+_POLICY_SET_KEYS = (
+    "mode",
+    "seen_receipts",
+    "accepted_receipts",
+    "expiry_handling",
+    "expiry_shorten_after_seconds",
+)
+"""Keys accepted by `mas policy set`, in user-facing spelling."""
+
+_POLICY_GET_KEYS = (
+    "mode",
+    "version",
+    "seen_receipts_enabled",
+    "accepted_receipts_enabled",
+    "expiry_handling",
+    "expiry_shorten_after_seconds",
+    "updated_at",
+)
+"""Snapshot fields readable by `mas policy get`."""
+
+
+def _parse_policy_bool(raw: str) -> bool:
+    """Parse a user-supplied boolean for policy set."""
+    text = raw.strip().lower()
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off"):
+        return False
+    raise CliError(
+        "invalid_policy_value",
+        f"invalid boolean {raw!r}; use one of true/false, 1/0, yes/no, on/off",
+    )
+
+
+def cmd_policy_set(args: argparse.Namespace) -> int:
+    ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
+    try:
+        rel = ctx.resolve_relationship(args.relationship)
+        rid = rel["relationship_id"]
+        key = args.key
+        value = args.value
+        try:
+            if key == "mode":
+                set_policy(ctx.conn, rid, value)
+            elif key == "seen_receipts":
+                set_seen_receipts_enabled(
+                    ctx.conn, rid, _parse_policy_bool(value))
+            elif key == "accepted_receipts":
+                set_accepted_receipts_enabled(
+                    ctx.conn, rid, _parse_policy_bool(value))
+            elif key == "expiry_handling":
+                if value == "shorten":
+                    current = get_policy(ctx.conn, rid)
+                    window = current.expiry_shorten_after_seconds
+                    if window is None:
+                        raise CliError(
+                            "invalid_policy_value",
+                            "expiry_handling=shorten needs a window: set "
+                            "expiry_shorten_after_seconds <positive seconds> "
+                            "first",
+                        )
+                    set_expiry_policy(ctx.conn, rid, "shorten", window)
+                else:
+                    set_expiry_policy(ctx.conn, rid, value)
+            elif key == "expiry_shorten_after_seconds":
+                try:
+                    window = int(value)
+                except ValueError:
+                    raise CliError(
+                        "invalid_policy_value",
+                        "expiry_shorten_after_seconds must be a positive "
+                        f"integer of seconds, got {value!r}",
+                    )
+                # Setting the window atomically enables shorten with it;
+                # there is no chicken-and-egg with expiry_handling.
+                set_expiry_policy(ctx.conn, rid, "shorten", window)
+            else:
+                raise CliError(
+                    "unknown_policy_key",
+                    f"unknown policy key {key!r}; valid keys: "
+                    f"{', '.join(_POLICY_SET_KEYS)}",
+                )
+        except CliError:
+            raise
+        except Exception as exc:
+            raise CliError("policy_set_failed", str(exc))
+        snap = policy_snapshot(ctx.conn, rid)
+        print(_canon_text(snap))
+        return 0
+    finally:
+        ctx.close()
+
+
+def cmd_policy_get(args: argparse.Namespace) -> int:
+    ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
+    try:
+        rel = ctx.resolve_relationship(args.relationship)
+        rid = rel["relationship_id"]
+        snap = policy_snapshot(ctx.conn, rid)
+        policy = get_policy(ctx.conn, rid)
+        snap["expiry_handling"] = policy.expiry_handling
+        snap["expiry_shorten_after_seconds"] = policy.expiry_shorten_after_seconds
+        if args.key is None:
+            print(_canon_text(snap))
+            return 0
+        if args.key not in _POLICY_GET_KEYS:
+            raise CliError(
+                "unknown_policy_key",
+                f"unknown policy key {args.key!r}; valid keys: "
+                f"{', '.join(_POLICY_GET_KEYS)}",
+            )
+        value = snap[args.key]
+        print(_canon_text(value) if not isinstance(value, str) else value)
+        return 0
+    finally:
+        ctx.close()
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -2972,6 +3100,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common(p_receive)
     p_receive.set_defaults(func=cmd_receive)
+
+    p_policy = subs.add_parser(
+        "policy", help="get or set per-relationship delivery policy")
+    pol_subs = p_policy.add_subparsers(dest="policy_command", required=True)
+    p_pol_set = pol_subs.add_parser("set", help="set a delivery policy key")
+    p_pol_set.add_argument("relationship", help="relationship id")
+    p_pol_set.add_argument(
+        "key", help=f"one of: {', '.join(_POLICY_SET_KEYS)}")
+    p_pol_set.add_argument("value", help="new value for the key")
+    p_pol_set.set_defaults(func=cmd_policy_set)
+    p_pol_get = pol_subs.add_parser("get", help="read delivery policy")
+    p_pol_get.add_argument("relationship", help="relationship id")
+    p_pol_get.add_argument(
+        "key", nargs="?", default=None,
+        help=f"optional field, one of: {', '.join(_POLICY_GET_KEYS)}")
+    p_pol_get.set_defaults(func=cmd_policy_get)
 
     p_rotate = subs.add_parser("rotate", help="agreement key rotation ceremony")
     p_rotate.add_argument("--relationship", required=True)
