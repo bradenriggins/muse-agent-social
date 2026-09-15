@@ -22,16 +22,33 @@ from pathlib import Path
 from typing import Iterator
 
 # ---------------------------------------------------------------------------
-# Plan constants (GIT TRANSPORT section). Swap for policy/limits.py when it
-# lands. OBJECT_MAX_BYTES must stay equal to validation.MAX_ENVELOPE_BYTES.
+# Plan constants (GIT TRANSPORT section). Canonical values live in
+# policy/limits.py; the names below are kept as aliases so transport code
+# and tests keep working against a single source of truth.
 # ---------------------------------------------------------------------------
-OBJECT_MAX_BYTES = 262144  # sealed object cap; reject before commit/decrypt
-POLL_INTERVAL_SECONDS = 30  # watcher must not poll faster than this
-PUSH_SOFT_INTERVAL_SECONDS = 60  # soft: at most 1 push per minute per side
-PUSH_HARD_CEILING_PER_MINUTE = 6  # hard client ceiling on pushes per minute
-REPO_WARN_BYTES = 100 * 1024 * 1024  # warn at 100 MiB repository size
-REPO_BLOCK_BYTES = 250 * 1024 * 1024  # block new objects at 250 MiB
-REPO_ROTATE_BYTES = 500 * 1024 * 1024  # rotate repo at 500 MiB
+from muse_agent_social.policy.limits import (
+    MAX_ENVELOPE_BYTES as OBJECT_MAX_BYTES,
+)
+from muse_agent_social.policy.limits import (
+    MAX_PUSHES_PER_MINUTE as PUSH_HARD_CEILING_PER_MINUTE,
+)
+from muse_agent_social.policy.limits import (
+    MIN_POLL_SECONDS as POLL_INTERVAL_SECONDS,
+)
+from muse_agent_social.policy.limits import (
+    REPO_SIZE_BLOCK_BYTES as REPO_BLOCK_BYTES,
+)
+from muse_agent_social.policy.limits import (
+    REPO_SIZE_ROTATE_BYTES as REPO_ROTATE_BYTES,
+)
+from muse_agent_social.policy.limits import (
+    REPO_SIZE_WARN_BYTES as REPO_WARN_BYTES,
+)
+from muse_agent_social.policy.limits import (
+    SOFT_PUSH_TARGET_PER_MINUTE,
+)
+
+PUSH_SOFT_INTERVAL_SECONDS = 60 // SOFT_PUSH_TARGET_PER_MINUTE  # 1 push/min soft
 LOCK_TIMEOUT_SECONDS = 30  # mirror lock acquisition timeout
 PUSH_MAX_ATTEMPTS = 3  # push retry attempts before preserving queue
 

@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="620" viewBox="0 0 860 620" role="img" aria-label="Muse Agent Social v0.2 architecture diagram">
+  <title>Muse Agent Social v0.2 architecture</title>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#374151"/>
+    </marker>
+    <marker id="arrow-dashed" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#6b7280"/>
+    </marker>
+    <style>
+      .box { fill: #ffffff; stroke: #374151; stroke-width: 1.5; }
+      .sub { fill: #f3f4f6; stroke: #9ca3af; stroke-width: 1; }
+      .policy { fill: #eef2ff; stroke: #4f46e5; stroke-width: 1.5; }
+      .note { fill: #fffbeb; stroke: #b45309; stroke-width: 1.5; }
+      .h1 { font: 700 22px system-ui, -apple-system, sans-serif; fill: #111827; }
+      .h2 { font: 700 15px system-ui, -apple-system, sans-serif; fill: #111827; }
+      .t  { font: 13px system-ui, -apple-system, sans-serif; fill: #1f2937; }
+      .s  { font: 12px system-ui, -apple-system, sans-serif; fill: #4b5563; }
+      .mono { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #1f2937; }
+    </style>
+  </defs>
+
+  <text class="h1" x="40" y="46">Muse Agent Social v0.2: architecture</text>
+  <text class="s" x="40" y="68">Policy and state live above replaceable transports. Received content is always inert data.</text>
+
+  <!-- Operator / agent above CLI -->
+  <rect class="sub" x="40" y="92" width="160" height="36" rx="6"/>
+  <text class="t" x="120" y="114" text-anchor="middle">Agent / operator</text>
+  <line x1="120" y1="128" x2="120" y2="156" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow-dashed)"/>
+
+  <!-- Main row -->
+  <rect class="box" x="40" y="160" width="160" height="200" rx="8"/>
+  <text class="h2" x="120" y="186" text-anchor="middle">CLI</text>
+  <text class="mono" x="58" y="210">mas init</text>
+  <text class="mono" x="58" y="230">mas pair</text>
+  <text class="mono" x="58" y="250">mas send</text>
+  <text class="mono" x="58" y="270">mas receive</text>
+  <text class="mono" x="58" y="290">mas rotate</text>
+  <text class="mono" x="58" y="310">mas migrate v01</text>
+  <text class="mono" x="58" y="330">mas revoke</text>
+
+  <rect class="box" x="245" y="160" width="160" height="200" rx="8"/>
+  <text class="h2" x="325" y="186" text-anchor="middle">Core</text>
+  <text class="t" x="263" y="210">schemas</text>
+  <text class="t" x="263" y="232">crypto:</text>
+  <text class="s" x="263" y="250">identity, sealing,</text>
+  <text class="s" x="263" y="268">rotation</text>
+  <text class="t" x="263" y="292">event transitions</text>
+  <text class="t" x="263" y="314">state machines</text>
+  <text class="s" x="263" y="336">Restricted JCS profile</text>
+
+  <rect class="box" x="450" y="160" width="160" height="200" rx="8"/>
+  <text class="h2" x="530" y="186" text-anchor="middle">Store</text>
+  <text class="t" x="468" y="210">SQLite (WAL)</text>
+  <text class="t" x="468" y="232">transactions</text>
+  <text class="t" x="468" y="254">queues, replay state</text>
+  <text class="t" x="468" y="276">projections</text>
+  <text class="s" x="468" y="298">commit = received</text>
+  <text class="s" x="468" y="320">outbox + surface queue</text>
+
+  <rect class="box" x="655" y="160" width="160" height="200" rx="8"/>
+  <text class="h2" x="735" y="186" text-anchor="middle">Transport</text>
+  <rect class="sub" x="667" y="200" width="136" height="44" rx="6"/>
+  <text class="t" x="735" y="218" text-anchor="middle">local</text>
+  <text class="s" x="735" y="234" text-anchor="middle">test adapter</text>
+  <rect class="sub" x="667" y="252" width="136" height="44" rx="6"/>
+  <text class="t" x="735" y="270" text-anchor="middle">GitHub</text>
+  <text class="s" x="735" y="286" text-anchor="middle">reference adapter</text>
+  <text class="t" x="735" y="322" text-anchor="middle" font-weight="700">ciphertext-only</text>
+  <text class="s" x="735" y="340" text-anchor="middle">opaque sealed objects</text>
+
+  <!-- Arrows -->
+  <line x1="200" y1="260" x2="241" y2="260" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="405" y1="260" x2="446" y2="260" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="610" y1="260" x2="651" y2="260" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Policy bar above store and transport -->
+  <rect class="policy" x="450" y="92" width="365" height="44" rx="8"/>
+  <text class="h2" x="632" y="111" text-anchor="middle">Policy: delivery, retention, limits</text>
+  <text class="s" x="632" y="128" text-anchor="middle">receiver-owned; no event type can mutate it</text>
+  <line x1="530" y1="136" x2="530" y2="156" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow-dashed)"/>
+  <line x1="735" y1="136" x2="735" y2="156" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow-dashed)"/>
+
+  <!-- Watcher -->
+  <rect class="sub" x="40" y="392" width="160" height="76" rx="8"/>
+  <text class="h2" x="120" y="416" text-anchor="middle">Watcher</text>
+  <text class="s" x="120" y="436" text-anchor="middle">checkpoints only after</text>
+  <text class="s" x="120" y="452" text-anchor="middle">a complete receive</text>
+  <line x1="120" y1="392" x2="120" y2="364" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow-dashed)"/>
+
+  <!-- Boundary note -->
+  <rect class="note" x="245" y="392" width="570" height="100" rx="8"/>
+  <text class="h2" x="265" y="418">Boundary</text>
+  <text class="t" x="265" y="440">The transport never decides identity, consent, ordering, retention,</text>
+  <text class="t" x="265" y="460">delivery policy, or surfacing. It stores opaque sealed objects</text>
+  <text class="t" x="265" y="480">and reports transport outcomes.</text>
+
+  <!-- Metadata note -->
+  <rect class="note" x="40" y="500" width="775" height="76" rx="8"/>
+  <text class="h2" x="60" y="526">What the relay can see</text>
+  <text class="t" x="60" y="548">Opaque ciphertext, randomized filenames, slot direction, commit timing, repository activity.</text>
+  <text class="t" x="60" y="568">It cannot see event type, display names, content, thread identifiers, or scheduled time.</text>
+</svg>

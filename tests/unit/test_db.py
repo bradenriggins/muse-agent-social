@@ -159,10 +159,10 @@ def test_migration_idempotent(tmp_path):
     seed_relationship(conn)
     insert_event(conn)
     first = migrations.migrate(conn)
-    assert first == migrations.SCHEMA_VERSION == 1
+    assert first == migrations.SCHEMA_VERSION
     second = migrations.migrate(conn)
-    assert second == 1
-    assert db.get_user_version(conn) == 1
+    assert second == migrations.SCHEMA_VERSION
+    assert db.get_user_version(conn) == migrations.SCHEMA_VERSION
     # Rows survive the no-op second run.
     row = conn.execute(
         "SELECT event_id FROM events WHERE event_id = 'evt-1'"
