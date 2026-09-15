@@ -121,6 +121,7 @@ from .policy.delivery import (
     accepted_receipt_permitted,
     get_policy,
     policy_snapshot,
+    should_send_seen_receipt,
     surface_action,
 )
 from .policy.limits import (
@@ -1130,6 +1131,24 @@ def _build_payload(ctx: "Ctx", args: argparse.Namespace) -> dict:
     elif t == "receipt.seen":
         if not args.target:
             raise CliError("bad_args", "receipt.seen needs --target")
+        # The policy gate is live on the send path: seen receipts are
+        # opt-in per relationship (receiver-owned policy, default off).
+        # Invoking this command is the operator's human-visible assertion
+        # that the target event was seen; the remaining branches (policy
+        # enabled, event committed locally) are enforced here.
+        relationship_id = getattr(args, "_relationship_id", None)
+        if not should_send_seen_receipt(
+            ctx.conn,
+            relationship_id,
+            args.target,
+            human_visible_view_opened=True,
+        ):
+            raise CliError(
+                "seen_receipt_not_permitted",
+                "receipt.seen refused by delivery policy: enable seen "
+                "receipts for this relationship and target a locally "
+                "committed event",
+            )
         payload = {
             "target_event_id": args.target,
             "seen_at": args.seen_at or _iso_now(),
