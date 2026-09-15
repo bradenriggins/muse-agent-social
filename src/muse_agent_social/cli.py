@@ -1506,7 +1506,7 @@ def _send_event(
     the event was released to the transport immediately, object_name.
     """
     rid = rel["relationship_id"]
-    manager = RotationManager(ctx.conn, ctx.state_dir)
+    manager = RotationManager(ctx.conn, ctx.keys_dir)
     try:
         manager.may_send(rid)
     except RotationError as exc:
@@ -2107,7 +2107,7 @@ def _receive_object_inner(
         raise CliError("clock_future", "event created_at is too far in the future")
     if created < add_seconds(now, -ACCEPT_WINDOW_DAYS * 24 * 3600):
         raise CliError("expired_window", "event is older than the 7-day window")
-    manager = RotationManager(ctx.conn, ctx.state_dir)
+    manager = RotationManager(ctx.conn, ctx.keys_dir)
     try:
         manager.on_data_event_epoch(rid, int(protected["key_epoch"]))
     except RotationError as exc:
@@ -2391,7 +2391,7 @@ def cmd_rotate(args: argparse.Namespace) -> int:
     try:
         rel = ctx.resolve_relationship(args.relationship)
         rid = rel["relationship_id"]
-        manager = RotationManager(ctx.conn, ctx.state_dir)
+        manager = RotationManager(ctx.conn, ctx.keys_dir)
         action = (
             "prepare"
             if args.prepare
