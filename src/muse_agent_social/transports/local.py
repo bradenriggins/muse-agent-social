@@ -45,6 +45,25 @@ def _atomic_write(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+def check_object_size(object_name: str, size_bytes: int) -> int:
+    """Pre-read size gate: reject over-cap objects before buffering.
+
+    Takes the size from metadata (stat() / git cat-file -s) so callers can
+    enforce OBJECT_MAX_BYTES without ever reading the object content: a
+    hostile multi-GB blob must never be buffered into memory. Raises
+    TransportError('object_too_large') (non-retryable) when *size_bytes*
+    exceeds OBJECT_MAX_BYTES; returns *size_bytes* otherwise.
+    """
+    if size_bytes > OBJECT_MAX_BYTES:
+        raise TransportError(
+            "object_too_large",
+            f"object {object_name} is {size_bytes} bytes; "
+            f"limit is {OBJECT_MAX_BYTES}",
+            retryable=False,
+        )
+    return size_bytes
+
+
 class LocalTransport(Transport):
     """Filesystem transport. Two agents (or tests) share a directory."""
 
@@ -77,8 +96,32 @@ class LocalTransport(Transport):
             return []
         items: list[tuple[str, bytes]] = []
         for path in sorted(self.incoming.glob("*.json")):
+            # Size pre-check from stat() metadata BEFORE read_bytes(): an
+            # over-cap object is never buffered into memory. The receive
+            # loop (watcher.run_once) enforces the cap itself via len(data)
+            # and quarantines oversized input without failing the run, so
+            # an over-cap object is returned with a bounded placeholder
+            # that still trips that check instead of its full content.
+            try:
+                check_object_size(path.name, path.stat().st_size)
+            except TransportError as exc:
+                if exc.code != "object_too_large":
+                    raise
+                items.append((path.name, b"\x00" * (OBJECT_MAX_BYTES + 1)))
+                continue
             items.append((path.name, path.read_bytes()))
         return items
+
+    def read_object(self, object_name: str) -> bytes:
+        """Read a single object, checking size from metadata first.
+
+        Raises non-retryable TransportError('object_too_large') without
+        buffering when the object exceeds OBJECT_MAX_BYTES.
+        """
+        check_object_name(object_name)
+        path = self.incoming / object_name
+        check_object_size(object_name, path.stat().st_size)
+        return path.read_bytes()
 
     def upload(self, object_name: str, data: bytes) -> None:
         check_object_name(object_name)

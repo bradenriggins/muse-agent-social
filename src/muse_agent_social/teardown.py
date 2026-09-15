@@ -79,6 +79,26 @@ _OPERATIONAL_DIRS = (
 )
 
 
+def _relationship_fs_paths(state_dir: Path, relationship_id: str) -> list[Path]:
+    """Every on-disk path owned by one relationship (authoritative list).
+
+    Audited against every writer under the state dir:
+      transports/github.py  mirrors/<rid>/      git working clone
+      transports/base.py    locks/<rid>.lock    mirror flock
+      watcher.py            watcher/<rid>.json  watcher resume state
+
+    These are per-relationship, so only this relationship's subtree is
+    wiped (never the whole mirrors/ or locks/ dir, which other
+    relationships still use). Whole operational dirs (inbox, outbox, ...)
+    are covered separately by _OPERATIONAL_DIRS.
+    """
+    return [
+        state_dir / "mirrors" / relationship_id,
+        state_dir / "locks" / f"{relationship_id}.lock",
+        state_dir / "watcher" / f"{relationship_id}.json",
+    ]
+
+
 class TeardownError(Exception):
     """Teardown was refused or failed partway."""
 
@@ -185,7 +205,11 @@ def _discover_deploy_keys(state_dir: Path) -> tuple[list[DeployKeyRef], list[Rel
                 DeployKeyRef(
                     repo=str(entry.get("repo", "")),
                     label=str(entry.get("label", "")),
-                    key_id=str(entry.get("key_id", "")),
+                    # relay.json writers have used both "key_id" and "id"
+                    # for the GitHub key id; accept either.
+                    key_id=str(
+                        entry.get("key_id") or entry.get("id") or ""
+                    ),
                 )
             )
         for entry in data.get("repos", []) or []:
@@ -391,7 +415,15 @@ def teardown_relationship(
                 )
             # Projection tables: rows keyed by event, conversation, or
             # relationship. No foreign keys, but they are relationship
-            # traces and must not survive teardown.
+            # traces and must not survive teardown. Tables that were never
+            # created (e.g. deploy_key_registry on a store that never ran
+            # the pairing ceremony) are skipped.
+            existing_tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
             placeholders = ",".join("?" for _ in event_ids) or "NULL"
             conn.execute(
                 "DELETE FROM message_revisions "
@@ -427,7 +459,10 @@ def teardown_relationship(
                 "rotation_quarantine",
                 "transport_mutations",
                 "transport_push_log",
+                "deploy_key_registry",
             ):
+                if table not in existing_tables:
+                    continue
                 conn.execute(
                     f"DELETE FROM {table} WHERE relationship_id = ?",
                     (relationship_id,),
@@ -486,6 +521,12 @@ def teardown_relationship(
     if not dry_run:
         for dirname in _OPERATIONAL_DIRS:
             _wipe_tree(state_dir / dirname, report, dry_run)
+        # Per-relationship transport and watcher state (authoritative list
+        # from _relationship_fs_paths): the git mirror, the mirror lock,
+        # and watcher resume state. Wiping these is what lets the postcheck
+        # below pass after the keys were destroyed in step 3.
+        for path in _relationship_fs_paths(state_dir, relationship_id):
+            _wipe_tree(path, report, dry_run)
         # Any stray file or dir named with the relationship id.
         for p in list(state_dir.iterdir()):
             if relationship_id in p.name and p.name != "tombstones":

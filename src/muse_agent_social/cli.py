@@ -28,9 +28,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
+import hashlib
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import sys
 import urllib.error
@@ -41,6 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
@@ -139,7 +143,12 @@ from .store.projections import (
     quarantine_event,
     record_projection_input,
 )
-from .teardown import TeardownError, teardown_relationship
+from .teardown import (
+    DeployKeyRef,
+    RelayRef,
+    TeardownError,
+    teardown_relationship,
+)
 from .transports.base import TransportError
 from .transports.github import (
     GitHubTransport,
@@ -662,17 +671,21 @@ def cmd_pair_accept(args: argparse.Namespace) -> int:
                 "re-run with --i-compared-phrase after comparing the phrase",
             )
         pair_dir = ctx.keys_dir / "pairing" / invite["invite_id"]
+        # Generate key material in memory first. create_acceptance() runs
+        # all validation (signature, expiry, one-use ledger) and must
+        # succeed before anything is written to disk; otherwise a rejected
+        # acceptance would leave orphaned private key files.
         rel_priv, rel_pub_mb = generate_relationship_keypair()
-        store_private_key(
-            pair_dir / "relationship.key",
-            rel_priv.private_bytes(
-                serialization.Encoding.Raw,
-                serialization.PrivateFormat.Raw,
-                serialization.NoEncryption(),
-            ),
+        rel_priv_bytes = rel_priv.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
         )
-        deploy_pub = generate_deploy_keypair(pair_dir / "deploy")
-        (pair_dir / "deploy.pub").write_text(deploy_pub + "\n", encoding="utf-8")
+        deploy_priv = Ed25519PrivateKey.generate()
+        deploy_pub = deploy_priv.public_key().public_bytes(
+            serialization.Encoding.OpenSSH,
+            serialization.PublicFormat.OpenSSH,
+        ).decode("ascii").strip()
         try:
             acceptance = create_acceptance(
                 ctx.conn,
@@ -684,16 +697,42 @@ def cmd_pair_accept(args: argparse.Namespace) -> int:
             )
         except PairingError as exc:
             raise CliError("pairing_error", f"{exc.code}: {exc}")
-        meta = {
-            "invite_id": invite["invite_id"],
-            "relationship_pubkey": rel_pub_mb,
-            "relationship_key_path": str(pair_dir / "relationship.key"),
-            "deploy_pub_path": str(pair_dir / "deploy.pub"),
-            "deploy_priv_path": str(pair_dir / "deploy"),
-        }
-        (pair_dir / "pairing.json").write_text(
-            json.dumps(meta, indent=2) + "\n", encoding="utf-8"
-        )
+        try:
+            store_private_key(pair_dir / "relationship.key", rel_priv_bytes)
+            store_private_key(
+                pair_dir / "deploy",
+                deploy_priv.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.OpenSSH,
+                    serialization.NoEncryption(),
+                ),
+            )
+            (pair_dir / "deploy.pub").write_text(
+                deploy_pub + "\n", encoding="utf-8"
+            )
+            meta = {
+                "invite_id": invite["invite_id"],
+                "relationship_pubkey": rel_pub_mb,
+                "relationship_key_path": str(pair_dir / "relationship.key"),
+                "deploy_pub_path": str(pair_dir / "deploy.pub"),
+                "deploy_priv_path": str(pair_dir / "deploy"),
+            }
+            (pair_dir / "pairing.json").write_text(
+                json.dumps(meta, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            # Persistence failed after the acceptance was recorded: remove
+            # the half-written pair directory and the acceptance row so a
+            # retry starts clean.
+            shutil.rmtree(pair_dir, ignore_errors=True)
+            with ctx.conn:
+                ctx.conn.execute(
+                    "DELETE FROM pairing_acceptances WHERE invite_id = ?",
+                    (invite["invite_id"],),
+                )
+            raise CliError(
+                "key_write_failed", f"cannot persist pairing keys: {exc}"
+            )
         out = _canon_text(acceptance) + "\n"
         if args.out:
             Path(args.out).write_text(out, encoding="utf-8")
@@ -771,6 +810,65 @@ def _write_relay_json(ctx: Ctx, deploy_keys: list, repos: list) -> None:
     )
 
 
+def _github_delete_deploy_key(repo: str, key_id, token: str) -> None:
+    """DELETE a GitHub deploy key. Used to roll back a partially completed
+    pair commit. A 404 is success (already gone: the desired end state).
+    Raises ProvisioningError for other API failures."""
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/keys/{key_id}",
+        method="DELETE",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "mas-cli/0.2",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30):
+            return
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return
+        raise ProvisioningError("api_error", f"GitHub API {exc.code}") from exc
+
+
+def _github_list_deploy_keys(repo: str, token: str) -> list:
+    """GET the repo's existing deploy keys. Raises ProvisioningError on API
+    failure."""
+    req = urllib.request.Request(
+        "https://api.github.com/repos/" + repo + "/keys",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "mas-cli/0.2",
+        },
+    )
+    req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise ProvisioningError("api_error", f"GitHub API {exc.code}") from exc
+    if not isinstance(payload, list):
+        raise ProvisioningError(
+            "api_error", "unexpected deploy key list response from GitHub"
+        )
+    return payload
+
+
+def _ssh_key_fingerprint(openssh_pub: str) -> str:
+    """SHA256 fingerprint of an OpenSSH public key, in GitHub's
+    ``SHA256:<base64>`` form (unpadded). Returns "" for unparseable input."""
+    try:
+        parts = (openssh_pub or "").split()
+        if len(parts) < 2:
+            return ""
+        raw = base64.b64decode(parts[1])
+        digest = hashlib.sha256(raw).digest()
+        return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+    except (ValueError, TypeError, binascii.Error):
+        return ""
+
+
 def cmd_pair_commit(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
@@ -837,6 +935,51 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
             # signed commit's repository_url is informational for local mode
             # (the real pointer is --local-relay-dir on both sides).
             commit_relay_url = "https://local.invalid/relay"
+        # Provision BEFORE committing: the deploy-key titles need the
+        # relationship id, so it is minted here and handed to commit_pairing.
+        # On any provisioning or local-commit failure, keys already
+        # registered are deleted, the locally generated private key is
+        # removed, and no relationship row is committed, so the invite can
+        # be retried cleanly.
+        relationship_id = None
+        inviter_key_path = None
+        if provider == "github":
+            repo = _parse_github_repo(relay_url)
+            token = _github_token(args)
+            relationship_id = str(uuid.uuid4())
+            key_title = deploy_key_title(relationship_id)
+            # The inviter also needs git access: generate our own deploy
+            # keypair, register the public half, keep the private half.
+            from muse_agent_social.model.invites import generate_deploy_keypair
+
+            inviter_key_path = (
+                ctx.keys_dir / "pairing" / invite_id / "deploy-inviter"
+            )
+            inviter_pub = generate_deploy_keypair(str(inviter_key_path))
+            peer_pub = acceptance["deploy_public_key"]
+            registered: list = []
+            try:
+                # Register the acceptor's (peer) public deploy key.
+                reg = register_peer_deploy_key(
+                    repo, peer_pub, key_title, lambda: token
+                )
+                registered.append(reg.get("id"))
+                reg_self = register_peer_deploy_key(
+                    repo, inviter_pub, key_title, lambda: token
+                )
+                registered.append(reg_self.get("id"))
+            except ProvisioningError as exc:
+                for key_id in registered:
+                    if key_id:
+                        try:
+                            _github_delete_deploy_key(repo, key_id, token)
+                        except ProvisioningError:
+                            pass
+                try:
+                    inviter_key_path.unlink()
+                except OSError:
+                    pass
+                raise CliError("provisioning_error", f"{exc.code}: {exc}")
         try:
             commit = commit_pairing(
                 ctx.conn,
@@ -846,56 +989,38 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
                 slots,
                 negotiated,
                 keys_dir=ctx.keys_dir,
+                relationship_id=relationship_id,
             )
         except PairingError as exc:
+            if provider == "github":
+                for key_id in registered:
+                    if key_id:
+                        try:
+                            _github_delete_deploy_key(repo, key_id, token)
+                        except ProvisioningError:
+                            pass
+                try:
+                    inviter_key_path.unlink()
+                except OSError:
+                    pass
             raise CliError("pairing_error", f"{exc.code}: {exc}")
         relationship_id = commit["relationship_id"]
         deploy_keys: list = []
         repos: list = []
         ssh_key_path: Optional[str] = None
         if provider == "github":
-            repo = _parse_github_repo(relay_url)
-            token = _github_token(args)
-            # Register the acceptor's (peer) public deploy key.
-            try:
-                reg = register_peer_deploy_key(
-                    repo,
-                    acceptance["deploy_public_key"],
-                    deploy_key_title(relationship_id),
-                    lambda: token,
-                )
-            except ProvisioningError as exc:
-                raise CliError("provisioning_error", f"{exc.code}: {exc}")
-            key_id = reg.get("id")
             deploy_keys.append(
                 {
-                    "id": key_id,
-                    "title": deploy_key_title(relationship_id),
-                    "key": acceptance["deploy_public_key"],
+                    "id": registered[0],
+                    "title": key_title,
+                    "key": peer_pub,
                     "role": "peer",
                 }
             )
-            # The inviter also needs git access: generate our own deploy
-            # keypair, register the public half, keep the private half.
-            from muse_agent_social.model.invites import generate_deploy_keypair
-
-            inviter_key_path = (
-                ctx.keys_dir / "pairing" / invite_id / "deploy-inviter"
-            )
-            inviter_pub = generate_deploy_keypair(str(inviter_key_path))
-            try:
-                reg_self = register_peer_deploy_key(
-                    repo,
-                    inviter_pub,
-                    deploy_key_title(relationship_id),
-                    lambda: token,
-                )
-            except ProvisioningError as exc:
-                raise CliError("provisioning_error", f"{exc.code}: {exc}")
             deploy_keys.append(
                 {
-                    "id": reg_self.get("id"),
-                    "title": deploy_key_title(relationship_id),
+                    "id": registered[1],
+                    "title": key_title,
                     "key": inviter_pub,
                     "role": "self",
                 }
@@ -1000,10 +1125,36 @@ def cmd_pair_ingest(args: argparse.Namespace) -> int:
                     repo, deploy_pub, deploy_key_title(rid), lambda: token
                 )
             except ProvisioningError as exc:
-                # Idempotent: the inviter registered this same key during
-                # commit, so "already in use" means the desired end state.
+                # Idempotent only when the SAME key is already registered:
+                # fetch the repo's existing deploy keys and compare the
+                # attempted key's SHA256 fingerprint. A different key in use
+                # (or any other rejection) fails loudly instead of being
+                # swallowed as success.
                 if exc.code == "key_rejected" and "already in use" in str(exc):
-                    reg = {"id": None, "title": deploy_key_title(rid)}
+                    existing = _github_list_deploy_keys(repo, token)
+                    want_fp = _ssh_key_fingerprint(deploy_pub)
+                    match = next(
+                        (
+                            entry
+                            for entry in existing
+                            if isinstance(entry, dict)
+                            and _ssh_key_fingerprint(entry.get("key", ""))
+                            == want_fp
+                        ),
+                        None,
+                    )
+                    if match is None:
+                        raise CliError(
+                            "provisioning_error",
+                            "GitHub reports the deploy key is already in use "
+                            "but no existing deploy key matches its "
+                            "fingerprint; refusing to treat this as success",
+                        )
+                    reg = {
+                        "id": match.get("id"),
+                        "title": match.get("title")
+                        or deploy_key_title(rid),
+                    }
                 else:
                     raise CliError("provisioning_error", f"{exc.code}: {exc}")
             deploy_keys.append(
@@ -1420,7 +1571,7 @@ def _send_event(
     the event was released to the transport immediately, object_name.
     """
     rid = rel["relationship_id"]
-    manager = RotationManager(ctx.conn, ctx.state_dir)
+    manager = RotationManager(ctx.conn, ctx.keys_dir)
     try:
         manager.may_send(rid)
     except RotationError as exc:
@@ -2021,7 +2172,7 @@ def _receive_object_inner(
         raise CliError("clock_future", "event created_at is too far in the future")
     if created < add_seconds(now, -ACCEPT_WINDOW_DAYS * 24 * 3600):
         raise CliError("expired_window", "event is older than the 7-day window")
-    manager = RotationManager(ctx.conn, ctx.state_dir)
+    manager = RotationManager(ctx.conn, ctx.keys_dir)
     try:
         manager.on_data_event_epoch(rid, int(protected["key_epoch"]))
     except RotationError as exc:
@@ -2314,7 +2465,7 @@ def cmd_rotate(args: argparse.Namespace) -> int:
     try:
         rel = ctx.resolve_relationship(args.relationship)
         rid = rel["relationship_id"]
-        manager = RotationManager(ctx.conn, ctx.state_dir)
+        manager = RotationManager(ctx.conn, ctx.keys_dir)
         action = (
             "prepare"
             if args.prepare
@@ -2543,22 +2694,31 @@ class _RevokeHooks:
                 return "not_found"
             raise ProvisioningError("api_error", f"GitHub API {exc.code} on {path}")
 
-    def revoke_deploy_key(self, key_id):
+    def revoke_deploy_key(self, ref: DeployKeyRef):
         try:
-            repos = self.discover_repos()
-            if not repos:
+            repo = ref.repo
+            if not repo:
+                repos = self.discover_repos()
+                first = repos[0] if repos else None
+                repo = (
+                    first.get("repo")
+                    if isinstance(first, dict)
+                    else first
+                )
+            if not repo:
                 return "manual: no relay repo recorded"
-            repo = repos[0].get("repo")
-            status = self._api("DELETE", f"/repos/{repo}/keys/{key_id}")
+            if not ref.key_id:
+                return "manual: no deploy key id recorded"
+            status = self._api("DELETE", f"/repos/{repo}/keys/{ref.key_id}")
             return "revoked" if status in (204, "not_found") else f"manual: HTTP {status}"
         except ProvisioningError as exc:
             return f"manual: {exc}"
 
-    def delete_relay_repo(self, repo):
+    def delete_relay_repo(self, ref: RelayRef):
         if not self.delete_remote:
             return "manual: pass --delete-remote to delete the relay repository"
         try:
-            status = self._api("DELETE", f"/repos/{repo}")
+            status = self._api("DELETE", f"/repos/{ref.repo}")
             return "deleted" if status in (204, "not_found") else f"manual: HTTP {status}"
         except ProvisioningError as exc:
             return f"manual: {exc}"
@@ -2567,19 +2727,52 @@ class _RevokeHooks:
 def cmd_revoke(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
-        rel = ctx.resolve_relationship(args.relationship)
+        # Revoke resolves the EXACT relationship id only: no prefix
+        # matching, no peer-label fallback. A typo must fail loudly,
+        # never destroy the wrong relationship.
+        try:
+            rel = get_relationship(ctx.conn, args.relationship)
+        except PairingError:
+            raise CliError(
+                "unknown_relationship",
+                f"no relationship with id {args.relationship!r}; "
+                "revoke needs the exact relationship id",
+            )
         rid = rel["relationship_id"]
         peer_label = rel["peer_identity_id"][:24]
+        if not args.yes:
+            print(
+                f"About to REVOKE relationship {rid} (peer {peer_label}...). "
+                "This destroys private keys, relay state, and local history, "
+                "and cannot be undone.",
+                file=sys.stderr,
+            )
+            try:
+                answer = input(
+                    "Type the full relationship id to confirm, "
+                    "or anything else to abort: "
+                ).strip()
+            except EOFError:
+                answer = ""
+            if answer != rid:
+                raise CliError(
+                    "revoke_aborted", "revoke aborted: no changes made"
+                )
         token = args.token or os.environ.get("MAS_GITHUB_TOKEN")
         hooks = _RevokeHooks(ctx.state_dir, token, bool(args.delete_remote))
         # The release teardown does not know about event_payloads (written by
         # the receive/send projection staging); clear them first so the
-        # events DELETE does not hit the foreign key.
+        # events DELETE does not hit the foreign key. relay_config is
+        # deleted before teardown too: the postcheck scans for the raw
+        # relationship id, and this row carries it.
         with ctx.conn:
             ctx.conn.execute(
                 "DELETE FROM event_payloads WHERE event_id IN "
                 "(SELECT event_id FROM events WHERE relationship_id = ?)",
                 (rid,),
+            )
+            ctx.conn.execute(
+                "DELETE FROM relay_config WHERE relationship_id = ?", (rid,)
             )
         try:
             report = teardown_relationship(
@@ -2592,18 +2785,21 @@ def cmd_revoke(args: argparse.Namespace) -> int:
             )
         except TeardownError as exc:
             raise CliError("teardown_error", f"{exc.code}: {exc}")
-        ctx.conn.execute(
-            "DELETE FROM relay_config WHERE relationship_id = ?", (rid,)
-        )
         ctx.conn.commit()
         summary = {
             "relationship_id_sha256": report.relationship_id_sha256,
             "revoked_at": report.revoked_at,
             "reason_code": report.reason_code,
-            "cleanup": report.cleanup,
-            "key_deletion": report.key_deletion,
+            "keys_destroyed": report.keys_destroyed,
+            "deploy_keys_revoked": report.deploy_keys_revoked,
+            "relay_repos_deleted": report.relay_repos_deleted,
+            "files_deleted": report.files_deleted,
+            "dirs_removed": report.dirs_removed,
             "tombstone_path": report.tombstone_path,
-            "postcheck": report.postcheck,
+            "postcheck_scanned": report.postcheck_scanned,
+            "postcheck_hits": report.postcheck_hits,
+            "crypto_erasure_before_bulk": report.crypto_erasure_before_bulk,
+            "dry_run": report.dry_run,
         }
         print(_canon_text(summary))
         return 0
@@ -2910,6 +3106,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_revoke.add_argument("--reason", default=None)
     p_revoke.add_argument("--token", default=None)
     p_revoke.add_argument("--delete-remote", action="store_true")
+    p_revoke.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the interactive confirmation prompt (for automation)",
+    )
     p_revoke.set_defaults(func=cmd_revoke)
 
     p_inspect = subs.add_parser("inspect", help="inspect local state")
