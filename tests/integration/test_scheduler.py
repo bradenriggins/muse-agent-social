@@ -138,15 +138,18 @@ def test_late_but_within_window_released_with_late_by(sched):
 
 def test_release_fn_failure_rolls_back_and_retry_succeeds(sched):
     """A release_fn crash rolls the claim back; the row stays scheduled
-    and a later run releases exactly once."""
+    and a later run releases exactly once. Per-row isolation (H6): the
+    exception is contained and recorded against the row, never
+    propagated."""
     conn, t0 = sched["conn"], sched["t0"]
     sid = schedule(conn, sched["raw"], _ts(t0 - timedelta(minutes=1)), None)
 
     def boom(conn, **kw):
         raise RuntimeError("outgoing queue unavailable")
 
-    with pytest.raises(RuntimeError):
-        run_due(conn, _ts(t0), boom)
+    summary = run_due(conn, _ts(t0), boom)
+    assert summary["released"] == []
+    assert summary["failed"] == [sid]
     assert get_scheduled(conn, sid)["state"] == "scheduled"
     assert conn.execute("SELECT COUNT(*) FROM test_outbox").fetchone()[0] == 0
 

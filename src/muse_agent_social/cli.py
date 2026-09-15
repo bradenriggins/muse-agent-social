@@ -58,9 +58,11 @@ from .compatibility.v01 import (
     LegacyPolicy,
     MemoryReplayStore,
     SeqAssigner,
+    StoreReplayGuard,
     VaultError,
     adapt_v01,
     detect_v01,
+    record_legacy_replay,
     vault_load,
     verify_v01,
 )
@@ -73,6 +75,7 @@ from .crypto.identity import (
 )
 from .crypto.rotation import (
     ConfirmRejected,
+    NoAckTimeout,
     RotationError,
     RotationManager,
 )
@@ -122,9 +125,15 @@ from .model.invites import (
     validate_invite,
 )
 from .policy.delivery import (
+    DELIVERY_MODES,
+    EXPIRY_HANDLINGS,
     accepted_receipt_permitted,
     get_policy,
     policy_snapshot,
+    set_accepted_receipts_enabled,
+    set_expiry_policy,
+    set_policy,
+    set_seen_receipts_enabled,
     surface_action,
 )
 from .policy.limits import (
@@ -1512,8 +1521,19 @@ def _release_fn(ctx: Ctx):
         if isinstance(sealed, str):
             sealed = sealed.encode("utf-8")
         if isinstance(transport, LocalTransport):
-            # Immediate local delivery; the receiver's replay guard makes a
-            # retry-after-crash duplicate harmless.
+            # Immediate local upload inside the scheduler transaction,
+            # before the scheduled -> released claim commits. Ordering
+            # note: the peer can fetch this object before this sender's
+            # commit lands, and a crash between upload and commit rolls
+            # the row back to scheduled, so the next run_due uploads the
+            # same sealed bytes under a NEW object name (sent_objects was
+            # rolled back too). The peer then sees two relay objects for
+            # one event. This is contained, not just tolerated: the
+            # receiver checks replay_guard for the replay_nonce (and the
+            # event_id with identical bytes) before inserting, so the
+            # duplicate is accepted-but-not-surfaced and the event is
+            # persisted exactly once. The bytes are immutable once
+            # sealed, so early visibility cannot corrupt receiver state.
             transport.upload(name, sealed)
         else:
             queue_mutation(
@@ -1552,6 +1572,53 @@ def _flush_send_transports(ctx: Ctx, relationship_ids) -> None:
                 )
 
 
+def _warn_overdue_scheduled(ctx: Ctx) -> None:
+    """Warn when scheduled rows are past deliver_at and still undelivered.
+
+    Medium 2a: run_due only fires on `mas send` / `mas receive`, so an
+    idle install silently misses deliver_at. Every CLI invocation that
+    can release rows warns loudly about overdue rows before releasing
+    them, so the delay is visible instead of silent.
+    """
+    try:
+        overdue = ctx.conn.execute(
+            "SELECT COUNT(*) FROM scheduler_queue "
+            "WHERE state = 'scheduled' AND deliver_at < ?",
+            (utcnow(),),
+        ).fetchone()[0]
+    except Exception:
+        return
+    if overdue:
+        print(
+            f"warning: {overdue} scheduled event(s) are past deliver_at "
+            "and still undelivered (this install only releases on "
+            "send/receive); releasing them now, possibly late",
+            file=sys.stderr,
+        )
+
+
+def _sweep_rotations(ctx: Ctx) -> None:
+    """Run rotation maintenance: discard ack-less candidates past their
+    deadline and retire old private keys after the 24h/100-event bound.
+
+    Lost-ack semantics: sweep() discards a candidate whose ack never
+    arrived once its 24h deadline passes and raises NoAckTimeout to alert
+    the operator. The wedge clears itself: a later begin_rotation()
+    succeeds because the stale candidate is gone (superseding), and the
+    old key is retired on the normal 24h/100-event schedule. The warning
+    is loud but never fails the poll or the send.
+    """
+    manager = RotationManager(ctx.conn, ctx.keys_dir)
+    try:
+        manager.sweep()
+    except NoAckTimeout as exc:
+        print(
+            f"warning: rotation ack timeout ({exc.code}): {exc}; stale "
+            "candidate discarded, a new rotation may now begin",
+            file=sys.stderr,
+        )
+
+
 def _send_event(
     ctx: Ctx,
     rel: dict,
@@ -1564,6 +1631,7 @@ def _send_event(
     deliver_at: Optional[str] = None,
     expires_at: Optional[str] = None,
     dry_run: bool = False,
+    clock_skew_seconds: Optional[float] = None,
 ) -> dict:
     """Persist, seal, and enqueue one outgoing event.
 
@@ -1651,21 +1719,37 @@ def _send_event(
     except ProjectionError as exc:
         raise CliError("send_error", f"projection failed: {exc.code}: {exc}")
     released: list[str] = []
+    cancel_outcome: Optional[str] = None
+    if event_type == "delivery.canceled":
+        # H7: cancel-before-release. The cancel must win if it arrives
+        # before deliver_at, so the cancellation is claimed BEFORE
+        # run_due() can release the row. Previously run_due ran first: a
+        # cancel racing a due release delivered the event while the CLI
+        # still reported success.
+        try:
+            scheduler.cancel(ctx.conn, payload["scheduled_event_id"])
+            cancel_outcome = "canceled"
+        except scheduler.SchedulerError as exc:
+            # already_released -> the delivery.canceled event now travels
+            # as a signed retraction request; unknown ids are reported
+            # honestly but do not fail the send.
+            cancel_outcome = exc.code
     try:
-        due = scheduler.run_due(ctx.conn, utcnow(), _release_fn(ctx))
+        due = scheduler.run_due(
+            ctx.conn, utcnow(), _release_fn(ctx),
+            clock_skew_seconds=clock_skew_seconds,
+        )
     except Exception as exc:
         raise CliError("send_error", f"scheduler release failed: {exc}")
     released.extend(due.get("released", []))
     # Push GitHub send-direction mutations now; anything left queued is
     # flushed by the next receive run.
     _flush_send_transports(ctx, [rid])
+    # Rotation housekeeping after every successful send: sweep discards
+    # lost-ack candidates and retires old keys.
+    _sweep_rotations(ctx)
     if event_type == "relationship.ready":
         _maybe_mark_active_after_ready(ctx, rid)
-    if event_type == "delivery.canceled":
-        try:
-            scheduler.cancel(ctx.conn, payload["scheduled_event_id"])
-        except scheduler.SchedulerError:
-            pass
     object_names = [
         r["object_name"]
         for r in ctx.conn.execute(
@@ -1681,6 +1765,7 @@ def _send_event(
         "scheduled": not released,
         "object_names": object_names,
         "released": due,
+        "cancel_outcome": cancel_outcome,
     }
 
 
@@ -1707,6 +1792,7 @@ def _maybe_mark_active_after_ready(ctx: Ctx, rid: str) -> None:
 def cmd_send(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
+        _warn_overdue_scheduled(ctx)
         if args.type in _LEGACY_SEND_TYPES:
             if not args.to and not args.relationship:
                 raise CliError("bad_args", "legacy send needs --to")
@@ -1745,11 +1831,30 @@ def cmd_send(args: argparse.Namespace) -> int:
             deliver_at=args.deliver_at,
             expires_at=args.expires_at,
             dry_run=bool(args.dry_run),
+            clock_skew_seconds=args.clock_skew_seconds,
         )
         if args.json:
             print(_canon_text(result))
         elif result.get("dry_run"):
             print(_canon_text(result))
+        elif result.get("cancel_outcome") == "canceled":
+            print(
+                f"canceled {args.scheduled_event_id}; delivery.canceled "
+                f"event {result['event_id']} sent"
+            )
+        elif result.get("cancel_outcome") == "already_released":
+            print(
+                f"sent {result['event_id']} seq {result['sender_seq']} "
+                f"epoch {result['key_epoch']} (scheduled event "
+                f"{args.scheduled_event_id} already released; cancel became "
+                "a signed retraction request)"
+            )
+        elif result.get("cancel_outcome"):
+            print(
+                f"sent {result['event_id']} seq {result['sender_seq']} "
+                f"epoch {result['key_epoch']} "
+                f"(cancel outcome: {result['cancel_outcome']})"
+            )
         elif result.get("scheduled"):
             print(
                 f"scheduled {result['event_id']} seq {result['sender_seq']} "
@@ -1924,68 +2029,82 @@ def _receive_v01(
         return _quarantine_outcome(ctx, rid, object_name, "v01_no_vault", str(exc))
     drain_open = phase in ("dual_read", "observing")
     policy = LegacyPolicy(
+        pair_id=pair_id,
         expected_sender=mstate_get(ctx.conn, "migration.peer_legacy_id") or "*",
         my_agent_id=mstate_get(ctx.conn, "migration.my_legacy_id") or "*",
-        replay_store=MemoryReplayStore(),
+        # Persistent replay store (Medium 1): a per-object memory store
+        # would forget every nonce at the next object, so replays were
+        # never rejected. The v0.2 replay_guard table is shared and
+        # survives across objects and restarts.
+        replay_store=StoreReplayGuard(ctx.conn),
         legacy_read_open=drain_open,
         legacy_sends_allowed=False,
     )
     try:
-        verified = verify_v01(data, pair_key, policy)
+        verified = verify_v01(data, pair_key, policy=policy)
     except LegacyError as exc:
         return _quarantine_outcome(ctx, rid, object_name, "v01_verify_failed", str(exc))
     # Durable sequence assignment: the caller owns SeqAssigner persistence.
     seq_state = mstate_get(ctx.conn, "migration.seq_assigner") or {}
     assigner = SeqAssigner.from_dict({k: int(v) for k, v in seq_state.items()})
-    adapted = adapt_v01(verified, assigner)
+    adapted = adapt_v01(verified, pair_id, assigner)
     mstate_set(ctx.conn, "migration.seq_assigner", assigner.to_dict())
     ctx.conn.commit()
     payload = {
-        "body": adapted["payload"].get("legacy_title")
-        and f"{adapted['payload']['legacy_title']}\n\n{adapted['payload']['body']}"
-        or adapted["payload"]["body"],
+        "body": (
+            f"{adapted['payload']['legacy_title']}\n\n{adapted['payload']['body']}"
+            if adapted["payload"].get("legacy_title")
+            else adapted["payload"]["body"]
+        ),
         "format": "plain",
     }
-    row = adapted["event_row"]
+    # adapt_v01 returns a flat dict (see compatibility/v01.py); legacy
+    # messages land in the relationship's own conversation, mirroring the
+    # migration drain in migrate.py.
+    conversation_id = rid
+    thread_id = rid + ":t"
     with ctx.conn:
         ctx.conn.execute(
             "INSERT OR IGNORE INTO conversations (conversation_id) VALUES (?)",
-            (row["conversation_id"],),
+            (conversation_id,),
         )
         ctx.conn.execute(
             "INSERT OR IGNORE INTO threads (thread_id, conversation_id) "
             "VALUES (?, ?)",
-            (row["thread_id"], row["conversation_id"]),
+            (thread_id, conversation_id),
         )
         ctx.conn.execute(
             "INSERT INTO events (event_id, relationship_id, conversation_id, "
             "thread_id, sender, sender_seq, created_at, key_epoch, event_type, "
             "replay_nonce, sealed_envelope) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'message.created', ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'message.created', ?, ?)",
             (
-                row["event_id"],
+                adapted["event_id"],
                 rid,
-                row["conversation_id"],
-                row["thread_id"],
-                row["sender"],
-                row["sender_seq"],
-                row["created_at"],
-                1,
-                _new_uuid(),
+                conversation_id,
+                thread_id,
+                adapted["sender"],
+                adapted["sender_seq"],
+                adapted["created_at"],
+                "v01:" + verified.envelope["nonce"],
                 data,
             ),
         )
         record_projection_input(
             ctx.conn,
-            event_id=row["event_id"],
+            event_id=adapted["event_id"],
             event_type="message.created",
             payload=payload,
             reply_to=None,
         )
         ctx.conn.execute(
             "INSERT INTO projection_queue (event_id, queued_at) VALUES (?, ?)",
-            (row["event_id"], utcnow()),
+            (adapted["event_id"], utcnow()),
         )
+    # Record the verified nonce/id in the persistent replay store so a
+    # replayed v0.1 object is rejected on the next object.
+    record_legacy_replay(policy, verified)
+    ctx.conn.commit()
     return {"outcome": "accepted", "surfaces": 1, "receipts_queued": 0}
 
 
@@ -2361,8 +2480,21 @@ def _post_receive_hooks(
             pass
 
 
+def prune_replay_entries(ctx: Ctx) -> int:
+    """Delete expired replay-guard entries. Returns rows removed.
+
+    Runs after successful receives (and any other CLI lifecycle point
+    that wants it) so the shared replay_guard table stays bounded.
+    Never raises: pruning is hygiene, not protocol.
+    """
+    try:
+        return StoreReplayGuard(ctx.conn).prune(utcnow())
+    except Exception:
+        return 0
+
+
 def _receive_relationship(
-    ctx: Ctx, rid: str, time_budget: float
+    ctx: Ctx, rid: str, time_budget: float, clock_skew_seconds: Optional[float] = None
 ) -> tuple[int, dict]:
     transport = _transport_for(ctx, rid, "receive")
     acc = {"surfaces": 0, "receipts_queued": 0}
@@ -2382,17 +2514,28 @@ def _receive_relationship(
         min_poll_interval=0.0,
         time_budget=time_budget,
         policy_callback=policy_callback,
+        # Rotation housekeeping on every watcher poll cycle: sweep
+        # discards lost-ack candidates and retires old keys.
+        maintenance_callback=lambda: _sweep_rotations(ctx),
     )
     receipts_sent = 0
     if code in (EXIT_OK, EXIT_RETRYABLE, EXIT_PARTIAL_TIMEOUT):
         # Release accepted receipts (and any due scheduled sends) that the
         # receive commit queued in the scheduler outbox, then push them.
         try:
-            due = scheduler.run_due(ctx.conn, utcnow(), _release_fn(ctx))
+            due = scheduler.run_due(
+                ctx.conn, utcnow(), _release_fn(ctx),
+                clock_skew_seconds=clock_skew_seconds,
+            )
             receipts_sent = len(due.get("released", []))
         except Exception as exc:
             print(f"warning: release failed: {exc}", file=sys.stderr)
         _flush_send_transports(ctx, [rid])
+    # Replay hygiene (Medium 1): prune expired replay-guard entries after
+    # a successful receive so the table stays bounded. The v0.1 and v0.2
+    # replay entries share this table and expire by acceptance window.
+    if code == EXIT_OK:
+        result["replay_pruned"] = prune_replay_entries(ctx)
     result["receipts_sent"] = receipts_sent
     return code, result
 
@@ -2400,6 +2543,7 @@ def _receive_relationship(
 def cmd_receive(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
+        _warn_overdue_scheduled(ctx)
         if args.relationship:
             rids = [ctx.resolve_relationship(args.relationship)["relationship_id"]]
         else:
@@ -2424,7 +2568,8 @@ def cmd_receive(args: argparse.Namespace) -> int:
         for rid in rids:
             try:
                 code, result = _receive_relationship(
-                    ctx, rid, float(args.timeout or 120)
+                    ctx, rid, float(args.timeout or 120),
+                    clock_skew_seconds=args.clock_skew_seconds,
                 )
             except CliError as exc:
                 code, result = exc.exit_code, {"error": exc.code}
@@ -2460,9 +2605,115 @@ def cmd_receive(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _atomic_write_bytes(path: Path, data: bytes, mode: int) -> None:
+    """Write *data* to *path* atomically (temp file + rename)."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def _rotate_identity(ctx: Ctx, args: argparse.Namespace) -> int:
+    """Rotate the identity signing key (H11).
+
+    Uses the shipped crypto (rotate_identity_key / verify_identity_rotation),
+    reissues the local agent card under the new identity id, backs up the
+    old seed and card, and persists the rotation announcement for
+    out-of-band peer delivery.
+
+    There is deliberately no in-protocol peer notification: the v0.2 event
+    schemas define no identity-rotation event type (schema ownership sits
+    with another lane), so faking one would corrupt the event stream. The
+    command says this loudly instead.
+    """
+    if not args.confirm_identity:
+        raise CliError(
+            "confirmation_required",
+            "rotating the identity key changes your identity_id; existing "
+            "peers will not recognize the new identity until they receive "
+            "the rotation announcement. Pass --confirm-identity to proceed.",
+        )
+    from .crypto.identity import derive_identity_hierarchy
+    from .crypto.rotation import (
+        IdentityRotationError,
+        rotate_identity_key,
+        verify_identity_rotation,
+    )
+
+    old_card = ctx.card
+    new_seed = secrets.token_bytes(32)
+    new_hierarchy = derive_identity_hierarchy(new_seed)
+    try:
+        announcement = rotate_identity_key(
+            old_card,
+            ctx.hierarchy.ed25519_private,
+            new_hierarchy.ed25519_private,
+        )
+    except IdentityRotationError as exc:
+        raise CliError("identity_rotation_failed", str(exc))
+    # Fail closed: verify with the shipped verifier before touching disk.
+    if not verify_identity_rotation(announcement, old_card):
+        raise CliError(
+            "identity_rotation_failed",
+            "self-verification of the rotation announcement failed; "
+            "no state was changed",
+        )
+
+    identity_ref = ctx.config.get("identity_ref") or {}
+    seed_rel = identity_ref.get("master_seed_path") or f"keys/{_MASTER_SEED_NAME}"
+    card_rel = identity_ref.get("card_path") or _CARD_NAME
+    seed_path = ctx.state_dir / seed_rel
+    card_path = ctx.state_dir / card_rel
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    # Back up the old seed and card first; losing the old seed would brick
+    # anything sealed to the old identity.
+    backup_seed = seed_path.with_name(f"{seed_path.name}.backup-{stamp}")
+    backup_card = card_path.with_name(f"{card_path.name}.backup-{stamp}")
+    shutil.copy2(seed_path, backup_seed)
+    os.chmod(backup_seed, 0o600)
+    shutil.copy2(card_path, backup_card)
+
+    _atomic_write_bytes(seed_path, new_seed, 0o600)
+    _atomic_write_bytes(
+        card_path,
+        (_canon_text(announcement["new_card"]) + "\n").encode("utf-8"),
+        0o644,
+    )
+    rot_dir = ctx.state_dir / "identity-rotations"
+    rot_dir.mkdir(parents=True, exist_ok=True)
+    ann_path = rot_dir / f"{new_hierarchy.identity_id}.json"
+    ann_path.write_text(_canon_text(announcement) + "\n", encoding="utf-8")
+
+    print(
+        f"identity rotated: {ctx.identity_id} -> {new_hierarchy.identity_id}"
+    )
+    print(f"new card: {card_path}")
+    print(f"announcement: {ann_path}")
+    print(f"backups: {backup_seed}, {backup_card}")
+    print(
+        "warning: peer notification is out-of-band. No identity-rotation "
+        "event type exists in the v0.2 protocol schemas, so peers cannot "
+        "learn the new identity_id over the relay yet; share the "
+        "announcement file with each peer directly until the protocol "
+        "gains an identity.rotation event.",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def cmd_rotate(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
+        if args.identity:
+            return _rotate_identity(ctx, args)
+        if not args.relationship:
+            raise CliError(
+                "missing_relationship",
+                "mas rotate needs --relationship (or --identity for "
+                "identity-key rotation)",
+            )
         rel = ctx.resolve_relationship(args.relationship)
         rid = rel["relationship_id"]
         manager = RotationManager(ctx.conn, ctx.keys_dir)
@@ -2899,12 +3150,162 @@ def cmd_inspect_queue(args: argparse.Namespace) -> int:
         ctx.close()
 
 
+def cmd_inspect_scheduled(args: argparse.Namespace) -> int:
+    ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
+    try:
+        state = args.state
+        if state is not None and state not in scheduler.SCHEDULER_STATES:
+            raise CliError("invalid_state", f"unknown scheduler state {state!r}")
+        rows = []
+        for r in scheduler.list_scheduled(ctx.conn, state):
+            # inner_event is raw sealed bytes (up to 256 KiB); the inspect
+            # surface shows its size and digest, not the bytes themselves.
+            raw = bytes(r["inner_event"])
+            rows.append(
+                {
+                    "scheduled_id": r["scheduled_id"],
+                    "deliver_at": r["deliver_at"],
+                    "expires_at": r["expires_at"],
+                    "state": r["state"],
+                    "release_failures": r["release_failures"],
+                    "inner_event_bytes": len(raw),
+                    "inner_event_sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+        print(_canon_text(rows))
+        return 0
+    finally:
+        ctx.close()
+
+
 def cmd_inspect_policy(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
         rel = ctx.resolve_relationship(args.relationship)
         policy = get_policy(ctx.conn, rel["relationship_id"])
         print(_canon_text(policy_snapshot(ctx.conn, rel["relationship_id"])))
+        return 0
+    finally:
+        ctx.close()
+
+
+# ---------------------------------------------------------------------------
+# Delivery policy CLI (H10)
+# ---------------------------------------------------------------------------
+
+_POLICY_SET_KEYS = (
+    "mode",
+    "seen_receipts",
+    "accepted_receipts",
+    "expiry_handling",
+    "expiry_shorten_after_seconds",
+)
+"""Keys accepted by `mas policy set`, in user-facing spelling."""
+
+_POLICY_GET_KEYS = (
+    "mode",
+    "version",
+    "seen_receipts_enabled",
+    "accepted_receipts_enabled",
+    "expiry_handling",
+    "expiry_shorten_after_seconds",
+    "updated_at",
+)
+"""Snapshot fields readable by `mas policy get`."""
+
+
+def _parse_policy_bool(raw: str) -> bool:
+    """Parse a user-supplied boolean for policy set."""
+    text = raw.strip().lower()
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off"):
+        return False
+    raise CliError(
+        "invalid_policy_value",
+        f"invalid boolean {raw!r}; use one of true/false, 1/0, yes/no, on/off",
+    )
+
+
+def cmd_policy_set(args: argparse.Namespace) -> int:
+    ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
+    try:
+        rel = ctx.resolve_relationship(args.relationship)
+        rid = rel["relationship_id"]
+        key = args.key
+        value = args.value
+        try:
+            if key == "mode":
+                set_policy(ctx.conn, rid, value)
+            elif key == "seen_receipts":
+                set_seen_receipts_enabled(
+                    ctx.conn, rid, _parse_policy_bool(value))
+            elif key == "accepted_receipts":
+                set_accepted_receipts_enabled(
+                    ctx.conn, rid, _parse_policy_bool(value))
+            elif key == "expiry_handling":
+                if value == "shorten":
+                    current = get_policy(ctx.conn, rid)
+                    window = current.expiry_shorten_after_seconds
+                    if window is None:
+                        raise CliError(
+                            "invalid_policy_value",
+                            "expiry_handling=shorten needs a window: set "
+                            "expiry_shorten_after_seconds <positive seconds> "
+                            "first",
+                        )
+                    set_expiry_policy(ctx.conn, rid, "shorten", window)
+                else:
+                    set_expiry_policy(ctx.conn, rid, value)
+            elif key == "expiry_shorten_after_seconds":
+                try:
+                    window = int(value)
+                except ValueError:
+                    raise CliError(
+                        "invalid_policy_value",
+                        "expiry_shorten_after_seconds must be a positive "
+                        f"integer of seconds, got {value!r}",
+                    )
+                # Setting the window atomically enables shorten with it;
+                # there is no chicken-and-egg with expiry_handling.
+                set_expiry_policy(ctx.conn, rid, "shorten", window)
+            else:
+                raise CliError(
+                    "unknown_policy_key",
+                    f"unknown policy key {key!r}; valid keys: "
+                    f"{', '.join(_POLICY_SET_KEYS)}",
+                )
+        except CliError:
+            raise
+        except Exception as exc:
+            raise CliError("policy_set_failed", str(exc))
+        snap = policy_snapshot(ctx.conn, rid)
+        print(_canon_text(snap))
+        return 0
+    finally:
+        ctx.close()
+
+
+def cmd_policy_get(args: argparse.Namespace) -> int:
+    ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
+    try:
+        rel = ctx.resolve_relationship(args.relationship)
+        rid = rel["relationship_id"]
+        snap = policy_snapshot(ctx.conn, rid)
+        policy = get_policy(ctx.conn, rid)
+        snap["expiry_handling"] = policy.expiry_handling
+        snap["expiry_shorten_after_seconds"] = policy.expiry_shorten_after_seconds
+        if args.key is None:
+            print(_canon_text(snap))
+            return 0
+        if args.key not in _POLICY_GET_KEYS:
+            raise CliError(
+                "unknown_policy_key",
+                f"unknown policy key {args.key!r}; valid keys: "
+                f"{', '.join(_POLICY_GET_KEYS)}",
+            )
+        value = snap[args.key]
+        print(_canon_text(value) if not isinstance(value, str) else value)
         return 0
     finally:
         ctx.close()
@@ -3019,6 +3420,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--scheduled-event-id", default=None)
     p_send.add_argument("--canceled-at", default=None)
     p_send.add_argument("--migration-id", default=None)
+    p_send.add_argument(
+        "--clock-skew-seconds", type=float, default=None,
+        help="observed clock skew in seconds; passed to the scheduler so "
+        "blocking skew rejects scheduled sends instead of silently "
+        "mis-timing them",
+    )
     p_send.add_argument("--epoch", type=int, default=None)
     p_send.add_argument("--prepare-event-id", default=None)
     p_send.add_argument("--new-agreement-key", default=None)
@@ -3070,11 +3477,40 @@ def build_parser() -> argparse.ArgumentParser:
     p_receive = subs.add_parser("receive", help="receive new relay objects")
     p_receive.add_argument("--relationship", default=None)
     p_receive.add_argument("--timeout", type=float, default=120.0)
+    p_receive.add_argument(
+        "--clock-skew-seconds", type=float, default=None,
+        help="observed clock skew in seconds; passed to the scheduler so "
+        "blocking skew rejects scheduled releases",
+    )
     _add_common(p_receive)
     p_receive.set_defaults(func=cmd_receive)
 
+    p_policy = subs.add_parser(
+        "policy", help="get or set per-relationship delivery policy")
+    pol_subs = p_policy.add_subparsers(dest="policy_command", required=True)
+    p_pol_set = pol_subs.add_parser("set", help="set a delivery policy key")
+    p_pol_set.add_argument("relationship", help="relationship id")
+    p_pol_set.add_argument(
+        "key", help=f"one of: {', '.join(_POLICY_SET_KEYS)}")
+    p_pol_set.add_argument("value", help="new value for the key")
+    p_pol_set.set_defaults(func=cmd_policy_set)
+    p_pol_get = pol_subs.add_parser("get", help="read delivery policy")
+    p_pol_get.add_argument("relationship", help="relationship id")
+    p_pol_get.add_argument(
+        "key", nargs="?", default=None,
+        help=f"optional field, one of: {', '.join(_POLICY_GET_KEYS)}")
+    p_pol_get.set_defaults(func=cmd_policy_get)
+
     p_rotate = subs.add_parser("rotate", help="agreement key rotation ceremony")
-    p_rotate.add_argument("--relationship", required=True)
+    p_rotate.add_argument("--relationship", default=None)
+    p_rotate.add_argument(
+        "--identity", action="store_true",
+        help="rotate the identity signing key instead of an agreement key",
+    )
+    p_rotate.add_argument(
+        "--confirm-identity", action="store_true",
+        help="required for --identity: acknowledge the identity_id changes",
+    )
     p_rotate.add_argument("--prepare", action="store_true")
     p_rotate.add_argument("--ack", action="store_true")
     p_rotate.add_argument("--confirm", action="store_true")
@@ -3131,6 +3567,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_policy.add_argument("--relationship", required=True)
     _add_common(p_policy)
     p_policy.set_defaults(func=cmd_inspect_policy)
+    p_sched = insp_subs.add_parser(
+        "scheduled", help="list scheduler rows (default: all states)"
+    )
+    p_sched.add_argument(
+        "--state",
+        default=None,
+        help="filter by scheduler state: "
+        + ", ".join(scheduler.SCHEDULER_STATES),
+    )
+    _add_common(p_sched)
+    p_sched.set_defaults(func=cmd_inspect_scheduled)
 
     return parser
 
