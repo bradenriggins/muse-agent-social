@@ -1,0 +1,140 @@
+[
+  {
+    "name": "rfc8785_primitive_example",
+    "input": {
+      "a": 1,
+      "b": true,
+      "c": null,
+      "d": "text"
+    },
+    "expected_hex": "7b2261223a312c2262223a747275652c2263223a6e756c6c2c2264223a2274657874227d"
+  },
+  {
+    "name": "recursive_sorting",
+    "input": {
+      "z": {
+        "b": 2,
+        "a": 1
+      },
+      "a": {
+        "y": {
+          "d": 4,
+          "c": 3
+        },
+        "x": 0
+      }
+    },
+    "expected_hex": "7b2261223a7b2278223a302c2279223a7b2263223a332c2264223a347d7d2c227a223a7b2261223a312c2262223a327d7d"
+  },
+  {
+    "name": "object_in_array",
+    "input": {
+      "arr": [
+        {
+          "b": 1,
+          "a": 2
+        },
+        {
+          "d": 4,
+          "c": 3
+        }
+      ]
+    },
+    "expected_hex": "7b22617272223a5b7b2261223a322c2262223a317d2c7b2263223a332c2264223a347d5d7d"
+  },
+  {
+    "name": "control_escaping",
+    "input": {
+      "s": "A\bB\tC\nD\fE\rF\u0000G\u001fHI\"J\\K"
+    },
+    "expected_hex": "7b2273223a22415c62425c74435c6e445c66455c72465c7530303030475c7530303166485c7530303766495c224a5c5c4b227d"
+  },
+  {
+    "name": "non_ascii_passthrough",
+    "input": {
+      "s": "héllo→世界😀"
+    },
+    "expected_hex": "7b2273223a2268c3a96c6c6fe28692e4b896e7958cf09f9880227d"
+  },
+  {
+    "name": "empty_object",
+    "input": {},
+    "expected_hex": "7b7d"
+  },
+  {
+    "name": "empty_array",
+    "input": [],
+    "expected_hex": "5b5d"
+  },
+  {
+    "name": "int_boundaries",
+    "input": {
+      "min": -9007199254740991,
+      "max": 9007199254740991,
+      "zero": 0,
+      "neg": -42
+    },
+    "expected_hex": "7b226d6178223a393030373139393235343734303939312c226d696e223a2d393030373139393235343734303939312c226e6567223a2d34322c227a65726f223a307d"
+  },
+  {
+    "name": "ascii_key_byte_order",
+    "input": {
+      "~": 1,
+      "!": 2,
+      "A": 3,
+      "a": 4,
+      "0": 5
+    },
+    "expected_hex": "7b2221223a322c2230223a352c2241223a332c2261223a342c227e223a317d"
+  },
+  {
+    "name": "nested_arrays_preserve_order",
+    "input": {
+      "m": [
+        [
+          3,
+          2,
+          1
+        ],
+        [
+          "b",
+          "a"
+        ]
+      ]
+    },
+    "expected_hex": "7b226d223a5b5b332c322c315d2c5b2262222c2261225d5d7d"
+  },
+  {
+    "name": "bool_null",
+    "input": {
+      "t": true,
+      "f": false,
+      "n": null
+    },
+    "expected_hex": "7b2266223a66616c73652c226e223a6e756c6c2c2274223a747275657d"
+  },
+  {
+    "name": "envelope_like",
+    "input": {
+      "protected": {
+        "protocol": "muse-agent-social/0.2",
+        "event_id": "12345678-1234-1234-1234-1234567890ab",
+        "sender_seq": 42,
+        "deliver_at": null,
+        "event_type": "message.created"
+      },
+      "recipients": [
+        {
+          "recipient": "did:key:zAAA",
+          "wrap_nonce": "AA",
+          "wrapped_key": "BB",
+          "agreement_key": "zCCC"
+        }
+      ],
+      "signature": "sig",
+      "content_nonce": "nn",
+      "ciphertext": "ct"
+    },
+    "expected_hex": "7b2263697068657274657874223a226374222c22636f6e74656e745f6e6f6e6365223a226e6e222c2270726f746563746564223a7b2264656c697665725f6174223a6e756c6c2c226576656e745f6964223a2231323334353637382d313233342d313233342d313233342d313233343536373839306162222c226576656e745f74797065223a226d6573736167652e63726561746564222c2270726f746f636f6c223a226d7573652d6167656e742d736f6369616c2f302e32222c2273656e6465725f736571223a34327d2c22726563697069656e7473223a5b7b2261677265656d656e745f6b6579223a227a434343222c22726563697069656e74223a226469643a6b65793a7a414141222c22777261705f6e6f6e6365223a224141222c22777261707065645f6b6579223a224242227d5d2c227369676e6174757265223a22736967227d"
+  }
+]
