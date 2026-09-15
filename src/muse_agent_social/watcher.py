@@ -157,8 +157,15 @@ def run_once(
     time_budget: float = DEFAULT_TIME_BUDGET_SECONDS,
     policy_callback: Callable[[str], dict[str, Any]] | None = None,
     clock: Callable[[], float] | None = None,
+    maintenance_callback: Callable[[], None] | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    """Run one watcher poll cycle. Returns (exit_code, result_json)."""
+    """Run one watcher poll cycle. Returns (exit_code, result_json).
+
+    maintenance_callback is run once per clean cycle, after object
+    processing and before returning EXIT_OK. It is the hook for
+    housekeeping such as rotation sweeps; a raising callback is recorded
+    in result["maintenance_error"] and never fails the cycle.
+    """
     now_fn = clock or time.time
     t_start = now_fn()
     if state_dir is not None:
@@ -180,6 +187,7 @@ def run_once(
                 min_poll_interval, time_budget,
                 policy_callback or default_policy_callback,
                 now_fn, t_start, result, finish,
+                maintenance_callback,
             )
     except TransportError as exc:
         if exc.code == "lock_timeout":
@@ -201,9 +209,20 @@ def _run_once_locked(
     t_start: float,
     result: dict[str, Any],
     finish: Callable[[int, str | None], tuple[int, dict[str, Any]]],
+    maintenance_callback: Callable[[], None] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     state = load_watcher_state(state_dir, relationship_id)
     now = now_fn()
+
+    def finish_ok(reason: str | None = None):
+        # Maintenance runs on every clean cycle; a failing callback is
+        # recorded but never fails the poll.
+        if maintenance_callback is not None:
+            try:
+                maintenance_callback()
+            except Exception as exc:
+                result["maintenance_error"] = f"{type(exc).__name__}: {exc}"
+        return finish(EXIT_OK, reason)
 
     # Poll throttle: never scan faster than the plan interval.
     if now - float(state.get("last_poll_at", 0.0)) < min_poll_interval:
@@ -237,7 +256,7 @@ def _run_once_locked(
     )
     if not needs_work:
         save_watcher_state(state_dir, relationship_id, state)
-        return finish(EXIT_OK)
+        return finish_ok()
 
     # -- receive phase --------------------------------------------------
     try:
@@ -326,7 +345,7 @@ def _run_once_locked(
         state["next_retry_at"] = None
         save_watcher_state(state_dir, relationship_id, state)
         result["checkpoint_advanced"] = True
-        return finish(EXIT_OK)
+        return finish_ok()
 
     # Retryable remainder: do not checkpoint; schedule backoff with jitter.
     failures = int(state.get("consecutive_failures", 0)) + 1

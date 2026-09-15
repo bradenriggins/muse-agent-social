@@ -69,6 +69,7 @@ from .crypto.identity import (
 )
 from .crypto.rotation import (
     ConfirmRejected,
+    NoAckTimeout,
     RotationError,
     RotationManager,
 )
@@ -1426,6 +1427,28 @@ def _warn_overdue_scheduled(ctx: Ctx) -> None:
         )
 
 
+def _sweep_rotations(ctx: Ctx) -> None:
+    """Run rotation maintenance: discard ack-less candidates past their
+    deadline and retire old private keys after the 24h/100-event bound.
+
+    Lost-ack semantics: sweep() discards a candidate whose ack never
+    arrived once its 24h deadline passes and raises NoAckTimeout to alert
+    the operator. The wedge clears itself: a later begin_rotation()
+    succeeds because the stale candidate is gone (superseding), and the
+    old key is retired on the normal 24h/100-event schedule. The warning
+    is loud but never fails the poll or the send.
+    """
+    manager = RotationManager(ctx.conn, ctx.keys_dir)
+    try:
+        manager.sweep()
+    except NoAckTimeout as exc:
+        print(
+            f"warning: rotation ack timeout ({exc.code}): {exc}; stale "
+            "candidate discarded, a new rotation may now begin",
+            file=sys.stderr,
+        )
+
+
 def _send_event(
     ctx: Ctx,
     rel: dict,
@@ -1552,6 +1575,9 @@ def _send_event(
     # Push GitHub send-direction mutations now; anything left queued is
     # flushed by the next receive run.
     _flush_send_transports(ctx, [rid])
+    # Rotation housekeeping after every successful send: sweep discards
+    # lost-ack candidates and retires old keys.
+    _sweep_rotations(ctx)
     if event_type == "relationship.ready":
         _maybe_mark_active_after_ready(ctx, rid)
     object_names = [
@@ -2282,6 +2308,9 @@ def _receive_relationship(
         min_poll_interval=0.0,
         time_budget=time_budget,
         policy_callback=policy_callback,
+        # Rotation housekeeping on every watcher poll cycle: sweep
+        # discards lost-ack candidates and retires old keys.
+        maintenance_callback=lambda: _sweep_rotations(ctx),
     )
     receipts_sent = 0
     if code in (EXIT_OK, EXIT_RETRYABLE, EXIT_PARTIAL_TIMEOUT):
