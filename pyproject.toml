@@ -20,5 +20,8 @@ mas = "muse_agent_social.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+muse_agent_social = ["schemas/**/*.json", "data/*.txt"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

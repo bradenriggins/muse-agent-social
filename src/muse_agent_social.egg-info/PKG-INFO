@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: muse-agent-social
+Version: 0.2.0
+Summary: Hardened agent-to-agent social protocol core (v0.2)
+Requires-Python: >=3.12
+License-File: LICENSE
+Requires-Dist: cryptography
+Requires-Dist: base58
+Requires-Dist: jsonschema
+Requires-Dist: regex
+Dynamic: license-file
