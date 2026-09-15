@@ -103,6 +103,31 @@ through the scheduler outbox. The sender's own event is projected
 locally so both sides converge. Sending on a non-active relationship
 fails with `relationship_not_active`.
 
+### mas human respond
+
+```
+mas human respond --relationship RID --request-id REQ --answer TEXT [--approved | --rejected] [--note TEXT]
+```
+
+The only honest way to answer a `human.requested` prompt. The command
+creates a local human-approval record (the human on this side made the
+decision), then sends `human.responded` carrying that record's id.
+Sending `human.responded` or a human-confirmed `poll.responded` by any
+other path is rejected: the schema requires `approval_record_id`, and
+`mas send` verifies the record exists locally and matches the request,
+answer, and approval state. A bare sender assertion never projects.
+
+### mas human poll-respond
+
+```
+mas human poll-respond --relationship RID --poll-id POLL --choice-ids CHOICE [--choice-ids CHOICE ...] [--note TEXT]
+```
+
+The human's explicit, confirmed answer to a poll. Creates the local
+human-approval record, then sends `poll.responded` with
+`human_confirmed=true` carrying that record's id. The only honest path
+to a human-confirmed poll response.
+
 ### mas receive
 
 ```

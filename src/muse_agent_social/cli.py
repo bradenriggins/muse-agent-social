@@ -1632,6 +1632,62 @@ def cmd_human_respond(args: argparse.Namespace) -> int:
         ctx.close()
 
 
+def cmd_human_poll_respond(args: argparse.Namespace) -> int:
+    """The human's explicit, confirmed response to a poll.
+
+    Creates the local human-approval record for the poll, then sends
+    poll.responded with human_confirmed=true carrying that record's ID.
+    This is the only honest path to a human-confirmed poll response:
+    the schema requires approval_record_id when human_confirmed is true,
+    and the human drives this command.
+    """
+    from muse_agent_social.model.approvals import create_approval
+
+    ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
+    try:
+        if not args.to and not args.relationship:
+            raise CliError("bad_args", "human poll-respond needs --to or --relationship")
+        rel = ctx.resolve_relationship(args.to or args.relationship)
+        rid = rel["relationship_id"]
+        if rel["consent_state"] != "active":
+            raise CliError("relationship_not_active", "relationship is not active")
+        choice_ids = list(args.choice_ids or [])
+        if not choice_ids:
+            raise CliError("bad_args", "human poll-respond needs --choice-ids")
+        answer = ",".join(choice_ids)
+        with ctx.conn:
+            approval_id = create_approval(
+                ctx.conn,
+                relationship_id=rid,
+                subject_type="poll",
+                subject_id=args.poll_id,
+                answer=answer,
+                approved=True,
+                created_at=utcnow(),
+                note=args.note,
+            )
+        args._relationship_id = rid
+        args.approval_record = approval_id
+        args.type = "poll.responded"
+        args.poll_id = args.poll_id
+        args.human_confirmed = True
+        payload = _build_payload(ctx, args)
+        result = _send_event(
+            ctx,
+            rel,
+            "poll.responded",
+            payload,
+            conversation_id=args.conversation,
+            thread_id=args.thread,
+            reply_to=args.reply_to,
+            dry_run=bool(args.dry_run),
+        )
+        print(f"approval {approval_id} recorded; sent {result['event_id']}")
+        return 0
+    finally:
+        ctx.close()
+
+
 # ---------------------------------------------------------------------------
 # mas receive
 # ---------------------------------------------------------------------------
@@ -2746,6 +2802,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_hrespond.add_argument("--dry-run", action="store_true")
     _add_common(p_hrespond)
     p_hrespond.set_defaults(func=cmd_human_respond)
+    p_hpoll = human_subs.add_parser(
+        "poll-respond",
+        help="human-confirmed poll response; creates the local approval record",
+    )
+    p_hpoll.add_argument("--relationship", default=None)
+    p_hpoll.add_argument("--to", default=None)
+    p_hpoll.add_argument("--poll-id", required=True)
+    p_hpoll.add_argument("--choice-ids", action="append", required=True)
+    p_hpoll.add_argument("--note", default=None)
+    p_hpoll.add_argument("--conversation", default=None)
+    p_hpoll.add_argument("--thread", default=None)
+    p_hpoll.add_argument("--reply-to", default=None)
+    p_hpoll.add_argument("--dry-run", action="store_true")
+    _add_common(p_hpoll)
+    p_hpoll.set_defaults(func=cmd_human_poll_respond)
 
     p_receive = subs.add_parser("receive", help="receive new relay objects")
     p_receive.add_argument("--relationship", default=None)

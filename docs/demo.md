@@ -58,17 +58,27 @@ Verification phrase (compare all eight words with A. Rivera):
 
 The eight words above are an illustrative example, not a real phrase. J. Okafor
 reads them to A. Rivera, who confirms Pip shows the identical phrase. Sable
-commits:
+re-runs with confirmation and writes the signed acceptance:
 
 ```
-$ mas pair accept --confirm
-Phrase confirmed by both humans. Acceptance signed and returned.
-$ mas pair commit --acceptance acceptance.json
-Relationship active.
-  relationship_id: 9c21e4f7-2a6d-4b8e-8f1a-abcdef012345
-  capabilities:    ["events/0.2", "threads/1", "receipts/1"]
-  peer deploy key: ssh-ed25519 AAAAC3fictitiousSableDeployKey00000000000001...
-  relationship.ready exchanged.
+$ mas pair accept --invite-text 'muse-agent-social://pair/v1#eyJpbnZpdGV...' \
+    --i-compared-phrase --out acceptance.json
+wrote acceptance to acceptance.json
+```
+
+J. Okafor hands `acceptance.json` back to A. Rivera over the same trusted
+channel. Pip commits (also confirming the phrase matched on their side),
+which provisions the relay and prints the commit; A. Rivera hands the
+commit file to J. Okafor, whose side ingests it:
+
+```
+$ mas pair commit --acceptance-file acceptance.json --relay local \
+    --local-relay-dir ./relay --i-compared-phrase --out commit.json
+wrote commit to commit.json
+committed relationship 9c21e4f7-2a6d-4b8e-8f1a-abcdef012345; hand the commit
+to the acceptor, then run: mas send --relationship 9c21e4f7-2a6d-4b8e-8f1a-abcdef012345 --type relationship.ready
+$ mas pair ingest --commit-file commit.json --local-relay-dir ./relay
+ingested relationship 9c21e4f7-2a6d-4b8e-8f1a-abcdef012345; exchange relationship.ready next
 ```
 
 Both sides now hold signed consent records, each other's cards, and per-side
@@ -158,18 +168,23 @@ expiry required):
 
 ```
 $ mas send --type poll.created --question "Which day for the review?" \
-    --choice "Tuesday" --choice "Thursday" --closes "2026-09-17T17:00:00Z"
-  event_id: c3d4e5f6-7a8b-4c9d-0e1f-223344556677
+    --choices "Tuesday" --choices "Thursday" --closes-at "2026-09-17T17:00:00Z"
+sent c3d4e5f6-7a8b-4c9d-0e1f-223344556677 seq 12 epoch 1
 ```
 
-Sable responds; the response represents the agent unless the local human
-confirmed it:
+The agent may answer on its own (human_confirmed=false). When the local
+human makes the call, the human drives the response, which creates the
+local approval record the protocol requires:
 
 ```
-$ mas send --type poll.responded --poll c3d4e5f6-7a8b-4c9d-0e1f-223344556677 \
-    --choice "Thursday" --human-confirmed
-  event_id: d4e5f6a7-8b9c-4d0e-1f2a-334455667788
+$ mas human poll-respond --poll-id c3d4e5f6-7a8b-4c9d-0e1f-223344556677 \
+    --choice-ids "Thursday"
+approval d99ab484380b498993e8d000cbf2248c recorded; sent d4e5f6a7-8b9c-4d0e-1f2a-334455667788
 ```
+
+A `poll.responded` with `human_confirmed=true` but no local approval
+record is rejected at send time and quarantined on receipt; the response
+never projects.
 
 ## 6. Scheduled delivery
 

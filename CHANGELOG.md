@@ -72,7 +72,13 @@ forward secrecy, Git metadata leakage, no server-side blob cap, no guaranteed
 physical erasure, and a trusted human channel for verification. v0.2 is an
 experimental pair protocol, not production-secure messaging.
 
-## [0.1.0] - 2026-09-13
+There is no attachment event type in v0.2: the typed-event table defines no
+attachment event, so an `attachment.*` type is unknown and quarantined on
+receipt, and the 250 MiB transport limit blocks oversized objects outright.
+File sharing uses the `file-ref` convenience type (a `message.created` with a
+URL), not embedded blobs.
+
+## [0.1.0] - prototype (superseded by 0.2.0)
 
 Initial prototype: encrypted pair transport over a GitHub relay with shared-key
 message sealing, script-based send and receive, and a live pilot pair. Superseded
