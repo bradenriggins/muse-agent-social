@@ -93,36 +93,12 @@ def new_object_name() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Queued-mutation store. These tables should be promoted into
-# store/migrations.py as a versioned migration by the store track; the DDL
-# here is CREATE TABLE IF NOT EXISTS so it is idempotent and forward
-# compatible. Table and column names are the contract (see INTERFACE.md).
+# Queued-mutation store. The DDL lives in transports/tables.py (a leaf
+# module with no package imports, so store/migrations.py can apply it as a
+# versioned migration without creating an import cycle). Table and column
+# names are the contract (see INTERFACE.md).
 # ---------------------------------------------------------------------------
-_TRANSPORT_DDL = """
-CREATE TABLE IF NOT EXISTS transport_mutations (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    mutation_id     TEXT NOT NULL UNIQUE,
-    relationship_id TEXT NOT NULL,
-    op              TEXT NOT NULL CHECK(op IN ('upload', 'consume')),
-    object_name     TEXT NOT NULL,
-    data            BLOB,
-    state           TEXT NOT NULL DEFAULT 'queued'
-        CHECK(state IN ('queued', 'done', 'failed')),
-    attempts        INTEGER NOT NULL DEFAULT 0,
-    created_at      TEXT NOT NULL,
-    CHECK((op = 'upload' AND data IS NOT NULL)
-       OR (op = 'consume' AND data IS NULL))
-);
-CREATE INDEX IF NOT EXISTS idx_transport_mutations_rel_state
-    ON transport_mutations(relationship_id, state);
-CREATE TABLE IF NOT EXISTS transport_push_log (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    relationship_id TEXT NOT NULL,
-    pushed_at       REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_transport_push_log_rel_time
-    ON transport_push_log(relationship_id, pushed_at);
-"""
+from .tables import TRANSPORT_DDL as _TRANSPORT_DDL
 
 
 def ensure_transport_tables(conn: sqlite3.Connection) -> None:

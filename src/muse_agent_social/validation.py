@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 import jsonschema
+import regex
+import unicodedata
 from jsonschema.exceptions import best_match
 from referencing import Registry, Resource
 
@@ -199,11 +201,26 @@ def _validate_defs_variant(
 
 
 def _check_emoji(obj: Any) -> None:
+    """Enforce the plan's reaction rule: one Unicode extended grapheme
+    cluster, at most 32 UTF-8 bytes, no invisible control characters.
+
+    U+200D ZERO WIDTH JOINER is allowed because it is structural inside
+    compound emoji (family, profession sequences). All other format
+    controls (Cf) and all control characters (Cc) are rejected.
+    """
     emoji = obj.get("emoji")
     if not isinstance(emoji, str):
         return
     if len(emoji.encode("utf-8")) > 32:
         raise ValidationError("emoji", "too_long_bytes")
+    for ch in emoji:
+        cat = unicodedata.category(ch)
+        if cat == "Cc":
+            raise ValidationError("emoji", "control_character")
+        if cat == "Cf" and ch != "\u200d":
+            raise ValidationError("emoji", "invisible_control")
+    if len(regex.findall(r"\X", emoji)) != 1:
+        raise ValidationError("emoji", "not_single_grapheme")
 
 
 def _check_poll_choices(obj: Any) -> None:

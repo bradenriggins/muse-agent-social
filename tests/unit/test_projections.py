@@ -858,6 +858,7 @@ def test_human_request_response(conn, log):
                 "request_id": requested["event_id"],
                 "answer": "yes",
                 "approved": True,
+                "approval_record_id": "rec1",
             },
             sender=SENDER_B,
             at=10,
@@ -1026,7 +1027,8 @@ def test_deterministic_rebuild_byte_identical(conn, log):
                     {"prompt": "p?", "response_shape": "text",
                      "expires_at": ts(log.base, 9999)}, at=24)
     log.add("human.responded",
-            {"request_id": human["event_id"], "answer": "a", "approved": False},
+            {"request_id": human["event_id"], "answer": "a", "approved": False,
+             "approval_record_id": "rec2"},
             sender=SENDER_B, at=25)
     sched = log.add("delivery.scheduled",
                     {"inner_event_id": str(uuid.uuid4()),

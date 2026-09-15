@@ -75,6 +75,7 @@ _OPERATIONAL_DIRS = (
     "inbox",
     "outbox",
     "retry",
+    "plaintext_cache",
 )
 
 

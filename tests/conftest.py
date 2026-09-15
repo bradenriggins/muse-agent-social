@@ -1,6 +1,13 @@
 """Shared fixtures for track-social unit tests."""
 
+import sys
+from pathlib import Path
+
 import pytest
+
+# Adversarial suites import the reference receive harness as
+# ``support.harness``; make tests/ importable.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from muse_agent_social.store import db
 from muse_agent_social.store import migrations

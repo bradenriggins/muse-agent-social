@@ -450,7 +450,8 @@ def test_payload_poll_variants():
     )
     validate_payload(
         "poll.responded",
-        {"poll_id": UUID, "choice_ids": ["tacos"], "human_confirmed": True},
+        {"poll_id": UUID, "choice_ids": ["tacos"], "human_confirmed": True,
+         "approval_record_id": "rec1"},
     )
     expect_payload_error(
         "poll.responded", {"poll_id": UUID, "choice_ids": []}, "choice_ids",
@@ -481,11 +482,13 @@ def test_payload_human_variants():
     )
     validate_payload(
         "human.responded",
-        {"request_id": UUID, "answer": "yes", "approved": True},
+        {"request_id": UUID, "answer": "yes", "approved": True,
+         "approval_record_id": "rec1"},
     )
     expect_payload_error(
         "human.responded",
-        {"request_id": UUID, "answer": "yes", "approved": "yes"},
+        {"request_id": UUID, "answer": "yes", "approved": "yes",
+         "approval_record_id": "rec1"},
         "approved",
         "type",
     )

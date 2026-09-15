@@ -18,10 +18,13 @@ SCHEMA_VERSION = 2
 # directly (migrate_projections(), rotation._ensure_tables(), the github
 # transport's table setup) with identical results.
 from muse_agent_social.crypto.rotation import _ROTATION_TABLES
+from muse_agent_social.model.approvals import APPROVALS_DDL
 from muse_agent_social.store.projections import _V2_DDL as _PROJECTIONS_V2_DDL
-from muse_agent_social.transports.github import _TRANSPORT_DDL
+from muse_agent_social.transports.tables import TRANSPORT_DDL
 
-_V2_DDL = "\n".join([_PROJECTIONS_V2_DDL, _ROTATION_TABLES, _TRANSPORT_DDL])
+_V2_DDL = "\n".join(
+    [_PROJECTIONS_V2_DDL, _ROTATION_TABLES, TRANSPORT_DDL, APPROVALS_DDL]
+)
 
 _V1_DDL = """
 -- Conversations and threads exist so the plan's required foreign keys on

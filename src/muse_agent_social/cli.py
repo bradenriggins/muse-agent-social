@@ -1000,8 +1000,54 @@ def _iso_now() -> str:
     return utcnow()
 
 
-def _build_payload(args: argparse.Namespace) -> dict:
-    """Build and schema-validate the typed payload for ``mas send``."""
+def _require_approval_record(
+    ctx: "Ctx",
+    args: argparse.Namespace,
+    *,
+    subject_type: str,
+    subject_id: str,
+    answer: str,
+    approved: bool,
+) -> str:
+    """Verify the --approval-record references a real local human-approval
+    record matching this send. Returns the approval ID for the payload."""
+    from muse_agent_social.model.approvals import get_approval
+
+    rid = args._relationship_id
+    record = get_approval(ctx.conn, args.approval_record)
+    if record is None:
+        raise CliError(
+            "unknown_approval_record",
+            "no local human-approval record with that ID; the human must "
+            "respond with `mas human respond` first",
+        )
+    if record["relationship_id"] != rid:
+        raise CliError(
+            "approval_record_mismatch",
+            "approval record belongs to a different relationship",
+        )
+    if record["subject_type"] != subject_type or record["subject_id"] != subject_id:
+        raise CliError(
+            "approval_record_mismatch",
+            "approval record does not match this request",
+        )
+    if record["answer"] != answer or bool(record["approved"]) != approved:
+        raise CliError(
+            "approval_record_mismatch",
+            "approval record answer/approved does not match this send",
+        )
+    return record["approval_id"]
+
+
+def _build_payload(ctx: "Ctx", args: argparse.Namespace) -> dict:
+    """Build and schema-validate the typed payload for ``mas send``.
+
+    For ``human.responded`` and human-confirmed ``poll.responded``, the
+    plan requires a local human-approval record ID, never a bare sender
+    assertion. The record must already exist (created by the human-facing
+    ``mas human respond`` command); this function verifies it and embeds
+    its ID in the payload.
+    """
     t = args.type
     if t == "message.created":
         if not args.body:
@@ -1061,6 +1107,15 @@ def _build_payload(args: argparse.Namespace) -> dict:
             "choice_ids": list(args.choice_ids),
             "human_confirmed": bool(args.human_confirmed),
         }
+        if args.human_confirmed:
+            payload["approval_record_id"] = _require_approval_record(
+                ctx,
+                args,
+                subject_type="poll",
+                subject_id=args.poll_id,
+                answer=",".join(args.choice_ids),
+                approved=True,
+            )
     elif t == "task.created":
         if not args.title:
             raise CliError("bad_args", "task.created needs --title")
@@ -1097,13 +1152,23 @@ def _build_payload(args: argparse.Namespace) -> dict:
         if not args.approval_record:
             raise CliError(
                 "bad_args",
-                "human.responded needs --approval-record (local approval id; "
-                "the CLI invocation itself is the human's approval)",
+                "human.responded needs --approval-record (create one with "
+                "`mas human respond`; the CLI invocation itself is the "
+                "human's approval)",
             )
+        approval_id = _require_approval_record(
+            ctx,
+            args,
+            subject_type="human_request",
+            subject_id=args.request_id,
+            answer=args.answer,
+            approved=bool(args.approved),
+        )
         payload = {
             "request_id": args.request_id,
             "answer": args.answer,
             "approved": bool(args.approved),
+            "approval_record_id": approval_id,
         }
     elif t == "delivery.scheduled":
         if not args.inner_event_id or not args.deliver_at:
@@ -1459,7 +1524,7 @@ def cmd_send(args: argparse.Namespace) -> int:
                 raise CliError("bad_args", "send needs --to or --relationship")
             rel = ctx.resolve_relationship(args.to or args.relationship)
             args._relationship_id = rel["relationship_id"]
-            event_type, payload = args.type, _build_payload(args)
+            event_type, payload = args.type, _build_payload(ctx, args)
         state = rel["consent_state"]
         if state == "revoked":
             raise CliError("relationship_not_active", "relationship is revoked")
@@ -1500,6 +1565,68 @@ def cmd_send(args: argparse.Namespace) -> int:
                 f"sent {result['event_id']} seq {result['sender_seq']} "
                 f"epoch {result['key_epoch']}"
             )
+        return 0
+    finally:
+        ctx.close()
+
+
+# ---------------------------------------------------------------------------
+# mas human respond
+# ---------------------------------------------------------------------------
+
+
+def cmd_human_respond(args: argparse.Namespace) -> int:
+    """The human's explicit response to a human.requested event.
+
+    This command IS the local human-approval step required by the plan:
+    running it creates the local human-approval record, then sends the
+    human.responded event carrying that record's ID. Agents must never
+    send human.responded on their own; the human drives this command.
+    """
+    from muse_agent_social.model.approvals import create_approval
+
+    ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
+    try:
+        if not args.to and not args.relationship:
+            raise CliError("bad_args", "human respond needs --to or --relationship")
+        rel = ctx.resolve_relationship(args.to or args.relationship)
+        rid = rel["relationship_id"]
+        if rel["consent_state"] != "active":
+            raise CliError("relationship_not_active", "relationship is not active")
+        if not args.request_id or args.answer is None:
+            raise CliError(
+                "bad_args", "human respond needs --request-id and --answer"
+            )
+        if args.approved and args.rejected:
+            raise CliError("bad_args", "cannot pass both --approved and --rejected")
+        approved = bool(args.approved)
+        with ctx.conn:
+            approval_id = create_approval(
+                ctx.conn,
+                relationship_id=rid,
+                subject_type="human_request",
+                subject_id=args.request_id,
+                answer=args.answer,
+                approved=approved,
+                created_at=utcnow(),
+                note=args.note,
+            )
+        args._relationship_id = rid
+        args.approval_record = approval_id
+        args.type = "human.responded"
+        args.approved = approved
+        event_type, payload = _build_payload(ctx, args)
+        result = _send_event(
+            ctx,
+            rel,
+            event_type,
+            payload,
+            conversation_id=args.conversation,
+            thread_id=args.thread,
+            reply_to=args.reply_to,
+            dry_run=bool(args.dry_run),
+        )
+        print(f"approval {approval_id} recorded; sent {result['event_id']}")
         return 0
     finally:
         ctx.close()
@@ -2596,6 +2723,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--dry-run", action="store_true")
     _add_common(p_send)
     p_send.set_defaults(func=cmd_send)
+
+    p_human = subs.add_parser(
+        "human",
+        help="human-in-the-loop actions (the human's explicit step)",
+    )
+    human_subs = p_human.add_subparsers(dest="human_cmd", required=True)
+    p_hrespond = human_subs.add_parser(
+        "respond",
+        help="answer a human.requested event; creates the local approval record",
+    )
+    p_hrespond.add_argument("--relationship", default=None)
+    p_hrespond.add_argument("--to", default=None)
+    p_hrespond.add_argument("--request-id", required=True)
+    p_hrespond.add_argument("--answer", required=True)
+    p_hrespond.add_argument("--approved", action="store_true")
+    p_hrespond.add_argument("--rejected", action="store_true")
+    p_hrespond.add_argument("--note", default=None)
+    p_hrespond.add_argument("--conversation", default=None)
+    p_hrespond.add_argument("--thread", default=None)
+    p_hrespond.add_argument("--reply-to", default=None)
+    p_hrespond.add_argument("--dry-run", action="store_true")
+    _add_common(p_hrespond)
+    p_hrespond.set_defaults(func=cmd_human_respond)
 
     p_receive = subs.add_parser("receive", help="receive new relay objects")
     p_receive.add_argument("--relationship", default=None)

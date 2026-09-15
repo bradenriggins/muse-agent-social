@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS poll_responses (
     sender            TEXT NOT NULL,
     choice_ids        TEXT NOT NULL,
     human_confirmed   INTEGER NOT NULL DEFAULT 0 CHECK(human_confirmed IN (0, 1)),
+    approval_record_id TEXT,
     response_event_id TEXT NOT NULL,
     responded_at      TEXT NOT NULL,
     PRIMARY KEY (poll_id, sender)
@@ -202,7 +203,8 @@ CREATE TABLE IF NOT EXISTS human_requests (
     answer            TEXT,
     approved          INTEGER CHECK(approved IS NULL OR approved IN (0, 1)),
     responded_at      TEXT,
-    response_event_id TEXT
+    response_event_id TEXT,
+    approval_record_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -980,11 +982,12 @@ def _handle_poll_responded(
         return [_add_pending(conn, ev, poll_id, "poll_response")]
     conn.execute(
         "INSERT INTO poll_responses(poll_id, sender, choice_ids, human_confirmed,"
-        " response_event_id, responded_at)"
-        " VALUES (?, ?, ?, ?, ?, ?)"
+        " approval_record_id, response_event_id, responded_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(poll_id, sender) DO UPDATE SET"
         " choice_ids = excluded.choice_ids,"
         " human_confirmed = excluded.human_confirmed,"
+        " approval_record_id = excluded.approval_record_id,"
         " response_event_id = excluded.response_event_id,"
         " responded_at = excluded.responded_at;",
         (
@@ -992,6 +995,7 @@ def _handle_poll_responded(
             ev["sender"],
             restricted_jcs(payload["choice_ids"]).decode("utf-8"),
             1 if payload.get("human_confirmed") else 0,
+            payload.get("approval_record_id"),
             ev["event_id"],
             ev["created_at"],
         ),
@@ -1127,12 +1131,14 @@ def _handle_human_responded(
         return [_add_pending(conn, ev, request_id, "human_response")]
     conn.execute(
         "UPDATE human_requests SET state = 'responded', answer = ?, approved = ?,"
-        " responded_at = ?, response_event_id = ? WHERE request_id = ?;",
+        " responded_at = ?, response_event_id = ?, approval_record_id = ?"
+        " WHERE request_id = ?;",
         (
             payload["answer"],
             1 if payload["approved"] else 0,
             ev["created_at"],
             ev["event_id"],
+            payload["approval_record_id"],
             request_id,
         ),
     )
