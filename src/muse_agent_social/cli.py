@@ -134,6 +134,7 @@ from .policy.delivery import (
     set_expiry_policy,
     set_policy,
     set_seen_receipts_enabled,
+    should_send_seen_receipt,
     surface_action,
 )
 from .policy.limits import (
@@ -642,8 +643,9 @@ def cmd_pair_invite(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         print(
-            "hand the URI to the peer out-of-band (file: use --out; "
-            "QR: encode the URI above with any QR generator)",
+            "hand the URI to the peer out-of-band: paste the text above, "
+            "use --out to write it to a file, or copy it through any "
+            "handoff channel you already trust",
             file=sys.stderr,
         )
         return 0
@@ -1290,6 +1292,24 @@ def _build_payload(ctx: "Ctx", args: argparse.Namespace) -> dict:
     elif t == "receipt.seen":
         if not args.target:
             raise CliError("bad_args", "receipt.seen needs --target")
+        # The policy gate is live on the send path: seen receipts are
+        # opt-in per relationship (receiver-owned policy, default off).
+        # Invoking this command is the operator's human-visible assertion
+        # that the target event was seen; the remaining branches (policy
+        # enabled, event committed locally) are enforced here.
+        relationship_id = getattr(args, "_relationship_id", None)
+        if not should_send_seen_receipt(
+            ctx.conn,
+            relationship_id,
+            args.target,
+            human_visible_view_opened=True,
+        ):
+            raise CliError(
+                "seen_receipt_not_permitted",
+                "receipt.seen refused by delivery policy: enable seen "
+                "receipts for this relationship and target a locally "
+                "committed event",
+            )
         payload = {
             "target_event_id": args.target,
             "seen_at": args.seen_at or _iso_now(),

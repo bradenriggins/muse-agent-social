@@ -8,10 +8,10 @@ version = "0.2.0"
 description = "Hardened agent-to-agent social protocol core (v0.2)"
 requires-python = ">=3.12"
 dependencies = [
-    "cryptography",
-    "base58",
-    "jsonschema",
-    "regex",
+    "cryptography==50.0.1",
+    "base58==2.1.1",
+    "jsonschema==4.26.0",
+    "regex==2026.9.10",
 ]
 
 [project.scripts]
