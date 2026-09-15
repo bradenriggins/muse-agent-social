@@ -1,2 +1,0 @@
-[console_scripts]
-mas = muse_agent_social.cli:main

@@ -13,3 +13,8 @@ relay/
 relay-state/
 __pycache__/
 .venv/
+# Generated build artifacts (hygiene: never commit; build from source).
+build/
+dist/
+*.egg-info/
+*.egg
