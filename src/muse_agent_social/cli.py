@@ -380,7 +380,7 @@ def _relay_config_row(ctx: Ctx, relationship_id: str) -> dict:
             "no_relay_config",
             f"no relay configured for relationship {relationship_id}",
         )
-    return row
+    return dict(row)
 
 
 def _direction_slots(ctx: Ctx, relationship_id: str) -> tuple[str, str]:
@@ -887,7 +887,7 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
                 reg_self = register_peer_deploy_key(
                     repo,
                     inviter_pub,
-                    deploy_key_title(relationship_id) + "-inviter",
+                    deploy_key_title(relationship_id),
                     lambda: token,
                 )
             except ProvisioningError as exc:
@@ -895,7 +895,7 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
             deploy_keys.append(
                 {
                     "id": reg_self.get("id"),
-                    "title": deploy_key_title(relationship_id) + "-inviter",
+                    "title": deploy_key_title(relationship_id),
                     "key": inviter_pub,
                     "role": "self",
                 }
