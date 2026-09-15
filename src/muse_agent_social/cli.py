@@ -625,8 +625,9 @@ def cmd_pair_invite(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         print(
-            "hand the URI to the peer out-of-band (file: use --out; "
-            "QR: encode the URI above with any QR generator)",
+            "hand the URI to the peer out-of-band: paste the text above, "
+            "use --out to write it to a file, or copy it through any "
+            "handoff channel you already trust",
             file=sys.stderr,
         )
         return 0
