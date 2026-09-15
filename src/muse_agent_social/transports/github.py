@@ -461,7 +461,11 @@ class GitHubTransport(Transport):
                     continue
                 # Size pre-check BEFORE buffering: git cat-file -s reports
                 # the blob size from metadata, so a hostile oversized blob
-                # is rejected without ever reading its content into memory.
+                # is never read into memory. The receive loop
+                # (watcher.run_once) enforces the cap itself via len(data)
+                # and quarantines oversized input without failing the run,
+                # so an over-cap blob is returned with a bounded placeholder
+                # that still trips that check instead of its full content.
                 blob_ref = f"{ref}:incoming/{name}"
                 cp = self._git("cat-file", "-s", blob_ref)
                 if cp.returncode != 0:
@@ -470,12 +474,58 @@ class GitHubTransport(Transport):
                     blob_size = int(cp.stdout.decode("ascii", "replace").strip())
                 except ValueError:
                     continue  # unexpected output; next poll converges
-                check_object_size(name, blob_size)
+                try:
+                    check_object_size(name, blob_size)
+                except TransportError as exc:
+                    if exc.code != "object_too_large":
+                        raise
+                    items.append((name, b"\x00" * (OBJECT_MAX_BYTES + 1)))
+                    continue
                 cp = self._git("cat-file", "-p", blob_ref)
                 if cp.returncode != 0:
                     continue  # raced deletion; next poll converges
                 items.append((name, cp.stdout))
             return items
+
+    def read_object(self, object_name: str) -> bytes:
+        """Read a single relay object, checking size from metadata first.
+
+        Uses git cat-file -s for the size pre-check, then cat-file -p for
+        the content. Raises non-retryable TransportError('object_too_large')
+        without buffering when the blob exceeds OBJECT_MAX_BYTES.
+        """
+        if not OBJECT_NAME_RE.match(object_name):
+            raise TransportError(
+                "bad_object_name", f"invalid relay object name: {object_name}"
+            )
+        with mirror_lock(self.state_dir, self.relationship_id, LOCK_TIMEOUT_SECONDS):
+            self._ensure_mirror_locked()
+            ref = f"origin/{self.branch}"
+            blob_ref = f"{ref}:incoming/{object_name}"
+            cp = self._git("cat-file", "-s", blob_ref)
+            if cp.returncode != 0:
+                raise TransportError(
+                    "object_not_found",
+                    f"relay object {object_name} not found",
+                    retryable=False,
+                )
+            try:
+                blob_size = int(cp.stdout.decode("ascii", "replace").strip())
+            except ValueError:
+                raise TransportError(
+                    "object_not_found",
+                    f"relay object {object_name} has unreadable size",
+                    retryable=False,
+                )
+            check_object_size(object_name, blob_size)
+            cp = self._git("cat-file", "-p", blob_ref)
+            if cp.returncode != 0:
+                raise TransportError(
+                    "object_not_found",
+                    f"relay object {object_name} not found",
+                    retryable=False,
+                )
+            return cp.stdout
 
     def upload(self, object_name: str, data: bytes) -> None:
         """Queue an upload mutation (flush() pushes it)."""

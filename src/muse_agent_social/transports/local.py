@@ -97,10 +97,31 @@ class LocalTransport(Transport):
         items: list[tuple[str, bytes]] = []
         for path in sorted(self.incoming.glob("*.json")):
             # Size pre-check from stat() metadata BEFORE read_bytes(): an
-            # over-cap object is rejected without ever being buffered.
-            check_object_size(path.name, path.stat().st_size)
+            # over-cap object is never buffered into memory. The receive
+            # loop (watcher.run_once) enforces the cap itself via len(data)
+            # and quarantines oversized input without failing the run, so
+            # an over-cap object is returned with a bounded placeholder
+            # that still trips that check instead of its full content.
+            try:
+                check_object_size(path.name, path.stat().st_size)
+            except TransportError as exc:
+                if exc.code != "object_too_large":
+                    raise
+                items.append((path.name, b"\x00" * (OBJECT_MAX_BYTES + 1)))
+                continue
             items.append((path.name, path.read_bytes()))
         return items
+
+    def read_object(self, object_name: str) -> bytes:
+        """Read a single object, checking size from metadata first.
+
+        Raises non-retryable TransportError('object_too_large') without
+        buffering when the object exceeds OBJECT_MAX_BYTES.
+        """
+        check_object_name(object_name)
+        path = self.incoming / object_name
+        check_object_size(object_name, path.stat().st_size)
+        return path.read_bytes()
 
     def upload(self, object_name: str, data: bytes) -> None:
         check_object_name(object_name)
