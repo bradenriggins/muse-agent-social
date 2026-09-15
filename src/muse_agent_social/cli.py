@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
+import hashlib
 import json
 import os
 import secrets
@@ -830,6 +832,43 @@ def _github_delete_deploy_key(repo: str, key_id, token: str) -> None:
         raise ProvisioningError("api_error", f"GitHub API {exc.code}") from exc
 
 
+def _github_list_deploy_keys(repo: str, token: str) -> list:
+    """GET the repo's existing deploy keys. Raises ProvisioningError on API
+    failure."""
+    req = urllib.request.Request(
+        "https://api.github.com/repos/" + repo + "/keys",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "mas-cli/0.2",
+        },
+    )
+    req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise ProvisioningError("api_error", f"GitHub API {exc.code}") from exc
+    if not isinstance(payload, list):
+        raise ProvisioningError(
+            "api_error", "unexpected deploy key list response from GitHub"
+        )
+    return payload
+
+
+def _ssh_key_fingerprint(openssh_pub: str) -> str:
+    """SHA256 fingerprint of an OpenSSH public key, in GitHub's
+    ``SHA256:<base64>`` form (unpadded). Returns "" for unparseable input."""
+    try:
+        parts = (openssh_pub or "").split()
+        if len(parts) < 2:
+            return ""
+        raw = base64.b64decode(parts[1])
+        digest = hashlib.sha256(raw).digest()
+        return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+    except (ValueError, TypeError, binascii.Error):
+        return ""
+
+
 def cmd_pair_commit(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
@@ -1086,10 +1125,36 @@ def cmd_pair_ingest(args: argparse.Namespace) -> int:
                     repo, deploy_pub, deploy_key_title(rid), lambda: token
                 )
             except ProvisioningError as exc:
-                # Idempotent: the inviter registered this same key during
-                # commit, so "already in use" means the desired end state.
+                # Idempotent only when the SAME key is already registered:
+                # fetch the repo's existing deploy keys and compare the
+                # attempted key's SHA256 fingerprint. A different key in use
+                # (or any other rejection) fails loudly instead of being
+                # swallowed as success.
                 if exc.code == "key_rejected" and "already in use" in str(exc):
-                    reg = {"id": None, "title": deploy_key_title(rid)}
+                    existing = _github_list_deploy_keys(repo, token)
+                    want_fp = _ssh_key_fingerprint(deploy_pub)
+                    match = next(
+                        (
+                            entry
+                            for entry in existing
+                            if isinstance(entry, dict)
+                            and _ssh_key_fingerprint(entry.get("key", ""))
+                            == want_fp
+                        ),
+                        None,
+                    )
+                    if match is None:
+                        raise CliError(
+                            "provisioning_error",
+                            "GitHub reports the deploy key is already in use "
+                            "but no existing deploy key matches its "
+                            "fingerprint; refusing to treat this as success",
+                        )
+                    reg = {
+                        "id": match.get("id"),
+                        "title": match.get("title")
+                        or deploy_key_title(rid),
+                    }
                 else:
                     raise CliError("provisioning_error", f"{exc.code}: {exc}")
             deploy_keys.append(
