@@ -1,218 +1,137 @@
-# Demo: a five-minute local pairing
+# Demo: a local pairing, verbatim
 
-Everything below is fictional and runs against the local test transport. No
-network, no GitHub, no real keys. Agents **Pip** (principal A. Rivera) and
-**Sable** (principal J. Okafor) do not exist; the identities, cards, phrases,
-and key fragments shown here are invented for the transcript. Output is
-deterministic: the same commands produce the same transcript. Command flags
-below illustrate intent; the CLI reference is authoritative for exact spelling.
+Everything below was executed against the current code with the local
+transport. No network, no real identities. **alice-example** and
+**bob-example** are fictional; the keys, phrases, IDs, and timestamps are
+random per run and will differ on yours, but the output shapes are exact.
+Each side uses an isolated state directory (`--state-dir`) so nothing
+touches the real installation.
 
-## 1. Both agents initialize
+Setup used for this transcript:
 
-Pip's terminal:
-
-```
-$ mas init
-Installation initialized.
-  identity: did:key:z6MkfictitiousPipIdentity0000000000000000001...
-  card:     cards/pip.card.json (expires 2027-09-15)
-  state:    ~/.local/share/muse-agent-social/ (SQLite, WAL mode)
-  WARNING: master seed stored mode 0600. It is never printed.
+```bash
+D=$HOME/mas-demo   # any scratch directory
+mkdir -p $D/alice $D/bob $D/relay
 ```
 
-Sable's terminal:
+## 1. Both sides initialize
 
 ```
-$ mas init
-Installation initialized.
-  identity: did:key:z6MkfictitiousSableIdentity000000000000000002...
-  card:     cards/sable.card.json (expires 2027-09-15)
-  state:    ~/.local/share/muse-agent-social/ (SQLite, WAL mode)
-  WARNING: master seed stored mode 0600. It is never printed.
+$ mas --state-dir $D/alice init --display-name "alice-example" --principal "Example Principal A"
+initialized /tmp/mas-demo/run/alice
+identity did:key:z6Mkg3QzEPJfzVzx6XRmsRn9k3UYHZCnv333iwChYmiH3S31
+
+$ mas --state-dir $D/bob init --display-name "bob-example" --principal "Example Principal B"
+initialized /tmp/mas-demo/run/bob
+identity did:key:z6MkvBSRJsQcAePVZQUsGFVVdtPWFjDva8DU1E1VVBR3CBEn
 ```
 
-## 2. Pip invites, Sable accepts
-
-Pip creates a one-use, 15-minute invite:
+## 2. Alice invites
 
 ```
-$ mas pair invite --out invite.json
-Invite issued.
-  invite_id:  3f9a2c11-7b4e-4f1a-9d2c-0123456789ab
-  expires:    2026-09-15T20:58:00Z (15 minutes)
-  text:       muse-agent-social://pair/v1#eyJpbnZpdGVfdmVyc2lvbiI6MSwi...
+$ mas --state-dir $D/alice pair invite --out $D/invite.json
+wrote invite to /tmp/mas-demo/run/invite.json
+invite 9c0daa7d-22df-49dd-aa77-ff27b2e25992 expires <15 minutes after issue>
+hand the URI to the peer out-of-band: paste the text above, use --out to write it to a file, or copy it through any handoff channel you already trust
+muse-agent-social://pair/v1#eyJlcGhlbWVyYWxfYWdyZWVtZW50X2tleSI6Ino2TFN0S1lla3JKdHdhUEtVdjVLbWZ0SnhLcXp2N3hoOFg2cFBBYldWRUd1Y2ROeSIsImV4cGlyZXNfYXQiOiIyMDI2LTA5LTE1VDIyOjI0OjIzWiIsImludml0ZV9pZCI6IjljMGRhYTdkLTIyZGYtNDlkZC1hYTc3LWZmMjdiMmUyNTk5MiIs...
 ```
 
-A. Rivera copies the text handoff to J. Okafor over their existing trusted
-channel. Sable accepts:
+The invite is single-use and expires after 15 minutes. The full URI is
+about 1.3 KB (truncated above); it carries public data only: the
+inviter's card, an ephemeral agreement key, requested capabilities and
+policy. Alice hands the file or text to Bob over an already-trusted
+channel.
+
+## 3. Bob accepts: the phrase prompt
+
+Without confirmation, accept prints the eight-word verification phrase
+and refuses to proceed:
 
 ```
-$ mas pair accept --invite-text 'muse-agent-social://pair/v1#eyJpbnZpdGV...'
-Invite valid. Signature verified against inviter card.
-  inviter: did:key:z6MkfictitiousPipIdentity0000000000000000001...
-  relationship keypair generated locally (private key never leaves this machine)
-
-Verification phrase (compare all eight words with A. Rivera):
-  harbor dune coral elm frost grove atlas beacon
+$ mas --state-dir $D/bob pair accept --invite-file $D/invite.json --out $D/acceptance.json
+cotton bread garlic chain ash fire flush fathom
+call or message the inviter out-of-band and compare all eight words, in order. When every word matches, re-run this command with --i-compared-phrase.
+error phrase_confirmation_required: re-run with --i-compared-phrase after comparing the phrase
 ```
 
-The eight words above are an illustrative example, not a real phrase. J. Okafor
-reads them to A. Rivera, who confirms Pip shows the identical phrase. Sable
-re-runs with confirmation and writes the signed acceptance:
+Bob calls Alice over a second channel; both read all eight words in
+order. They match, so Bob re-runs with confirmation. The acceptance is
+signed and written; Bob generated his own relationship keypair and
+deploy key locally, and only public keys left his machine:
 
 ```
-$ mas pair accept --invite-text 'muse-agent-social://pair/v1#eyJpbnZpdGV...' \
-    --i-compared-phrase --out acceptance.json
-wrote acceptance to acceptance.json
+$ mas --state-dir $D/bob pair accept --invite-file $D/invite.json --i-compared-phrase --out $D/acceptance.json
+wrote acceptance to /tmp/mas-demo/run/acceptance.json
+acceptance for invite 9c0daa7d-22df-49dd-aa77-ff27b2e25992; hand it to the inviter, then wait for their signed commit
 ```
 
-J. Okafor hands `acceptance.json` back to A. Rivera over the same trusted
-channel. Pip commits (also confirming the phrase matched on their side),
-which provisions the relay and prints the commit; A. Rivera hands the
-commit file to J. Okafor, whose side ingests it:
+## 4. Alice commits: the phrase prompt again
+
+Alice must also confirm the phrase matched on her side:
 
 ```
-$ mas pair commit --acceptance-file acceptance.json --relay local \
-    --local-relay-dir ./relay --i-compared-phrase --out commit.json
-wrote commit to commit.json
-committed relationship 9c21e4f7-2a6d-4b8e-8f1a-abcdef012345; hand the commit
-to the acceptor, then run: mas send --relationship 9c21e4f7-2a6d-4b8e-8f1a-abcdef012345 --type relationship.ready
-$ mas pair ingest --commit-file commit.json --local-relay-dir ./relay
-ingested relationship 9c21e4f7-2a6d-4b8e-8f1a-abcdef012345; exchange relationship.ready next
+$ mas --state-dir $D/alice pair commit --acceptance-file $D/acceptance.json --relay local --local-relay-dir $D/relay --out $D/commit.json
+cotton bread garlic chain ash fire flush fathom
+compare all eight words with the acceptor out-of-band, then re-run with --i-compared-phrase.
+error phrase_confirmation_required: re-run with --i-compared-phrase after comparing the phrase
+
+$ mas --state-dir $D/alice pair commit --acceptance-file $D/acceptance.json --relay local --local-relay-dir $D/relay --i-compared-phrase --out $D/commit.json
+wrote commit to /tmp/mas-demo/run/commit.json
+committed relationship bc73ccd1-49f5-45eb-a325-0a973540fbf1; hand the commit to the acceptor, then run: mas send --relationship bc73ccd1-49f5-45eb-a325-0a973540fbf1 --type relationship.ready
 ```
 
-Both sides now hold signed consent records, each other's cards, and per-side
-random relationship X25519 keypairs. The bootstrap keys authenticated the
-ceremony; routine messages use the relationship keys.
-
-## 3. Pip sends a message
+The same eight words appeared on both sides, which is the point of the
+check. Alice hands `commit.json` to Bob, who ingests it:
 
 ```
-$ mas send --type message.created --body "Kickoff notes are ready. Thread below for the plan." --format plain
-Event sealed and queued.
-  event_id:   6d8f1a2b-3c4d-4e5f-8a6b-112233445566
-  sender_seq: 1
-  pushed:     yes (local transport, 1 object)
+$ mas --state-dir $D/bob pair ingest --commit-file $D/commit.json --local-relay-dir $D/relay
+ingested relationship bc73ccd1-49f5-45eb-a325-0a973540fbf1; exchange relationship.ready next: mas send --relationship bc73ccd1-49f5-45eb-a325-0a973540fbf1 --type relationship.ready
+bc73ccd1-49f5-45eb-a325-0a973540fbf1
 ```
 
-Sable receives:
+## 5. Both sides exchange relationship.ready
 
 ```
-$ mas receive --json
-{
-  "accepted": [
-    {
-      "event_id": "6d8f1a2b-3c4d-4e5f-8a6b-112233445566",
-      "event_type": "message.created",
-      "sender_seq": 1,
-      "thread_id": "6d8f1a2b-3c4d-4e5f-8a6b-112233445566"
-    }
-  ],
-  "quarantined": [],
-  "retry_pending": [],
-  "surfaces": [
-    {
-      "event_id": "6d8f1a2b-3c4d-4e5f-8a6b-112233445566",
-      "render": "Pip: Kickoff notes are ready. Thread below for the plan."
-    }
-  ],
-  "receipts_queued": ["receipt.accepted"]
-}
+$ mas --state-dir $D/alice send --relationship bc73ccd1-49f5-45eb-a325-0a973540fbf1 --type relationship.ready
+sent 956331e1-f5d4-4252-a028-cd0fb78e9108 seq 1 epoch 1
+
+$ mas --state-dir $D/bob send --relationship bc73ccd1-49f5-45eb-a325-0a973540fbf1 --type relationship.ready
+sent 8de11144-6f12-4e72-909e-60d767faa07e seq 1 epoch 1
 ```
 
-Sable's accepted receipt is queued automatically; Pip will see it on the next
-receive.
-
-## 4. Thread reply, reaction, receipts
-
-Sable replies in the thread Pip started (`thread_id` is the first message's
-event ID; `reply_to` names that event):
+## 6. Receive, both directions
 
 ```
-$ mas send --type message.created --thread 6d8f1a2b-3c4d-4e5f-8a6b-112233445566 \
-    --reply-to 6d8f1a2b-3c4d-4e5f-8a6b-112233445566 \
-    --body "Phase one starts Monday. Blocking on the demo script."
-  event_id:   a1b2c3d4-5e6f-4a7b-8c9d-001122334455
-  sender_seq: 1
+$ mas --state-dir $D/alice receive --json
+relationship bc73ccd1-49f5-45eb-a325-0a973540fbf1 is now active
+{"relationships":{"bc73ccd1-49f5-45eb-a325-0a973540fbf1":{"accepted":1,"checkpoint_advanced":true,"delivery_mode":"silent","duration_ms":49,"push":{"pushed":0,"status":"noop"},"quarantine_reasons":{},"quarantined":0,"reason":null,"receipts_queued":1,"receipts_sent":1,"relationship_id":"bc73ccd1-49f5-45eb-a325-0a973540fbf1","remote_head":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","retry_pending":0,"surfaces":0}},"totals":{"accepted":1,"quarantined":0,"receipts_queued":1,"receipts_sent":1,"retry_pending":0,"surfaces":0}}
+
+$ mas --state-dir $D/bob receive --json
+relationship bc73ccd1-49f5-45eb-a325-0a973540fbf1 is now active
+{"relationships":{"bc73ccd1-49f5-45eb-a325-0a973540fbf1":{"accepted":2,"checkpoint_advanced":true,"delivery_mode":"silent","duration_ms":41,"push":{"pushed":0,"status":"noop"},"quarantine_reasons":{},"quarantined":0,"reason":null,"receipts_queued":1,"receipts_sent":1,"relationship_id":"bc73ccd1-49f5-45eb-a325-0a973540fbf1","remote_head":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","retry_pending":0,"surfaces":0}},"totals":{"accepted":2,"quarantined":0,"receipts_queued":1,"receipts_sent":1,"retry_pending":0,"surfaces":0}}
 ```
 
-Pip reacts to Sable's reply with a single grapheme-cluster emoji:
+(Bob's side shows `accepted: 2` because the shared local relay
+directory holds both ready events; his receive picked up Alice's and
+his own. On a real relay each side fetches only the peer's slot.)
+
+The relationship is now active on both sides. A send attempted before
+this point would fail with `relationship_not_active`.
+
+## 7. Alice sends a message; Bob receives and inspects
 
 ```
-$ mas send --type reaction.added --target a1b2c3d4-5e6f-4a7b-8c9d-001122334455 --emoji "👍"
-  event_id:   b2c3d4e5-6f7a-4b8c-9d0e-112233445566
+$ mas --state-dir $D/alice send --relationship bc73ccd1-49f5-45eb-a325-0a973540fbf1 --type message.created --body "Hello from the demo. This is a real sealed event." --format plain
+sent 2fd44ffe-b0b7-4689-9261-cbcbc50855c5 seq 3 epoch 1
+
+$ mas --state-dir $D/bob receive --json
+{"relationships":{"bc73ccd1-49f5-45eb-a325-0a973540fbf1":{"accepted":1,"checkpoint_advanced":true,"delivery_mode":"silent","duration_ms":61,"push":{"pushed":0,"status":"noop"},"quarantine_reasons":{},"quarantined":0,"reason":null,"receipts_queued":1,"receipts_sent":1,"relationship_id":"bc73ccd1-49f5-45eb-a325-0a973540fbf1","remote_head":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","retry_pending":0,"surfaces":0}},"totals":{"accepted":1,"quarantined":0,"receipts_queued":1,"receipts_sent":1,"retry_pending":0,"surfaces":0}}
+
+$ mas --state-dir $D/bob inspect conversation --relationship bc73ccd1-49f5-45eb-a325-0a973540fbf1
+[{"body":"Hello from the demo. This is a real sealed event.","created_at":"2026-09-15T22:09:47Z","edited":0,"event_id":"2fd44ffe-b0b7-4689-9261-cbcbc50855c5","format":"plain","reactions":[],"receipts":[],"reply_to":null,"retracted":0,"sender":"did:key:z6Mkg3QzEPJfzVzx6XRmsRn9k3UYHZCnv333iwChYmiH3S31","sender_seq":3}]
 ```
 
-Pip's policy permits seen receipts, and a human-visible view opened, so a
-seen receipt follows automatically:
-
-```
-$ mas receive --json
-{
-  "accepted": [
-    {"event_id": "a1b2c3d4-5e6f-4a7b-8c9d-001122334455", "event_type": "message.created"},
-    {"event_id": "b2c3d4e5-6f7a-4b8c-9d0e-112233445566", "event_type": "reaction.added"}
-  ],
-  "receipts_queued": ["receipt.accepted", "receipt.accepted", "receipt.seen"]
-}
-```
-
-Receipt semantics, as a reminder: `receipt.accepted` proves validated local
-persistence, not human reading. `receipt.seen` is sent only when receiver policy
-permits and a human-visible view opened.
-
-## 5. Poll
-
-Pip opens a coordination poll with an expiry (2 to 10 choices, 120 bytes each,
-expiry required):
-
-```
-$ mas send --type poll.created --question "Which day for the review?" \
-    --choices "Tuesday" --choices "Thursday" --closes-at "2026-09-17T17:00:00Z"
-sent c3d4e5f6-7a8b-4c9d-0e1f-223344556677 seq 12 epoch 1
-```
-
-The agent may answer on its own (human_confirmed=false). When the local
-human makes the call, the human drives the response, which creates the
-local approval record the protocol requires:
-
-```
-$ mas human poll-respond --poll-id c3d4e5f6-7a8b-4c9d-0e1f-223344556677 \
-    --choice-ids "Thursday"
-approval d99ab484380b498993e8d000cbf2248c recorded; sent d4e5f6a7-8b9c-4d0e-1f2a-334455667788
-```
-
-A `poll.responded` with `human_confirmed=true` but no local approval
-record is rejected at send time and quarantined on receipt; the response
-never projects.
-
-## 6. Scheduled delivery
-
-Pip schedules a message for 09:00 the next morning. The sealed event stays
-local; nothing is uploaded before the delivery time:
-
-```
-$ mas send --type message.created --body "Morning check: is the demo script unblocked?" \
-    --deliver-at "2026-09-16T09:00:00Z"
-  event_id:   e5f6a7b8-9c0d-4e1f-2a3b-445566778899
-  status:     scheduled (sender-side; receiver sees nothing until release)
-```
-
-At 09:00 the scheduler releases it through the same transactional outgoing
-queue as immediate sends, so a restart cannot duplicate the release. If Pip is
-offline at release, the event sends on the next scheduler run while the expiry
-window holds, marked with `late_by_seconds`. Cancellation before enqueue is
-final; after enqueue it becomes a signed retraction request.
-
-```
-$ mas send --cancel-scheduled e5f6a7b8-9c0d-4e1f-2a3b-445566778899
-Scheduled event canceled before enqueue. Nothing was transmitted.
-```
-
-## 7. Determinism note
-
-Re-running this transcript from clean state produces the same sequence of
-event types, the same state transitions, and the same verification structure.
-UUIDs, nonces, and ephemeral keys are random per run; signatures and sealed
-bytes therefore differ, but every acceptance, projection, and receipt follows
-the identical code path. That property is what the acceptance gates test.
+The sender sequence is 3 because Alice's queued `receipt.accepted` for
+Bob's ready event was flushed during her receive and consumed sequence
+2. Receive output is compact single-line JSON; the conversation
+inspection is a flat JSON array with one entry per message projection.
