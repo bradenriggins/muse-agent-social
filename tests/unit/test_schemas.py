@@ -349,7 +349,7 @@ def test_envelope_accepts_all_event_types():
         env = valid_envelope()
         env["protected"]["event_type"] = event_type
         validate("event-envelope", env)
-    assert len(PAYLOAD_DISPATCH) == 22
+    assert len(PAYLOAD_DISPATCH) == 23
 
 
 # payloads
@@ -623,7 +623,7 @@ def test_all_schema_files_are_valid_draft_2020_12():
 
     schemas_dir = _schemas_dir()
     files = sorted(schemas_dir.rglob("*.schema.json"))
-    assert len(files) == 16, [f.name for f in files]
+    assert len(files) == 17, [f.name for f in files]
     for path in files:
         schema = std_json.loads(path.read_text(encoding="utf-8"))
         jsonschema.Draft202012Validator.check_schema(schema)

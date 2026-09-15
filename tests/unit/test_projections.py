@@ -1086,10 +1086,12 @@ def test_get_conversation_limit_and_before(conn, log):
 
 
 def test_migrate_projections_idempotent(conn):
-    assert projections.migrate_projections(conn) == 3
-    assert projections.migrate_projections(conn) == 3
+    assert projections.migrate_projections(conn) == \
+        projections.PROJECTIONS_SCHEMA_VERSION
+    assert projections.migrate_projections(conn) == \
+        projections.PROJECTIONS_SCHEMA_VERSION
     version = conn.execute("PRAGMA user_version;").fetchone()[0]
-    assert version == 3
+    assert version == projections.PROJECTIONS_SCHEMA_VERSION
 
 
 def test_migrate_requires_skeleton_first():
