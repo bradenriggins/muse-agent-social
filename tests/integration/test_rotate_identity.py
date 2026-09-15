@@ -2,12 +2,9 @@
 
 `mas rotate --identity` must rotate the identity signing key with the
 existing crypto (rotate_identity_key / verify_identity_rotation),
-reissue the local agent card, and persist a verifiable announcement.
-
-Peer notification cannot go over the protocol: no identity-rotation
-event type exists in the v0.2 schemas (schema ownership belongs to
-another lane), so the command must NOT fake it. It writes the
-announcement to disk for out-of-band delivery and says so loudly.
+reissue the local agent card, persist a verifiable announcement, and
+notify each active peer with a signed identity.rotated event sent as
+the old identity before the local switch.
 """
 
 import json
@@ -100,8 +97,9 @@ class RotateIdentityTest(unittest.TestCase):
             sys.path.remove(str(SRC))
         self.assertTrue(verify_identity_rotation(announcement, old_card))
 
-        # No protocol event exists for this: the command must say peer
-        # notification is out-of-band, not fake a delivery.
+        # The announcement is also delivered in-protocol: with no active
+        # relationships here, the fallback note about out-of-band delivery
+        # must still be present.
         self.assertIn("out-of-band", out.lower() + err.lower())
 
         # The install still opens and works under the new identity.

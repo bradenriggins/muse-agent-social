@@ -226,7 +226,7 @@ def test_migration3_adds_attestation_and_backfills(tmp_path):
         (RID, CONV, BOB, _ts(0), _ts(3600), _ts(10)),
     )
     version = migrations.migrate(c)
-    assert version == migrations.SCHEMA_VERSION == 3
+    assert version == migrations.SCHEMA_VERSION
     cols = [r["name"] for r in c.execute("PRAGMA table_info(human_requests);")]
     assert "attestation" in cols
     assert (

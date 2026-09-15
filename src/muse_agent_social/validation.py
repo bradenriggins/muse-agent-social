@@ -176,6 +176,7 @@ PAYLOAD_DISPATCH: dict[str, tuple[str, str]] = {
     "task.updated": ("payloads/task", "updated"),
     "human.requested": ("payloads/human", "requested"),
     "human.responded": ("payloads/human", "responded"),
+    "identity.rotated": ("payloads/identity", "identity_rotated"),
     "delivery.scheduled": ("payloads/delivery", "scheduled"),
     "delivery.canceled": ("payloads/delivery", "canceled"),
     "security.key.prepare": ("payloads/security", "prepare"),

@@ -63,7 +63,7 @@ __all__ = [
 # Schema version owned by this track. The skeleton track owns version 1;
 # this migration is version 2, and the human-approval attestation column
 # is version 3. See INTERFACE.md for the bump contract.
-PROJECTIONS_SCHEMA_VERSION = 3
+PROJECTIONS_SCHEMA_VERSION = 4
 
 # Seven days, in seconds, before a missing projection target expires.
 PENDING_TARGET_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -71,7 +71,7 @@ PENDING_TARGET_TTL_SECONDS = 7 * 24 * 60 * 60
 # Event types with no projection rule. They are valid protocol events;
 # projecting them is a no-op rather than a rejection.
 _NO_PROJECTION_TYPES = frozenset(
-    {"relationship.ready", "migration.ready", "migration.commit"}
+    {"relationship.ready", "migration.ready", "migration.commit", "identity.rotated"}
 )
 
 _V2_DDL = """
@@ -348,13 +348,13 @@ def _exec_ddl(conn: sqlite3.Connection, ddl: str) -> None:
 
 
 def migrate_projections(conn: sqlite3.Connection) -> int:
-    """Apply the projection-track migrations (schema version 3).
+    """Apply the projection-track migrations (schema version 4).
 
     Idempotent: safe to run repeatedly. Requires the skeleton migration
-    (version 1) to be applied first. Refuses databases newer than version 3.
+    (version 1) to be applied first. Refuses databases newer than version 4.
     Must be called outside any open transaction.
 
-    Returns the schema version (3).
+    Returns the schema version (4).
     """
     current = get_user_version(conn)
     if current < 1:
@@ -378,7 +378,7 @@ def migrate_projections(conn: sqlite3.Connection) -> int:
             )
             conn.execute(
                 "INSERT OR REPLACE INTO migration_state(key, value) "
-                "VALUES ('projections_migration', '3');"
+                "VALUES ('projections_migration', '4');"
             )
     return PROJECTIONS_SCHEMA_VERSION
 

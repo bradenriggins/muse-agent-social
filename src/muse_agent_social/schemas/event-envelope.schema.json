@@ -136,6 +136,7 @@
             "delivery.scheduled",
             "human.requested",
             "human.responded",
+            "identity.rotated",
             "message.created",
             "message.edited",
             "message.retracted",

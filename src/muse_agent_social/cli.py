@@ -44,7 +44,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
@@ -68,13 +71,16 @@ from .compatibility.v01 import (
 )
 from .config import load_config, resolve_state_dir, save_config
 from .crypto.identity import (
+    b64url_decode,
     derive_identity_hierarchy,
     generate_master_seed,
     parse_agreement_key,
+    parse_identity_id,
     store_master_seed,
 )
 from .crypto.rotation import (
     ConfirmRejected,
+    IdentityRotationError,
     NoAckTimeout,
     RotationError,
     RotationManager,
@@ -2316,6 +2322,127 @@ def _redrain_projection(ctx: Ctx, rid: str, event_id: str) -> None:
             )
 
 
+def _verify_identity_rotation_against_pinned(
+    announcement: dict, old_identity_id: str
+) -> dict:
+    """Verify an identity.rotated announcement against the pinned peer identity.
+
+    The peer's full card is not stored locally, so continuity rests on the
+    old-key cross-signature: only the holder of the pinned identity's
+    private key could have produced it. Checks, fail-closed:
+
+    - announcement is a dict with rotation_version 1
+    - new_card verifies (schema, self-signature, expiry) via verify_card
+    - the new identity id differs from the old
+    - cross_signatures holds exactly the old and new key ids, and both
+      Ed25519 signatures verify over the restricted-JCS bytes of new_card
+
+    Returns the new card dict. Raises IdentityRotationError on any problem.
+    """
+    from cryptography.exceptions import InvalidSignature
+
+    if not isinstance(announcement, dict):
+        raise IdentityRotationError("bad_announcement", "announcement must be a dict")
+    if announcement.get("rotation_version") != 1:
+        raise IdentityRotationError(
+            "bad_version", "unsupported rotation_version"
+        )
+    new_card = announcement.get("new_card")
+    if not isinstance(new_card, dict):
+        raise IdentityRotationError("bad_card", "announcement has no new_card")
+    card_check = verify_card(new_card)
+    if not card_check.ok:
+        raise IdentityRotationError(
+            "bad_card", f"new card failed verification: {card_check.reason_code}"
+        )
+    new_id = new_card.get("identity_id", "")
+    if not old_identity_id or not new_id or old_identity_id == new_id:
+        raise IdentityRotationError("bad_identity", "new identity id is not new")
+    sigs = announcement.get("cross_signatures")
+    if not isinstance(sigs, list) or len(sigs) != 2:
+        raise IdentityRotationError(
+            "bad_signatures", "need exactly two cross-signatures"
+        )
+    by_key = {
+        s.get("key_id"): s.get("signature")
+        for s in sigs
+        if isinstance(s, dict)
+    }
+    if set(by_key) != {old_identity_id, new_id}:
+        raise IdentityRotationError(
+            "bad_signatures", "cross-signatures must cover the old and new ids"
+        )
+    canonical_new = restricted_jcs(new_card)
+    try:
+        for key_id in (old_identity_id, new_id):
+            pub = parse_identity_id(key_id)
+            signature = b64url_decode(by_key[key_id])
+            Ed25519PublicKey.from_public_bytes(pub).verify(signature, canonical_new)
+    except (ValueError, InvalidSignature, KeyError, TypeError) as exc:
+        raise IdentityRotationError(
+            "bad_signatures", f"cross-signature verification failed: {exc}"
+        ) from exc
+    return new_card
+
+
+def _apply_identity_rotation(
+    ctx: Ctx, rid: str, announcement: dict, old_peer_id: str
+) -> bool:
+    """Apply a verified identity.rotated announcement to the relationship.
+
+    Verifies the announcement against the pinned peer identity id, then
+    updates relationships.peer_identity_id (keeping the old id in
+    prior_peer_identity_id so delayed pre-rotation events and redelivered
+    rotation announcements stay attributable) and peer_display_name.
+
+    Idempotent: returns False without touching the database when the
+    stored peer identity already equals the announced new identity.
+    Raises IdentityRotationError when verification fails or the stored
+    peer identity no longer matches the announcement's old identity.
+    """
+    new_card = _verify_identity_rotation_against_pinned(announcement, old_peer_id)
+    new_id = new_card["identity_id"]
+    rel = get_relationship(ctx.conn, rid)
+    if rel["peer_identity_id"] == new_id:
+        return False
+    if rel["peer_identity_id"] != old_peer_id:
+        raise IdentityRotationError(
+            "stale_announcement",
+            "peer identity changed since this announcement was issued",
+        )
+    with transaction(ctx.conn):
+        ctx.conn.execute(
+            "UPDATE relationships SET peer_identity_id = ?, "
+            "prior_peer_identity_id = ?, peer_display_name = ? "
+            "WHERE relationship_id = ?",
+            (new_id, old_peer_id, new_card.get("display_name"), rid),
+        )
+    return True
+
+
+def _maybe_apply_pending_identity_rotation(
+    ctx: Ctx, rid: str, event_id: str, sender_id: str
+) -> None:
+    """Re-apply an identity rotation missed by a post-commit crash.
+
+    If the duplicate redelivery is an identity.rotated event whose
+    announcement has not been applied yet (the first attempt died after
+    the commit but before the identity update), apply it now.
+    Idempotent: already-applied announcements are a noop.
+    """
+    row = ctx.conn.execute(
+        "SELECT event_type FROM events WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    if row is None or row["event_type"] != "identity.rotated":
+        return
+    payload_row = ctx.conn.execute(
+        "SELECT payload FROM event_payloads WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    if payload_row is None:
+        return
+    _apply_identity_rotation(ctx, rid, json.loads(payload_row["payload"]), sender_id)
+
+
 def _receive_object_inner(
     ctx: Ctx, rid: str, object_name: str, data: bytes, acc: dict
 ) -> dict:
@@ -2340,7 +2467,9 @@ def _receive_object_inner(
     protected = envelope["protected"]
     if protected["relationship_id"] != rid:
         raise CliError("relationship_mismatch", "object is for another relationship")
-    if protected["sender"] != peer_id:
+    if protected["sender"] != peer_id and protected["sender"] != rel.get(
+        "prior_peer_identity_id"
+    ):
         raise CliError("unknown_sender", f"unexpected sender {protected['sender']}")
     event_id = protected["event_id"]
     existing = ctx.conn.execute(
@@ -2354,6 +2483,13 @@ def _receive_object_inner(
             # projection_queue row behind. Re-drain it so the projection
             # converges exactly once instead of being silently lost.
             _redrain_projection(ctx, rid, event_id)
+            # Same crash gap for identity rotation: if the first attempt
+            # died after the commit but before the peer identity update,
+            # apply the pending rotation now (idempotent). Verify against
+            # the sender (the old identity), not the current peer id.
+            _maybe_apply_pending_identity_rotation(
+                ctx, rid, event_id, protected["sender"]
+            )
             return {"outcome": "accepted", "surfaces": 0, "receipts_queued": 0}
         raise CliError("event_id_conflict", "event id reused with different bytes")
     if ctx.conn.execute(
@@ -2379,6 +2515,16 @@ def _receive_object_inner(
     except SealingError as exc:
         raise CliError(f"unseal_{exc.code}", f"{exc}")
     event_type = protected["event_type"]
+    if event_type == "identity.rotated":
+        # Verify the rotation announcement against the sender's pinned
+        # identity BEFORE anything is stored: a bogus announcement is
+        # quarantined without touching the event log.
+        try:
+            _verify_identity_rotation_against_pinned(payload, protected["sender"])
+        except IdentityRotationError as exc:
+            raise CliError(
+                "identity_rotation_rejected", f"{exc.code}: {exc}"
+            ) from exc
     expires_at = add_seconds(
         now,
         max(
@@ -2507,6 +2653,16 @@ def _receive_object_inner(
         return _quarantine_outcome(
             ctx, rid, object_name, f"projection_{exc.code}", str(exc)
         )
+    if event_type == "identity.rotated":
+        # The announcement was verified pre-commit; apply the peer
+        # identity update now. A crash between the commit and this update
+        # is converged by the duplicate resume path.
+        try:
+            _apply_identity_rotation(ctx, rid, payload, protected["sender"])
+        except IdentityRotationError as exc:
+            return _quarantine_outcome(
+                ctx, rid, object_name, "identity_rotation_rejected", str(exc)
+            )
     # Rotation hooks and relationship.ready activation.
     try:
         _post_receive_hooks(
@@ -2694,14 +2850,10 @@ def _rotate_identity(ctx: Ctx, args: argparse.Namespace) -> int:
     """Rotate the identity signing key (H11).
 
     Uses the shipped crypto (rotate_identity_key / verify_identity_rotation),
-    reissues the local agent card under the new identity id, backs up the
-    old seed and card, and persists the rotation announcement for
-    out-of-band peer delivery.
-
-    There is deliberately no in-protocol peer notification: the v0.2 event
-    schemas define no identity-rotation event type (schema ownership sits
-    with another lane), so faking one would corrupt the event stream. The
-    command says this loudly instead.
+    notifies each active peer with a signed identity.rotated event (sent as
+    the old identity, before the local switch), reissues the local agent card
+    under the new identity id, backs up the old seed and card, and persists
+    the rotation announcement for out-of-band delivery as a fallback.
     """
     if not args.confirm_identity:
         raise CliError(
@@ -2736,6 +2888,26 @@ def _rotate_identity(ctx: Ctx, args: argparse.Namespace) -> int:
             "no state was changed",
         )
 
+    # Notify each active peer BEFORE switching the local identity: the
+    # identity.rotated event is sealed and signed as the OLD identity,
+    # which is what the peer still has pinned. After the switch, the
+    # peer could not attribute the announcement.
+    active_rels = [
+        dict(r)
+        for r in ctx.conn.execute(
+            "SELECT * FROM relationships WHERE consent_state = 'active'"
+        ).fetchall()
+    ]
+    for rel in active_rels:
+        try:
+            _send_event(ctx, rel, "identity.rotated", announcement)
+        except CliError as exc:
+            raise CliError(
+                "identity_rotation_notify_failed",
+                f"could not notify peer on {rel['relationship_id']}: {exc}; "
+                "no state was changed",
+            ) from exc
+
     identity_ref = ctx.config.get("identity_ref") or {}
     seed_rel = identity_ref.get("master_seed_path") or f"keys/{_MASTER_SEED_NAME}"
     card_rel = identity_ref.get("card_path") or _CARD_NAME
@@ -2763,17 +2935,20 @@ def _rotate_identity(ctx: Ctx, args: argparse.Namespace) -> int:
     ann_path.write_text(_canon_text(announcement) + "\n", encoding="utf-8")
 
     print(
+        "peers notified over the relay: "
+        f"{len(active_rels)} active relationship(s) received identity.rotated"
+        if active_rels
+        else "no active relationships: no peer notification was sent"
+    )
+    print(
         f"identity rotated: {ctx.identity_id} -> {new_hierarchy.identity_id}"
     )
     print(f"new card: {card_path}")
     print(f"announcement: {ann_path}")
     print(f"backups: {backup_seed}, {backup_card}")
     print(
-        "warning: peer notification is out-of-band. No identity-rotation "
-        "event type exists in the v0.2 protocol schemas, so peers cannot "
-        "learn the new identity_id over the relay yet; share the "
-        "announcement file with each peer directly until the protocol "
-        "gains an identity.rotation event.",
+        "note: the announcement file is also saved for out-of-band "
+        "delivery as a fallback (e.g. a peer that was offline).",
         file=sys.stderr,
     )
     return 0

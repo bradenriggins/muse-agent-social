@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Migration 2 gathers the auxiliary DDL owned by feature modules so that a
 # single migrate() call brings a fresh database to the full v0.2 schema.
@@ -21,6 +21,14 @@ from muse_agent_social.crypto.rotation import _ROTATION_TABLES
 from muse_agent_social.model.approvals import APPROVALS_DDL
 from muse_agent_social.store.projections import _V2_DDL as _PROJECTIONS_V2_DDL
 from muse_agent_social.store.projections import _V3_DDL as _PROJECTIONS_V3_DDL
+
+# Migration 4: remember the peer's previous identity id across an
+# identity rotation, so delayed pre-rotation events and redelivered
+# rotation announcements from the old identity are still attributable
+# instead of being rejected as unknown_sender.
+_V4_DDL = """
+ALTER TABLE relationships ADD COLUMN prior_peer_identity_id TEXT;
+"""
 from muse_agent_social.transports.tables import TRANSPORT_DDL
 
 _V2_DDL = "\n".join(
@@ -162,6 +170,7 @@ MIGRATIONS: list[tuple[int, str, str]] = [
     (1, "v1_initial_schema", _V1_DDL),
     (2, "v2_projections_rotation_transport", _V2_DDL),
     (3, "v3_human_approval_attestation", _PROJECTIONS_V3_DDL),
+    (4, "v4_prior_peer_identity", _V4_DDL),
 ]
 
 
