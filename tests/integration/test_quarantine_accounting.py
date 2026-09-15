@@ -4,14 +4,8 @@ Fifty forged envelopes with distinct unknown ``key_epoch`` values go
 through the real CLI receive path (``cli._receive_object``), which gates
 on ``RotationManager.on_data_event_epoch`` before any cryptographic
 work. Each envelope must come back ``retry_pending`` (never accepted),
-and the ``rotation_quarantine`` table must stay bounded: a small
-constant cap, not one row per forged epoch.
-
-NOTE: this test depends on the receive-path lane's bounded-quarantine
-fix. On the current base ``on_data_event_epoch`` inserts one row per
-distinct unknown epoch, so the count reaches 50 and this test fails.
-Report it as PENDING-merge-verification with this exact name until
-that lane lands.
+and the ``rotation_quarantine`` table must stay bounded by the
+production cap (50 rows per relationship), not grow without limit.
 """
 
 import os
@@ -37,10 +31,10 @@ from support.harness import (
 )
 
 N_FORGED_EPOCHS = 50
-# The intended bound: a handful of unknown-epoch rows per relationship,
-# not one per forged epoch. The fixing lane may choose the exact cap;
-# this test pins "bounded and small".
-QUARANTINE_ROW_CAP = 8
+# The production bound (crypto/rotation.py ROTATION_QUARANTINE_CAP): at most
+# 50 unknown-epoch rows per relationship, not one per forged epoch without
+# limit. Rejected rows older than 30 days are expired by sweep().
+QUARANTINE_ROW_CAP = 50
 
 
 def _resign(envelope: dict, signer) -> bytes:
@@ -65,8 +59,10 @@ def ctx(tmp_path):
     provision_receive_side(conn, rid, bob, alice,
                            keys_dir=str(state_dir / "keys"))
     conv = new_conversation(conn)
+    from muse_agent_social import cli as cli_mod
+    cli_mod._ensure_cli_tables(conn)
     return types.SimpleNamespace(
-        conn=conn, state_dir=state_dir,
+        conn=conn, state_dir=state_dir, keys_dir=state_dir / "keys",
         alice=alice, bob=bob, rid=rid, conv=conv,
     )
 
@@ -85,12 +81,6 @@ def _forged_epoch_envelope(ctx, key_epoch: int, seq: int) -> bytes:
     return _resign(envelope, ctx.alice["ed_priv"])
 
 
-@pytest.mark.xfail(
-    reason="PENDING-merge-verification: needs the receive-path lane's "
-    "bounded-quarantine fix (one rotation_quarantine row per forged epoch "
-    "on this base)",
-    strict=False,
-)
 def test_forged_epoch_flood_keeps_quarantine_bounded(ctx):
     from muse_agent_social.cli import _receive_object
 
