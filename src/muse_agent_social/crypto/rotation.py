@@ -35,8 +35,8 @@ peer keys live in ``relationships.peer_agreement_key`` per the landed
 schema. This module NEVER generates, accepts, or retains a peer private key.
 
 The sealed event envelope (AES-256-GCM, per-message ephemeral keys) is the
-transport's job. This module exposes the CEK wrap/unwrap primitives the
-transport uses for dual-wrap (``wrap_cek`` / ``unwrap_cek``).
+transport's job (``crypto.sealing``); this module supplies the per-epoch
+peer public keys the transport dual-wraps to (``dual_wrap_keys``).
 """
 
 from __future__ import annotations
@@ -54,9 +54,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
-    X25519PublicKey,
 )
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from .._keyfiles import delete_private_key, store_private_key
 from ..model.cards import card_fingerprint, create_card, parse_timestamp, verify_card
@@ -85,8 +83,6 @@ __all__ = [
     "build_ack",
     "build_confirm",
     "build_commit",
-    "wrap_cek",
-    "unwrap_cek",
     "RotationManager",
     "rotate_identity_key",
     "verify_identity_rotation",
@@ -215,69 +211,6 @@ def build_commit(epoch: int) -> dict:
     return payload
 
 
-# ---------------------------------------------------------------------------
-# CEK wrap primitives (used by the transport for dual-wrap)
-# ---------------------------------------------------------------------------
-
-def _wrap_key(shared_secret: bytes, epoch: int) -> bytes:
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=b"mas-cek-wrap-v1",
-        info=f"epoch:{epoch}".encode("ascii"),
-    )
-    return hkdf.derive(shared_secret)
-
-
-def wrap_cek(cek: bytes, recipient_keys: dict) -> dict:
-    """Wrap a content-encryption key to one X25519 public key per epoch.
-
-    *recipient_keys* maps epoch (int) to the recipient's agreement public
-    key (multibase). Returns ``{str(epoch): {"ephemeral_public_key": hex,
-    "wrapped_cek": b64url}}``. During a rotation transition the transport
-    passes both the prior and the new epoch keys, which is the dual-wrap.
-    """
-    if not isinstance(cek, (bytes, bytearray)) or len(cek) != 32:
-        raise RotationError("bad_cek", "cek must be 32 bytes")
-    wraps = {}
-    for epoch, pub_multibase in recipient_keys.items():
-        epoch = int(epoch)
-        raw_pub = parse_agreement_key(pub_multibase)
-        ephemeral = X25519PrivateKey.generate()
-        shared = ephemeral.exchange(X25519PublicKey.from_public_bytes(raw_pub))
-        key = _wrap_key(shared, epoch)
-        wrapped = bytes(a ^ b for a, b in zip(cek, key))
-        wraps[str(epoch)] = {
-            "ephemeral_public_key": ephemeral.public_key().public_bytes_raw().hex(),
-            "wrapped_cek": b64url_encode(wrapped),
-        }
-    if not wraps:
-        raise RotationError("no_recipient_keys", "recipient_keys is empty")
-    return wraps
-
-
-def unwrap_cek(wraps: dict, epoch: int, recipient_priv: X25519PrivateKey) -> bytes:
-    """Unwrap a CEK using the recipient's private key for *epoch*."""
-    if not isinstance(wraps, dict):
-        raise RotationError("bad_wraps", "wraps must be a mapping")
-    wrap = wraps.get(str(int(epoch)))
-    if not isinstance(wrap, dict):
-        raise RotationError(
-            "no_wrap_for_epoch", f"no wrap present for epoch {int(epoch)}"
-        )
-    try:
-        ephemeral_raw = bytes.fromhex(wrap["ephemeral_public_key"])
-        wrapped = b64url_decode(wrap["wrapped_cek"])
-    except (KeyError, ValueError, TypeError) as exc:
-        raise RotationError("bad_wrap", f"malformed wrap: {exc}") from exc
-    if len(wrapped) != 32:
-        raise RotationError("bad_wrap", "wrapped CEK must be 32 bytes")
-    shared = recipient_priv.exchange(X25519PublicKey.from_public_bytes(ephemeral_raw))
-    key = _wrap_key(shared, int(epoch))
-    return bytes(a ^ b for a, b in zip(wrapped, key))
-
-
-# ---------------------------------------------------------------------------
 # Auxiliary tables
 # ---------------------------------------------------------------------------
 
@@ -412,11 +345,23 @@ class RotationManager:
             (rid, int(epoch), role),
         ).fetchone()
 
-    def _in_flight(self, rid: str):
+    def _in_flight(self, rid: str, role: str | None = None):
+        """Return the current in-flight rotation row, if any.
+
+        Pass ``role='rotating'`` or ``role='acking'`` when the caller
+        requires a specific side; without it the query is role-agnostic
+        and can return the other side's row after conflict resolution.
+        """
+        if role is None:
+            return self.conn.execute(
+                "SELECT * FROM key_rotations WHERE relationship_id=? "
+                "AND phase NOT IN ('committed', 'discarded')",
+                (rid,),
+            ).fetchone()
         return self.conn.execute(
             "SELECT * FROM key_rotations WHERE relationship_id=? "
-            "AND phase NOT IN ('committed', 'discarded')",
-            (rid,),
+            "AND role=? AND phase NOT IN ('committed', 'discarded')",
+            (rid, role),
         ).fetchone()
 
     # -- rotating side ----------------------------------------------------
@@ -511,13 +456,14 @@ class RotationManager:
         with self.conn:
             self.conn.execute(
                 "UPDATE key_rotations SET phase='acknowledged', "
-                "acknowledged_at=? WHERE relationship_id=? AND epoch=?",
+                "acknowledged_at=? WHERE relationship_id=? AND epoch=? "
+                "AND role='rotating'",
                 (_ts(now), rid, int(ack["epoch"])),
             )
             self.conn.execute(
                 "UPDATE key_epochs SET state='acknowledged' "
-                "WHERE relationship_id=? AND epoch=?",
-                (rid, int(ack["epoch"])),
+                "WHERE relationship_id=? AND epoch=? AND private_key_ref != ?",
+                (rid, int(ack["epoch"]), _PEER_REF),
             )
 
     def note_decrypted_new_wrap(self, rid: str, epoch: int, now=None) -> None:
@@ -536,14 +482,14 @@ class RotationManager:
         with self.conn:
             self.conn.execute(
                 "UPDATE key_rotations SET new_wrap_seen=1 "
-                "WHERE relationship_id=? AND epoch=?",
+                "WHERE relationship_id=? AND epoch=? AND role='rotating'",
                 (rid, int(epoch)),
             )
 
     def confirm_rotation(self, rid: str, now=None) -> dict:
         """Send ``security.key.confirm`` after decrypting a new-epoch wrap."""
         now = self._now(now)
-        rotation = self._in_flight(rid)
+        rotation = self._in_flight(rid, role='rotating')
         if (
             rotation is None
             or rotation["role"] != "rotating"
@@ -560,7 +506,7 @@ class RotationManager:
         with self.conn:
             self.conn.execute(
                 "UPDATE key_rotations SET phase='confirmed', confirmed_at=? "
-                "WHERE relationship_id=? AND epoch=?",
+                "WHERE relationship_id=? AND epoch=? AND role='rotating'",
                 (_ts(now), rid, int(rotation["epoch"])),
             )
         return build_confirm(int(rotation["epoch"]))
@@ -585,19 +531,19 @@ class RotationManager:
             self.conn.execute(
                 "UPDATE key_rotations SET phase='committed', committed_at=?, "
                 "accepted_events_since_commit=0 "
-                "WHERE relationship_id=? AND epoch=?",
+                "WHERE relationship_id=? AND epoch=? AND role='rotating'",
                 (_ts(now), rid, epoch),
             )
             self.conn.execute(
                 "UPDATE key_epochs SET state='active' "
-                "WHERE relationship_id=? AND epoch=?",
-                (rid, epoch),
+                "WHERE relationship_id=? AND epoch=? AND private_key_ref != ?",
+                (rid, epoch, _PEER_REF),
             )
             if prior_epoch in own:
                 self.conn.execute(
                     "UPDATE key_epochs SET state='retired' "
-                    "WHERE relationship_id=? AND epoch=?",
-                    (rid, prior_epoch),
+                    "WHERE relationship_id=? AND epoch=? AND private_key_ref != ?",
+                    (rid, prior_epoch, _PEER_REF),
                 )
             self.conn.execute(
                 "UPDATE relationships SET key_epoch=? WHERE relationship_id=?",
@@ -739,7 +685,7 @@ class RotationManager:
         wrapped to both the peer's prior and new keys, with the envelope
         ``key_epoch`` set to the new epoch.
         """
-        rotation = self._in_flight(rid)
+        rotation = self._in_flight(rid, role='acking')
         if (
             rotation is None
             or rotation["role"] != "acking"
@@ -794,14 +740,14 @@ class RotationManager:
         with self.conn:
             self.conn.execute(
                 "UPDATE key_rotations SET phase='confirmed', confirmed_at=? "
-                "WHERE relationship_id=? AND epoch=?",
+                "WHERE relationship_id=? AND epoch=? AND role='acking'",
                 (_ts(now), rid, int(confirm["epoch"])),
             )
 
     def build_commit_payload(self, rid: str, now=None) -> dict:
         """Build ``security.key.commit``; the peer stops writing old wraps."""
         now = self._now(now)
-        rotation = self._in_flight(rid)
+        rotation = self._in_flight(rid, role='acking')
         if (
             rotation is None
             or rotation["role"] != "acking"
@@ -815,7 +761,7 @@ class RotationManager:
         with self.conn:
             self.conn.execute(
                 "UPDATE key_rotations SET phase='committed', committed_at=? "
-                "WHERE relationship_id=? AND epoch=?",
+                "WHERE relationship_id=? AND epoch=? AND role='acking'",
                 (_ts(now), rid, epoch),
             )
             self.conn.execute(
@@ -979,8 +925,9 @@ class RotationManager:
         if row:
             delete_private_key(row["private_key_ref"])
             self.conn.execute(
-                "DELETE FROM key_epochs WHERE relationship_id=? AND epoch=?",
-                (rid, epoch),
+                "DELETE FROM key_epochs WHERE relationship_id=? AND epoch=? "
+                "AND private_key_ref != ?",
+                (rid, epoch, _PEER_REF),
             )
         self.conn.execute(
             "UPDATE key_rotations SET phase='discarded' "
@@ -1038,6 +985,19 @@ class RotationManager:
             )
             if (due_time or due_events) and prior_epoch is not None:
                 with self.conn:
+                    # Never delete the old key unless the new epoch's own
+                    # private key row still exists. A resurrected or stale
+                    # rotating row (e.g. after conflict resolution chose the
+                    # peer's rotation, "theirs") must not silently destroy the
+                    # still-current key the peer encrypts to.
+                    new_key = self.conn.execute(
+                        "SELECT private_key_ref FROM key_epochs "
+                        "WHERE relationship_id=? AND epoch=? "
+                        "AND private_key_ref != ?",
+                        (rid, epoch, _PEER_REF),
+                    ).fetchone()
+                    if new_key is None:
+                        continue
                     key_row = self.conn.execute(
                         "SELECT private_key_ref FROM key_epochs "
                         "WHERE relationship_id=? AND epoch=? "
@@ -1048,8 +1008,8 @@ class RotationManager:
                         delete_private_key(key_row["private_key_ref"])
                         self.conn.execute(
                             "DELETE FROM key_epochs WHERE relationship_id=? "
-                            "AND epoch=?",
-                            (rid, prior_epoch),
+                            "AND epoch=? AND private_key_ref != ?",
+                            (rid, prior_epoch, _PEER_REF),
                         )
 
 
