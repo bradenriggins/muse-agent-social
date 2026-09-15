@@ -62,7 +62,7 @@ from .base import (
     TransportError,
     mirror_lock,
 )
-from .local import OBJECT_NAME_RE
+from .local import OBJECT_NAME_RE, check_object_size
 
 GIT_TIMEOUT_SECONDS = 120
 LS_REMOTE_TIMEOUT_SECONDS = 30
@@ -459,7 +459,19 @@ class GitHubTransport(Transport):
                 name = entry[len("incoming/"):]
                 if not OBJECT_NAME_RE.match(name):
                     continue
-                cp = self._git("cat-file", "-p", f"{ref}:incoming/{name}")
+                # Size pre-check BEFORE buffering: git cat-file -s reports
+                # the blob size from metadata, so a hostile oversized blob
+                # is rejected without ever reading its content into memory.
+                blob_ref = f"{ref}:incoming/{name}"
+                cp = self._git("cat-file", "-s", blob_ref)
+                if cp.returncode != 0:
+                    continue  # raced deletion; next poll converges
+                try:
+                    blob_size = int(cp.stdout.decode("ascii", "replace").strip())
+                except ValueError:
+                    continue  # unexpected output; next poll converges
+                check_object_size(name, blob_size)
+                cp = self._git("cat-file", "-p", blob_ref)
                 if cp.returncode != 0:
                     continue  # raced deletion; next poll converges
                 items.append((name, cp.stdout))

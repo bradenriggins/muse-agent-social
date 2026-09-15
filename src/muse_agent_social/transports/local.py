@@ -45,6 +45,25 @@ def _atomic_write(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+def check_object_size(object_name: str, size_bytes: int) -> int:
+    """Pre-read size gate: reject over-cap objects before buffering.
+
+    Takes the size from metadata (stat() / git cat-file -s) so callers can
+    enforce OBJECT_MAX_BYTES without ever reading the object content: a
+    hostile multi-GB blob must never be buffered into memory. Raises
+    TransportError('object_too_large') (non-retryable) when *size_bytes*
+    exceeds OBJECT_MAX_BYTES; returns *size_bytes* otherwise.
+    """
+    if size_bytes > OBJECT_MAX_BYTES:
+        raise TransportError(
+            "object_too_large",
+            f"object {object_name} is {size_bytes} bytes; "
+            f"limit is {OBJECT_MAX_BYTES}",
+            retryable=False,
+        )
+    return size_bytes
+
+
 class LocalTransport(Transport):
     """Filesystem transport. Two agents (or tests) share a directory."""
 
@@ -77,6 +96,9 @@ class LocalTransport(Transport):
             return []
         items: list[tuple[str, bytes]] = []
         for path in sorted(self.incoming.glob("*.json")):
+            # Size pre-check from stat() metadata BEFORE read_bytes(): an
+            # over-cap object is rejected without ever being buffered.
+            check_object_size(path.name, path.stat().st_size)
             items.append((path.name, path.read_bytes()))
         return items
 
