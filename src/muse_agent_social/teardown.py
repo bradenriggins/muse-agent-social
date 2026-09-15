@@ -383,6 +383,54 @@ def teardown_relationship(
                 conn.execute(
                     "DELETE FROM replay_guard WHERE replay_nonce = ?", (nonce,)
                 )
+            # Encrypted payload cache must go before events (foreign key).
+            for eid in event_ids:
+                conn.execute(
+                    "DELETE FROM event_payloads WHERE event_id = ?", (eid,)
+                )
+            # Projection tables: rows keyed by event, conversation, or
+            # relationship. No foreign keys, but they are relationship
+            # traces and must not survive teardown.
+            placeholders = ",".join("?" for _ in event_ids) or "NULL"
+            conn.execute(
+                "DELETE FROM message_revisions "
+                f"WHERE edit_event_id IN ({placeholders})",
+                event_ids,
+            )
+            conn.execute(
+                "DELETE FROM reactions "
+                f"WHERE added_event_id IN ({placeholders})",
+                event_ids,
+            )
+            conn.execute(
+                "DELETE FROM receipts "
+                f"WHERE receipt_event_id IN ({placeholders})",
+                event_ids,
+            )
+            conn.execute(
+                "DELETE FROM poll_responses "
+                f"WHERE response_event_id IN ({placeholders})",
+                event_ids,
+            )
+            for table in (
+                "messages",
+                "polls",
+                "tasks",
+                "human_requests",
+                "deliveries",
+                "security_key_events",
+                "pending_refs",
+                "sequence_gaps",
+                "projection_cursors",
+                "key_rotations",
+                "rotation_quarantine",
+                "transport_mutations",
+                "transport_push_log",
+            ):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE relationship_id = ?",
+                    (relationship_id,),
+                )
             for eid in event_ids:
                 conn.execute("DELETE FROM events WHERE event_id = ?", (eid,))
             # Conversations left with no events are local traces of this
@@ -401,6 +449,14 @@ def teardown_relationship(
                         "DELETE FROM conversations WHERE conversation_id = ?",
                         (cid,),
                     )
+            if conv_ids:
+                conv_list = sorted(conv_ids)
+                cplaceholders = ",".join("?" for _ in conv_list)
+                conn.execute(
+                    "DELETE FROM thread_state "
+                    f"WHERE conversation_id IN ({cplaceholders})",
+                    conv_list,
+                )
             conn.execute(
                 "DELETE FROM key_epochs WHERE relationship_id = ?",
                 (relationship_id,),
