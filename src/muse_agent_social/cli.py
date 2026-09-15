@@ -1371,8 +1371,19 @@ def _release_fn(ctx: Ctx):
         if isinstance(sealed, str):
             sealed = sealed.encode("utf-8")
         if isinstance(transport, LocalTransport):
-            # Immediate local delivery; the receiver's replay guard makes a
-            # retry-after-crash duplicate harmless.
+            # Immediate local upload inside the scheduler transaction,
+            # before the scheduled -> released claim commits. Ordering
+            # note: the peer can fetch this object before this sender's
+            # commit lands, and a crash between upload and commit rolls
+            # the row back to scheduled, so the next run_due uploads the
+            # same sealed bytes under a NEW object name (sent_objects was
+            # rolled back too). The peer then sees two relay objects for
+            # one event. This is contained, not just tolerated: the
+            # receiver checks replay_guard for the replay_nonce (and the
+            # event_id with identical bytes) before inserting, so the
+            # duplicate is accepted-but-not-surfaced and the event is
+            # persisted exactly once. The bytes are immutable once
+            # sealed, so early visibility cannot corrupt receiver state.
             transport.upload(name, sealed)
         else:
             queue_mutation(
