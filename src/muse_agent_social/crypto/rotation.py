@@ -361,14 +361,24 @@ class RotationManager:
         return {int(r["epoch"]): r for r in rows}
 
     def _peer_key_epochs(self, rid: str) -> dict:
-        """Map epoch -> peer agreement public key (multibase)."""
+        """Map epoch -> peer agreement public key (multibase).
+
+        Epoch 1 peer keys live in ``relationships.peer_agreement_key`` per
+        the landed schema (the key_epochs PRIMARY KEY cannot hold both an
+        own and a peer row for the same epoch); later peer epochs live in
+        key_epochs rows with ``private_key_ref = 'peer'``. The fallback is
+        keyed by the relationship's current key_epoch: after the acking side
+        commits a rotation, peer_agreement_key holds the peer's NEW key, so
+        a hardcoded epoch-1 seed would mislabel it.
+        """
         out: dict[int, str] = {}
         rel = self.conn.execute(
-            "SELECT peer_agreement_key FROM relationships WHERE relationship_id=?",
+            "SELECT peer_agreement_key, key_epoch FROM relationships "
+            "WHERE relationship_id=?",
             (rid,),
         ).fetchone()
         if rel and rel["peer_agreement_key"]:
-            out[1] = rel["peer_agreement_key"]
+            out[int(rel["key_epoch"] or 1)] = rel["peer_agreement_key"]
         for r in self.conn.execute(
             "SELECT epoch, public_key FROM key_epochs WHERE relationship_id=? "
             "AND private_key_ref = ?",
@@ -801,6 +811,7 @@ class RotationManager:
                 "nothing_to_commit", "no confirmed rotation to commit"
             )
         epoch = int(rotation["epoch"])
+        new_peer_key = rotation["new_public_key"]
         with self.conn:
             self.conn.execute(
                 "UPDATE key_rotations SET phase='committed', committed_at=? "
@@ -812,9 +823,15 @@ class RotationManager:
                 "WHERE relationship_id=? AND epoch=? AND private_key_ref=?",
                 (rid, epoch, _PEER_REF),
             )
+            # The peer's agreement key changed: future sends must wrap to
+            # the new key. Without this, _recipients_for keeps wrapping to
+            # the old key while labeling the new key_epoch, so a peer that
+            # rotated because its old key was compromised stays readable to
+            # the attacker.
             self.conn.execute(
-                "UPDATE relationships SET key_epoch=? WHERE relationship_id=?",
-                (epoch, rid),
+                "UPDATE relationships SET key_epoch=?, peer_agreement_key=? "
+                "WHERE relationship_id=?",
+                (epoch, new_peer_key, rid),
             )
         return build_commit(epoch)
 
