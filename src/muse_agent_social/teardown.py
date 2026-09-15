@@ -205,8 +205,11 @@ def _discover_deploy_keys(state_dir: Path) -> tuple[list[DeployKeyRef], list[Rel
                 DeployKeyRef(
                     repo=str(entry.get("repo", "")),
                     label=str(entry.get("label", "")),
-                    # relay.json stores the GitHub key id under "id".
-                    key_id=str(entry.get("id", "")),
+                    # relay.json writers have used both "key_id" and "id"
+                    # for the GitHub key id; accept either.
+                    key_id=str(
+                        entry.get("key_id") or entry.get("id") or ""
+                    ),
                 )
             )
         for entry in data.get("repos", []) or []:
