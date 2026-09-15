@@ -31,6 +31,7 @@ import base64
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import sys
 import urllib.error
@@ -41,6 +42,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
@@ -667,17 +669,21 @@ def cmd_pair_accept(args: argparse.Namespace) -> int:
                 "re-run with --i-compared-phrase after comparing the phrase",
             )
         pair_dir = ctx.keys_dir / "pairing" / invite["invite_id"]
+        # Generate key material in memory first. create_acceptance() runs
+        # all validation (signature, expiry, one-use ledger) and must
+        # succeed before anything is written to disk; otherwise a rejected
+        # acceptance would leave orphaned private key files.
         rel_priv, rel_pub_mb = generate_relationship_keypair()
-        store_private_key(
-            pair_dir / "relationship.key",
-            rel_priv.private_bytes(
-                serialization.Encoding.Raw,
-                serialization.PrivateFormat.Raw,
-                serialization.NoEncryption(),
-            ),
+        rel_priv_bytes = rel_priv.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
         )
-        deploy_pub = generate_deploy_keypair(pair_dir / "deploy")
-        (pair_dir / "deploy.pub").write_text(deploy_pub + "\n", encoding="utf-8")
+        deploy_priv = Ed25519PrivateKey.generate()
+        deploy_pub = deploy_priv.public_key().public_bytes(
+            serialization.Encoding.OpenSSH,
+            serialization.PublicFormat.OpenSSH,
+        ).decode("ascii").strip()
         try:
             acceptance = create_acceptance(
                 ctx.conn,
@@ -689,16 +695,42 @@ def cmd_pair_accept(args: argparse.Namespace) -> int:
             )
         except PairingError as exc:
             raise CliError("pairing_error", f"{exc.code}: {exc}")
-        meta = {
-            "invite_id": invite["invite_id"],
-            "relationship_pubkey": rel_pub_mb,
-            "relationship_key_path": str(pair_dir / "relationship.key"),
-            "deploy_pub_path": str(pair_dir / "deploy.pub"),
-            "deploy_priv_path": str(pair_dir / "deploy"),
-        }
-        (pair_dir / "pairing.json").write_text(
-            json.dumps(meta, indent=2) + "\n", encoding="utf-8"
-        )
+        try:
+            store_private_key(pair_dir / "relationship.key", rel_priv_bytes)
+            store_private_key(
+                pair_dir / "deploy",
+                deploy_priv.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.OpenSSH,
+                    serialization.NoEncryption(),
+                ),
+            )
+            (pair_dir / "deploy.pub").write_text(
+                deploy_pub + "\n", encoding="utf-8"
+            )
+            meta = {
+                "invite_id": invite["invite_id"],
+                "relationship_pubkey": rel_pub_mb,
+                "relationship_key_path": str(pair_dir / "relationship.key"),
+                "deploy_pub_path": str(pair_dir / "deploy.pub"),
+                "deploy_priv_path": str(pair_dir / "deploy"),
+            }
+            (pair_dir / "pairing.json").write_text(
+                json.dumps(meta, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            # Persistence failed after the acceptance was recorded: remove
+            # the half-written pair directory and the acceptance row so a
+            # retry starts clean.
+            shutil.rmtree(pair_dir, ignore_errors=True)
+            with ctx.conn:
+                ctx.conn.execute(
+                    "DELETE FROM pairing_acceptances WHERE invite_id = ?",
+                    (invite["invite_id"],),
+                )
+            raise CliError(
+                "key_write_failed", f"cannot persist pairing keys: {exc}"
+            )
         out = _canon_text(acceptance) + "\n"
         if args.out:
             Path(args.out).write_text(out, encoding="utf-8")
