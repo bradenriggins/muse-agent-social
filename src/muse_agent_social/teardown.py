@@ -411,7 +411,15 @@ def teardown_relationship(
                 )
             # Projection tables: rows keyed by event, conversation, or
             # relationship. No foreign keys, but they are relationship
-            # traces and must not survive teardown.
+            # traces and must not survive teardown. Tables that were never
+            # created (e.g. deploy_key_registry on a store that never ran
+            # the pairing ceremony) are skipped.
+            existing_tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
             placeholders = ",".join("?" for _ in event_ids) or "NULL"
             conn.execute(
                 "DELETE FROM message_revisions "
@@ -447,7 +455,10 @@ def teardown_relationship(
                 "rotation_quarantine",
                 "transport_mutations",
                 "transport_push_log",
+                "deploy_key_registry",
             ):
+                if table not in existing_tables:
+                    continue
                 conn.execute(
                     f"DELETE FROM {table} WHERE relationship_id = ?",
                     (relationship_id,),

@@ -139,7 +139,12 @@ from .store.projections import (
     quarantine_event,
     record_projection_input,
 )
-from .teardown import TeardownError, teardown_relationship
+from .teardown import (
+    DeployKeyRef,
+    RelayRef,
+    TeardownError,
+    teardown_relationship,
+)
 from .transports.base import TransportError
 from .transports.github import (
     GitHubTransport,
@@ -2534,22 +2539,31 @@ class _RevokeHooks:
                 return "not_found"
             raise ProvisioningError("api_error", f"GitHub API {exc.code} on {path}")
 
-    def revoke_deploy_key(self, key_id):
+    def revoke_deploy_key(self, ref: DeployKeyRef):
         try:
-            repos = self.discover_repos()
-            if not repos:
+            repo = ref.repo
+            if not repo:
+                repos = self.discover_repos()
+                first = repos[0] if repos else None
+                repo = (
+                    first.get("repo")
+                    if isinstance(first, dict)
+                    else first
+                )
+            if not repo:
                 return "manual: no relay repo recorded"
-            repo = repos[0].get("repo")
-            status = self._api("DELETE", f"/repos/{repo}/keys/{key_id}")
+            if not ref.key_id:
+                return "manual: no deploy key id recorded"
+            status = self._api("DELETE", f"/repos/{repo}/keys/{ref.key_id}")
             return "revoked" if status in (204, "not_found") else f"manual: HTTP {status}"
         except ProvisioningError as exc:
             return f"manual: {exc}"
 
-    def delete_relay_repo(self, repo):
+    def delete_relay_repo(self, ref: RelayRef):
         if not self.delete_remote:
             return "manual: pass --delete-remote to delete the relay repository"
         try:
-            status = self._api("DELETE", f"/repos/{repo}")
+            status = self._api("DELETE", f"/repos/{ref.repo}")
             return "deleted" if status in (204, "not_found") else f"manual: HTTP {status}"
         except ProvisioningError as exc:
             return f"manual: {exc}"
@@ -2558,19 +2572,52 @@ class _RevokeHooks:
 def cmd_revoke(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
-        rel = ctx.resolve_relationship(args.relationship)
+        # Revoke resolves the EXACT relationship id only: no prefix
+        # matching, no peer-label fallback. A typo must fail loudly,
+        # never destroy the wrong relationship.
+        try:
+            rel = get_relationship(ctx.conn, args.relationship)
+        except PairingError:
+            raise CliError(
+                "unknown_relationship",
+                f"no relationship with id {args.relationship!r}; "
+                "revoke needs the exact relationship id",
+            )
         rid = rel["relationship_id"]
         peer_label = rel["peer_identity_id"][:24]
+        if not args.yes:
+            print(
+                f"About to REVOKE relationship {rid} (peer {peer_label}...). "
+                "This destroys private keys, relay state, and local history, "
+                "and cannot be undone.",
+                file=sys.stderr,
+            )
+            try:
+                answer = input(
+                    "Type the full relationship id to confirm, "
+                    "or anything else to abort: "
+                ).strip()
+            except EOFError:
+                answer = ""
+            if answer != rid:
+                raise CliError(
+                    "revoke_aborted", "revoke aborted: no changes made"
+                )
         token = args.token or os.environ.get("MAS_GITHUB_TOKEN")
         hooks = _RevokeHooks(ctx.state_dir, token, bool(args.delete_remote))
         # The release teardown does not know about event_payloads (written by
         # the receive/send projection staging); clear them first so the
-        # events DELETE does not hit the foreign key.
+        # events DELETE does not hit the foreign key. relay_config is
+        # deleted before teardown too: the postcheck scans for the raw
+        # relationship id, and this row carries it.
         with ctx.conn:
             ctx.conn.execute(
                 "DELETE FROM event_payloads WHERE event_id IN "
                 "(SELECT event_id FROM events WHERE relationship_id = ?)",
                 (rid,),
+            )
+            ctx.conn.execute(
+                "DELETE FROM relay_config WHERE relationship_id = ?", (rid,)
             )
         try:
             report = teardown_relationship(
@@ -2583,18 +2630,21 @@ def cmd_revoke(args: argparse.Namespace) -> int:
             )
         except TeardownError as exc:
             raise CliError("teardown_error", f"{exc.code}: {exc}")
-        ctx.conn.execute(
-            "DELETE FROM relay_config WHERE relationship_id = ?", (rid,)
-        )
         ctx.conn.commit()
         summary = {
             "relationship_id_sha256": report.relationship_id_sha256,
             "revoked_at": report.revoked_at,
             "reason_code": report.reason_code,
-            "cleanup": report.cleanup,
-            "key_deletion": report.key_deletion,
+            "keys_destroyed": report.keys_destroyed,
+            "deploy_keys_revoked": report.deploy_keys_revoked,
+            "relay_repos_deleted": report.relay_repos_deleted,
+            "files_deleted": report.files_deleted,
+            "dirs_removed": report.dirs_removed,
             "tombstone_path": report.tombstone_path,
-            "postcheck": report.postcheck,
+            "postcheck_scanned": report.postcheck_scanned,
+            "postcheck_hits": report.postcheck_hits,
+            "crypto_erasure_before_bulk": report.crypto_erasure_before_bulk,
+            "dry_run": report.dry_run,
         }
         print(_canon_text(summary))
         return 0
@@ -2901,6 +2951,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_revoke.add_argument("--reason", default=None)
     p_revoke.add_argument("--token", default=None)
     p_revoke.add_argument("--delete-remote", action="store_true")
+    p_revoke.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the interactive confirmation prompt (for automation)",
+    )
     p_revoke.set_defaults(func=cmd_revoke)
 
     p_inspect = subs.add_parser("inspect", help="inspect local state")
