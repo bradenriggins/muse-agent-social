@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import secrets
@@ -2946,6 +2947,34 @@ def cmd_inspect_queue(args: argparse.Namespace) -> int:
         ctx.close()
 
 
+def cmd_inspect_scheduled(args: argparse.Namespace) -> int:
+    ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
+    try:
+        state = args.state
+        if state is not None and state not in scheduler.SCHEDULER_STATES:
+            raise CliError("invalid_state", f"unknown scheduler state {state!r}")
+        rows = []
+        for r in scheduler.list_scheduled(ctx.conn, state):
+            # inner_event is raw sealed bytes (up to 256 KiB); the inspect
+            # surface shows its size and digest, not the bytes themselves.
+            raw = bytes(r["inner_event"])
+            rows.append(
+                {
+                    "scheduled_id": r["scheduled_id"],
+                    "deliver_at": r["deliver_at"],
+                    "expires_at": r["expires_at"],
+                    "state": r["state"],
+                    "release_failures": r["release_failures"],
+                    "inner_event_bytes": len(raw),
+                    "inner_event_sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+        print(_canon_text(rows))
+        return 0
+    finally:
+        ctx.close()
+
+
 def cmd_inspect_policy(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
@@ -3330,6 +3359,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_policy.add_argument("--relationship", required=True)
     _add_common(p_policy)
     p_policy.set_defaults(func=cmd_inspect_policy)
+    p_sched = insp_subs.add_parser(
+        "scheduled", help="list scheduler rows (default: all states)"
+    )
+    p_sched.add_argument(
+        "--state",
+        default=None,
+        help="filter by scheduler state: "
+        + ", ".join(scheduler.SCHEDULER_STATES),
+    )
+    _add_common(p_sched)
+    p_sched.set_defaults(func=cmd_inspect_scheduled)
 
     return parser
 
