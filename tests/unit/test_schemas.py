@@ -619,7 +619,9 @@ def test_all_schema_files_are_valid_draft_2020_12():
     import jsonschema
     from pathlib import Path
 
-    schemas_dir = Path(__file__).parent.parent.parent / "schemas"
+    from muse_agent_social.validation import _schemas_dir
+
+    schemas_dir = _schemas_dir()
     files = sorted(schemas_dir.rglob("*.schema.json"))
     assert len(files) == 16, [f.name for f in files]
     for path in files:
