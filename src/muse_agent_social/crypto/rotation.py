@@ -78,6 +78,8 @@ __all__ = [
     "ROTATION_WINDOW",
     "OLD_KEY_RETENTION",
     "OLD_KEY_EVENT_LIMIT",
+    "ROTATION_QUARANTINE_CAP",
+    "ROTATION_QUARANTINE_REJECTED_RETENTION",
     "agreement_fingerprint",
     "build_prepare",
     "build_ack",
@@ -93,6 +95,12 @@ __all__ = [
 ROTATION_WINDOW = timedelta(hours=24)
 OLD_KEY_RETENTION = timedelta(hours=24)
 OLD_KEY_EVENT_LIMIT = 100
+# Unknown-epoch envelopes are quarantined before any signature check, so a
+# forged stream with distinct bogus key_epoch values could otherwise grow
+# rotation_quarantine without bound. Cap rows per relationship; rejected
+# rows older than the retention window are expired by sweep().
+ROTATION_QUARANTINE_CAP = 50
+ROTATION_QUARANTINE_REJECTED_RETENTION = timedelta(days=30)
 
 _PEER_REF = "peer"
 
@@ -863,12 +871,28 @@ class RotationManager:
                 "VALUES (?, ?, 'unknown_future_epoch', ?, ?)",
                 (rid, key_epoch, json.dumps({"epoch": key_epoch}), _ts(now)),
             )
+            self._cap_quarantine(rid)
         raise RotationError(
             "unknown_future_epoch",
             f"epoch {key_epoch} is unknown; quarantined as retryable",
         )
 
     # -- quarantine ---------------------------------------------------------
+    def _cap_quarantine(self, rid: str) -> None:
+        """Keep rotation_quarantine bounded per relationship.
+
+        The unknown-epoch gate inserts before any signature check, so this
+        cap is the only thing stopping a forged stream of distinct bogus
+        epochs from growing the table without bound. Oldest rows go first;
+        the newest ROTATION_QUARANTINE_CAP rows survive.
+        """
+        self.conn.execute(
+            "DELETE FROM rotation_quarantine WHERE relationship_id=? "
+            "AND id NOT IN (SELECT id FROM rotation_quarantine "
+            "WHERE relationship_id=? ORDER BY id DESC LIMIT ?)",
+            (rid, rid, ROTATION_QUARANTINE_CAP),
+        )
+
     def _quarantine(self, rid, epoch, reason, payload, now) -> None:
         with self.conn:
             self.conn.execute(
@@ -877,6 +901,7 @@ class RotationManager:
                 "VALUES (?, ?, ?, ?, ?)",
                 (rid, epoch, reason, json.dumps(payload), _ts(now)),
             )
+            self._cap_quarantine(rid)
 
     def list_quarantine(self, rid: str) -> list:
         """List quarantine entries for a relationship (oldest first)."""
@@ -955,8 +980,16 @@ class RotationManager:
           ``NoAckTimeout`` for the first one found).
         - Deletes the old private key after commit once 24 hours have passed
           or 100 events were accepted under the new epoch, whichever first.
+        - Expires rejected unknown-epoch quarantine rows older than
+          ``ROTATION_QUARANTINE_REJECTED_RETENTION``.
         """
         now = self._now(now)
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM rotation_quarantine "
+                "WHERE reason='unknown_future_epoch_rejected' AND received_at <= ?",
+                (_ts(now - ROTATION_QUARANTINE_REJECTED_RETENTION),),
+            )
         row = self.conn.execute(
             "SELECT relationship_id, epoch FROM key_rotations "
             "WHERE role='rotating' AND phase='candidate' AND deadline <= ? "
