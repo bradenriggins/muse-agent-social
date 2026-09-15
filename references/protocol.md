@@ -216,6 +216,18 @@ Conflicting prepares for one epoch are quarantined, both, for human
 review. Future unknown epochs are quarantined as retryable for 24
 hours, then rejected. Until commit, epoch N stays authoritative.
 
+Identity rotation (a new master seed and identity ID, distinct from key
+epoch rotation): the rotator queues a signed `identity.rotated` event to
+each active relationship BEFORE switching local identity, so the
+announcement is sealed and signed as the old identity the peer has
+pinned. The receiver verifies the new card and both Ed25519
+cross-signatures over the new card bytes (one from the pinned old
+identity, one from the new identity) pre-commit; forged announcements
+are quarantined without storing. On success the peer identity updates
+and the old identity ID is kept as `prior_peer_identity_id`, which the
+receiver accepts for in-flight delayed events only for this event type.
+Post-rotation events from the new identity verify normally.
+
 ## Consent and teardown
 
 Teardown order: mark the relationship revoked locally (sends and
