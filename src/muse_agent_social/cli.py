@@ -55,9 +55,11 @@ from .compatibility.v01 import (
     LegacyPolicy,
     MemoryReplayStore,
     SeqAssigner,
+    StoreReplayGuard,
     VaultError,
     adapt_v01,
     detect_v01,
+    record_legacy_replay,
     vault_load,
     verify_v01,
 )
@@ -1866,68 +1868,82 @@ def _receive_v01(
         return _quarantine_outcome(ctx, rid, object_name, "v01_no_vault", str(exc))
     drain_open = phase in ("dual_read", "observing")
     policy = LegacyPolicy(
+        pair_id=pair_id,
         expected_sender=mstate_get(ctx.conn, "migration.peer_legacy_id") or "*",
         my_agent_id=mstate_get(ctx.conn, "migration.my_legacy_id") or "*",
-        replay_store=MemoryReplayStore(),
+        # Persistent replay store (Medium 1): a per-object memory store
+        # would forget every nonce at the next object, so replays were
+        # never rejected. The v0.2 replay_guard table is shared and
+        # survives across objects and restarts.
+        replay_store=StoreReplayGuard(ctx.conn),
         legacy_read_open=drain_open,
         legacy_sends_allowed=False,
     )
     try:
-        verified = verify_v01(data, pair_key, policy)
+        verified = verify_v01(data, pair_key, policy=policy)
     except LegacyError as exc:
         return _quarantine_outcome(ctx, rid, object_name, "v01_verify_failed", str(exc))
     # Durable sequence assignment: the caller owns SeqAssigner persistence.
     seq_state = mstate_get(ctx.conn, "migration.seq_assigner") or {}
     assigner = SeqAssigner.from_dict({k: int(v) for k, v in seq_state.items()})
-    adapted = adapt_v01(verified, assigner)
+    adapted = adapt_v01(verified, pair_id, assigner)
     mstate_set(ctx.conn, "migration.seq_assigner", assigner.to_dict())
     ctx.conn.commit()
     payload = {
-        "body": adapted["payload"].get("legacy_title")
-        and f"{adapted['payload']['legacy_title']}\n\n{adapted['payload']['body']}"
-        or adapted["payload"]["body"],
+        "body": (
+            f"{adapted['payload']['legacy_title']}\n\n{adapted['payload']['body']}"
+            if adapted["payload"].get("legacy_title")
+            else adapted["payload"]["body"]
+        ),
         "format": "plain",
     }
-    row = adapted["event_row"]
+    # adapt_v01 returns a flat dict (see compatibility/v01.py); legacy
+    # messages land in the relationship's own conversation, mirroring the
+    # migration drain in migrate.py.
+    conversation_id = rid
+    thread_id = rid + ":t"
     with ctx.conn:
         ctx.conn.execute(
             "INSERT OR IGNORE INTO conversations (conversation_id) VALUES (?)",
-            (row["conversation_id"],),
+            (conversation_id,),
         )
         ctx.conn.execute(
             "INSERT OR IGNORE INTO threads (thread_id, conversation_id) "
             "VALUES (?, ?)",
-            (row["thread_id"], row["conversation_id"]),
+            (thread_id, conversation_id),
         )
         ctx.conn.execute(
             "INSERT INTO events (event_id, relationship_id, conversation_id, "
             "thread_id, sender, sender_seq, created_at, key_epoch, event_type, "
             "replay_nonce, sealed_envelope) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'message.created', ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'message.created', ?, ?)",
             (
-                row["event_id"],
+                adapted["event_id"],
                 rid,
-                row["conversation_id"],
-                row["thread_id"],
-                row["sender"],
-                row["sender_seq"],
-                row["created_at"],
-                1,
-                _new_uuid(),
+                conversation_id,
+                thread_id,
+                adapted["sender"],
+                adapted["sender_seq"],
+                adapted["created_at"],
+                "v01:" + verified.envelope["nonce"],
                 data,
             ),
         )
         record_projection_input(
             ctx.conn,
-            event_id=row["event_id"],
+            event_id=adapted["event_id"],
             event_type="message.created",
             payload=payload,
             reply_to=None,
         )
         ctx.conn.execute(
             "INSERT INTO projection_queue (event_id, queued_at) VALUES (?, ?)",
-            (row["event_id"], utcnow()),
+            (adapted["event_id"], utcnow()),
         )
+    # Record the verified nonce/id in the persistent replay store so a
+    # replayed v0.1 object is rejected on the next object.
+    record_legacy_replay(policy, verified)
+    ctx.conn.commit()
     return {"outcome": "accepted", "surfaces": 1, "receipts_queued": 0}
 
 
@@ -2294,6 +2310,19 @@ def _post_receive_hooks(
             pass
 
 
+def prune_replay_entries(ctx: Ctx) -> int:
+    """Delete expired replay-guard entries. Returns rows removed.
+
+    Runs after successful receives (and any other CLI lifecycle point
+    that wants it) so the shared replay_guard table stays bounded.
+    Never raises: pruning is hygiene, not protocol.
+    """
+    try:
+        return StoreReplayGuard(ctx.conn).prune(utcnow())
+    except Exception:
+        return 0
+
+
 def _receive_relationship(
     ctx: Ctx, rid: str, time_budget: float, clock_skew_seconds: Optional[float] = None
 ) -> tuple[int, dict]:
@@ -2332,6 +2361,11 @@ def _receive_relationship(
         except Exception as exc:
             print(f"warning: release failed: {exc}", file=sys.stderr)
         _flush_send_transports(ctx, [rid])
+    # Replay hygiene (Medium 1): prune expired replay-guard entries after
+    # a successful receive so the table stays bounded. The v0.1 and v0.2
+    # replay entries share this table and expire by acceptance window.
+    if code == EXIT_OK:
+        result["replay_pruned"] = prune_replay_entries(ctx)
     result["receipts_sent"] = receipts_sent
     return code, result
 

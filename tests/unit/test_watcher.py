@@ -131,7 +131,19 @@ class TestWatcherContract:
         assert _checkpoint(state_dir) == ""
         assert load_watcher_state(state_dir, REL)["retry_pending"] == 1
 
-        # Remote head did not move, but retry_pending forces another receive.
+        # Backoff is honored: an immediate second poll is skipped instead
+        # of hammering through the retry delay.
+        code, result = run_once(transport, REL, receive, state_dir=state_dir,
+                                min_poll_interval=0)
+        assert code == EXIT_OK
+        assert result.get("poll_skipped") is True
+        assert result["accepted"] == 0
+        assert _checkpoint(state_dir) == ""
+
+        # Once the backoff expires, the retry proceeds.
+        state = load_watcher_state(state_dir, REL)
+        state["next_retry_at"] = "2020-01-01T00:00:00Z"
+        save_watcher_state(state_dir, REL, state)
         code, result = run_once(transport, REL, receive, state_dir=state_dir,
                                 min_poll_interval=0)
         assert code == EXIT_OK

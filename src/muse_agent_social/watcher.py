@@ -228,6 +228,28 @@ def _run_once_locked(
     if now - float(state.get("last_poll_at", 0.0)) < min_poll_interval:
         result["poll_skipped"] = True
         return finish(EXIT_OK, "poll_throttled")
+
+    # Retry backoff (Medium 1): a cycle that ended retryable or partial
+    # asked to wait until next_retry_at. Honor it instead of polling
+    # straight through the backoff.
+    if int(state.get("retry_pending", 0) or 0) > 0:
+        next_retry = state.get("next_retry_at")
+        if next_retry:
+            try:
+                retry_at = (
+                    datetime.strptime(next_retry, "%Y-%m-%dT%H:%M:%SZ")
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp()
+                )
+            except (TypeError, ValueError):
+                retry_at = 0.0
+            # Whole-second comparison: next_retry_at is stored truncated
+            # to whole seconds, so a sub-second jitter draw still defers
+            # the poll to the next whole second.
+            if retry_at >= int(now):
+                result["poll_skipped"] = True
+                save_watcher_state(state_dir, relationship_id, state)
+                return finish(EXIT_OK, "retry_backoff")
     state["last_poll_at"] = now
 
     try:
