@@ -134,6 +134,7 @@ def _make_ctx(conn, setup, *, fault=None):
     return SimpleNamespace(
         conn=conn,
         state_dir=setup["tmp_path"],
+        keys_dir=setup["keys_dir"],
         identity_id=bob["identity_id"],
         hierarchy=SimpleNamespace(ed25519_private=bob["ed_priv"]),
     )
@@ -205,6 +206,7 @@ def test_sigkill_between_event_and_projection_queue_is_atomic(setup):
     manifest = {
         "db_path": str(setup["db_path"]),
         "state_dir": str(setup["tmp_path"]),
+        "keys_dir": str(setup["keys_dir"]),
         "rid": setup["rid"],
         "object_name": "sigkill1.json",
         "envelope_hex": setup["raw"].hex(),
@@ -289,6 +291,7 @@ def _child_main():
     ctx = SimpleNamespace(
         conn=proxy,
         state_dir=Path(manifest["state_dir"]),
+        keys_dir=Path(manifest["keys_dir"]),
         identity_id=manifest["identity_id"],
         hierarchy=SimpleNamespace(
             ed25519_private=Ed25519PrivateKey.from_private_bytes(

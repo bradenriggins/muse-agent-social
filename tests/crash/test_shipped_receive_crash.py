@@ -1,6 +1,6 @@
 """H4: crash tests against the SHIPPED ``_receive_object_inner``.
 
-Status: FIXED-test-written / PENDING-merge-verification.
+Status: all green against the merged transactional receive.
 
 Each test kills the receive once at one fault boundary, re-delivers the
 same bytes, and proves exactly one terminal result: surfaced once, or
@@ -12,33 +12,21 @@ Fault boundaries:
   * surface queue insert    -> kill during INSERT INTO surface_queue
     (the shipped path has no post-commit surface drain; the surface
     decision is persisted as the surface_queue row inside the commit,
-    so this insert IS the surfacing boundary in this lane)
+    so this insert IS the surfacing boundary)
   * commit                  -> kill at the commit of the atomic block
   * projection drain        -> kill inside apply_event, after commit
   * surfacing               -> see surface queue insert note above
   * commit-to-projection gap -> kill after commit returns, before the
     incremental apply_event runs
 
-Boundaries inside the atomic commit transaction are cleanly retryable
-today and those tests pass. The post-commit boundaries (projection
-drain, commit-to-projection gap) FAIL until the other lane's
-transactional receive fix merges: the shipped duplicate-resume path
-returns ``accepted`` for the already-stored bytes without re-running
-the projection, so a crash after commit loses the projection while
-reporting success.
-
-Deeper finding while writing these tests: the shipped connection is
-autocommit (``db.connect`` uses ``isolation_level=None``), so the
-``with ctx.conn:`` block in ``_receive_object_inner`` is NOT atomic at
-all, every INSERT commits individually. That is why the
-projection-queue-insert, surface-queue-insert, and commit boundaries
-also fail today: partial state (event row, replay-guard row, staged
-payload) is already durable when the kill lands, and resume takes the
-duplicate path without projecting. Only the event-insert kill, which
-lands before anything commits, retries cleanly today.
+Boundaries inside the atomic commit transaction roll back cleanly and
+retry to exactly-once. The post-commit boundaries (projection drain,
+commit-to-projection gap) converge via the duplicate resume path,
+which re-drains any still-queued projection before reporting accepted.
 """
 
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -65,12 +53,14 @@ class FaultConn:
     """sqlite3 connection proxy that raises FaultInjected at one boundary.
 
     ``kill_sql``: raise on the first execute() containing the substring.
-    ``kill_commit``: raise instead of committing on the first clean
-    ``with``-block exit (after an explicit rollback). ``arm_commit_after``:
-    only arm the commit kill after an execute() containing the substring
-    has been seen, so the kill lands on the intended commit.
-    ``kill_after_commit_execute``: after the armed commit succeeds, raise
-    on the next execute() (the commit-to-projection gap).
+    ``kill_commit``: roll back and raise instead of committing when an
+    execute() containing "COMMIT;" is seen (the transaction() helper
+    commits via execute, not via the context-manager protocol).
+    ``arm_commit_after``: only arm the commit kill after an execute()
+    containing the substring has been seen, so the kill lands on the
+    intended commit. ``kill_after_commit_execute``: after the armed
+    commit succeeds, raise on the next execute() (the
+    commit-to-projection gap).
     """
 
     def __init__(
@@ -100,6 +90,15 @@ class FaultConn:
             raise FaultInjected(f"kill at {self._kill_sql}")
         if self._arm_commit_after and self._arm_commit_after in sql:
             self._commit_seen = True
+        if self._commit_seen and "COMMIT;" in sql:
+            self._commit_seen = False
+            if self._kill_commit:
+                self._real.execute("ROLLBACK;")
+                raise FaultInjected("kill at commit")
+            if self._kill_after_commit_execute:
+                result = self._real.execute(sql, params)
+                self._gap_armed = True
+                return result
         return self._real.execute(sql, params)
 
     def __enter__(self):
@@ -107,14 +106,8 @@ class FaultConn:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if exc_type is None and self._commit_seen:
-            self._commit_seen = False
-            if self._kill_commit:
-                self._real.rollback()
-                raise FaultInjected("kill at commit")
-            if self._kill_after_commit_execute:
-                # Commit succeeded; the next execute() dies in the gap.
-                self._gap_armed = True
+        # Commit kills are handled in execute() (the transaction() helper
+        # commits via execute("COMMIT;")); nothing to do here.
         return self._real.__exit__(exc_type, exc, tb)
 
     def __getattr__(self, name):
@@ -153,9 +146,12 @@ def setup(tmp_path):
 
 
 def _ctx(setup, conn):
+    keys_dir = Path(setup["state_dir"]) / "keys"
+    keys_dir.mkdir(parents=True, exist_ok=True)
     return SimpleNamespace(
         conn=conn,
         state_dir=setup["state_dir"],
+        keys_dir=keys_dir,
         identity_id=setup["identity_id"],
     )
 
@@ -194,60 +190,39 @@ def test_kill_at_event_insert_retries_cleanly(setup):
 
 
 def test_kill_at_projection_queue_insert(setup):
-    """PENDING-merge-verification: kill during the projection_queue INSERT.
-
-    The shipped connection is autocommit (``isolation_level=None``), so
-    the ``with ctx.conn:`` block is NOT atomic: the events row, the
-    replay-guard row, and the staged payload are already committed when
-    the kill lands. Resume takes the duplicate path, which returns
-    ``accepted`` WITHOUT re-running the projection, so the message is
-    lost while success is reported. The transactional receive fix must
-    make this boundary atomic (rollback) or make resume re-drain."""
+    """Kill during the projection_queue INSERT (inside the atomic receive
+    transaction): everything rolls back, resume reprocesses fully, the
+    event is stored and surfaced exactly once."""
     killer = FaultConn(setup["conn"], kill_sql="INSERT INTO projection_queue")
     with pytest.raises(FaultInjected):
         _receive(setup, killer)
-    # Partial state survives the kill: the event is durable.
-    assert setup["conn"].execute(
-        "SELECT COUNT(*) FROM events").fetchone()[0] == 1
+    assert _counts(setup) == {"events": 0, "messages": 0, "surface_queue": 0}
 
-    outcome, _ = _receive(setup, setup["conn"])
+    outcome, acc = _receive(setup, setup["conn"])
     assert outcome["outcome"] == "accepted"
-    # Desired terminal state: exactly one event, projected exactly once.
-    assert _counts(setup)["events"] == 1
-    assert _counts(setup)["messages"] == 1, (
-        "projection lost: resume reported accepted without projecting"
-    )
+    assert _counts(setup) == {"events": 1, "messages": 1, "surface_queue": 1}
+    assert acc["surfaces"] == 1
 
 
 def test_kill_at_surface_queue_insert(setup):
-    """PENDING-merge-verification: kill during the surface_queue INSERT
-    (the surfacing boundary in the shipped path: there is no post-commit
-    surface drain in this lane, the surface decision persists as the
-    surface_queue row). Same autocommit partial-commit failure as the
-    projection-queue boundary: the event is durable, the projection is
-    lost on resume."""
+    """Kill during the surface_queue INSERT (inside the atomic receive
+    transaction): everything rolls back, resume reprocesses fully, the
+    event is stored and surfaced exactly once."""
     killer = FaultConn(setup["conn"], kill_sql="surface_queue")
     with pytest.raises(FaultInjected):
         _receive(setup, killer)
-    assert setup["conn"].execute(
-        "SELECT COUNT(*) FROM events").fetchone()[0] == 1
+    assert _counts(setup) == {"events": 0, "messages": 0, "surface_queue": 0}
 
-    outcome, _ = _receive(setup, setup["conn"])
+    outcome, acc = _receive(setup, setup["conn"])
     assert outcome["outcome"] == "accepted"
-    assert _counts(setup)["events"] == 1
-    assert _counts(setup)["messages"] == 1, (
-        "projection lost: resume reported accepted without projecting"
-    )
+    assert _counts(setup) == {"events": 1, "messages": 1, "surface_queue": 1}
+    assert acc["surfaces"] == 1
 
 
 def test_kill_at_commit(setup):
-    """PENDING-merge-verification: kill at the commit of the ``with``
-    block. With the current autocommit connection this boundary is
-    vacuous: every statement has already committed individually before
-    the ``with``-block exit runs, so the kill changes nothing and resume
-    takes the duplicate path without projecting. The transactional
-    receive fix must wrap the block in a real transaction so a commit
-    failure rolls everything back."""
+    """Kill at the commit of the atomic receive transaction: the
+    transaction rolls back, resume reprocesses fully, the event is
+    stored and surfaced exactly once."""
     killer = FaultConn(
         setup["conn"],
         kill_commit=True,
@@ -255,25 +230,27 @@ def test_kill_at_commit(setup):
     )
     with pytest.raises(FaultInjected):
         _receive(setup, killer)
-    assert setup["conn"].execute(
-        "SELECT COUNT(*) FROM events").fetchone()[0] == 1
+    assert _counts(setup) == {"events": 0, "messages": 0, "surface_queue": 0}
 
-    outcome, _ = _receive(setup, setup["conn"])
+    outcome, acc = _receive(setup, setup["conn"])
     assert outcome["outcome"] == "accepted"
-    assert _counts(setup)["events"] == 1
-    assert _counts(setup)["messages"] == 1, (
-        "projection lost: resume reported accepted without projecting"
-    )
+    assert _counts(setup) == {"events": 1, "messages": 1, "surface_queue": 1}
+    assert acc["surfaces"] == 1
 
 
 def test_kill_during_projection_drain_loses_projection(setup, monkeypatch):
-    """PENDING-merge-verification: kill inside apply_event, after the
-    commit. The event is durable but unprojected; the shipped
-    duplicate-resume path returns accepted WITHOUT re-projecting, so the
-    message is lost while success is reported. The transactional receive
-    fix must make resume re-drain the projection."""
+    """Kill inside apply_event, after the commit: the event is durable
+    but unprojected, with its projection_queue row still present. The
+    duplicate resume path re-drains the projection, so the message
+    converges exactly once instead of being silently lost."""
+    real_apply_event = cli_mod.apply_event
+    calls = {"n": 0}
+
     def dead_drain(conn, event_row):
-        raise FaultInjected("kill during projection drain")
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise FaultInjected("kill during projection drain")
+        return real_apply_event(conn, event_row)
 
     monkeypatch.setattr(cli_mod, "apply_event", dead_drain)
     with pytest.raises(FaultInjected):
@@ -282,7 +259,6 @@ def test_kill_during_projection_drain_loses_projection(setup, monkeypatch):
 
     outcome, _ = _receive(setup, setup["conn"])
     assert outcome["outcome"] == "accepted"
-    # Desired terminal state: the projection must converge exactly once.
     assert _counts(setup)["events"] == 1
     assert _counts(setup)["messages"] == 1, (
         "projection lost: resume reported accepted without projecting"
@@ -290,9 +266,10 @@ def test_kill_during_projection_drain_loses_projection(setup, monkeypatch):
 
 
 def test_kill_in_commit_to_projection_gap_loses_projection(setup):
-    """PENDING-merge-verification: kill after the commit returns but
-    before the incremental apply_event runs. Same terminal failure as
-    the drain kill: durable event, lost projection, accepted resume."""
+    """Kill after the commit returns but before the incremental
+    apply_event runs: the event is durable with its projection_queue row
+    present but unprojected. The duplicate resume path re-drains the
+    projection, so the message converges exactly once."""
     killer = FaultConn(
         setup["conn"],
         arm_commit_after="INSERT INTO events",

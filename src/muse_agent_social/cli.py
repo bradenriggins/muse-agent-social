@@ -2266,6 +2266,56 @@ def _receive_object(
         )
 
 
+def _redrain_projection(ctx: Ctx, rid: str, event_id: str) -> None:
+    """Re-run the incremental projection for an already-accepted event.
+
+    Crash gap: the atomic receive commit can succeed while the process
+    dies before (or during) the post-commit apply_event. The event is
+    durable and its projection_queue row is still present, but the
+    projection never ran. Without this, the duplicate resume path would
+    report accepted while the message stays unprojected (silent loss).
+
+    apply_event is idempotent (already-projected events are a noop), so
+    running it here is safe on every redelivery. The queue row is left
+    in place, matching the normal path which never deletes it on
+    success.
+    """
+    queued = ctx.conn.execute(
+        "SELECT 1 FROM projection_queue WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    if queued is None:
+        return
+    payload_row = ctx.conn.execute(
+        "SELECT payload, reply_to FROM event_payloads WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    if payload_row is None:
+        return
+    event_row = ctx.conn.execute(
+        "SELECT * FROM events WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    if event_row is None:
+        return
+    event_row = dict(event_row)
+    event_row["payload"] = payload_row["payload"]
+    event_row["reply_to"] = payload_row["reply_to"]
+    try:
+        apply_event(ctx.conn, event_row)
+    except ProjectionError as exc:
+        with transaction(ctx.conn):
+            quarantine_event(
+                ctx.conn,
+                rid,
+                event_row["sender"],
+                int(event_row["sender_seq"]),
+                event_id,
+                f"projection_{exc.code}",
+            )
+            ctx.conn.execute(
+                "DELETE FROM projection_queue WHERE event_id = ?", (event_id,)
+            )
+
+
 def _receive_object_inner(
     ctx: Ctx, rid: str, object_name: str, data: bytes, acc: dict
 ) -> dict:
@@ -2298,6 +2348,12 @@ def _receive_object_inner(
     ).fetchone()
     if existing is not None:
         if bytes(existing["sealed_envelope"]) == data:
+            # Resume path: this exact object was accepted before. The
+            # atomic commit may have succeeded while the process died
+            # before (or during) the post-commit apply_event, leaving the
+            # projection_queue row behind. Re-drain it so the projection
+            # converges exactly once instead of being silently lost.
+            _redrain_projection(ctx, rid, event_id)
             return {"outcome": "accepted", "surfaces": 0, "receipts_queued": 0}
         raise CliError("event_id_conflict", "event id reused with different bytes")
     if ctx.conn.execute(

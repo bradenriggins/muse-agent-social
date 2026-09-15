@@ -36,7 +36,12 @@ def test_hook_failure_warns_and_receive_still_accepted(tmp_path, capsys, monkeyp
         "message.created", {"body": "hello", "format": "plain"}, seq=1,
     )
     cli_mod._ensure_cli_tables(conn)
-    ctx = SimpleNamespace(conn=conn, state_dir=tmp_path, identity_id=bob["identity_id"])
+    ctx = SimpleNamespace(
+        conn=conn,
+        state_dir=tmp_path,
+        keys_dir=tmp_path / "keys",
+        identity_id=bob["identity_id"],
+    )
 
     def boom(*args, **kwargs):
         raise RuntimeError("hook exploded")

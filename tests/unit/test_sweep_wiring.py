@@ -15,6 +15,8 @@ retired. These tests prove:
     never raises.
 """
 
+import os
+
 import pytest
 from types import SimpleNamespace
 
@@ -90,6 +92,15 @@ class TestLostAck:
         mgr = RotationManager(conn, state_dir / "keys")
         old_key = state_dir / "keys" / f"{REL}-e1.key"
         assert old_key.exists()
+        # Realistic post-commit state: the new epoch's own key row exists
+        # (sweep must never retire the old key without it, see C3).
+        new_key_path = state_dir / "keys" / f"{REL}-e2.key"
+        new_key_path.write_bytes(os.urandom(32))
+        conn.execute(
+            "INSERT INTO key_epochs(relationship_id, epoch, public_key,"
+            " private_key_ref, state) VALUES (?,?,?,?,?)",
+            (REL, 2, "mb-new-pub", str(new_key_path), "active"),
+        )
         conn.execute(
             "INSERT INTO key_rotations("
             "relationship_id, epoch, role, phase, prior_epoch, prepared_at,"
@@ -102,6 +113,7 @@ class TestLostAck:
         conn.commit()
         mgr.sweep()
         assert not old_key.exists()
+        assert new_key_path.exists()
         remaining = conn.execute(
             "SELECT COUNT(*) FROM key_epochs "
             "WHERE relationship_id = ? AND epoch = 1",
