@@ -776,6 +776,28 @@ def _write_relay_json(ctx: Ctx, deploy_keys: list, repos: list) -> None:
     )
 
 
+def _github_delete_deploy_key(repo: str, key_id, token: str) -> None:
+    """DELETE a GitHub deploy key. Used to roll back a partially completed
+    pair commit. A 404 is success (already gone: the desired end state).
+    Raises ProvisioningError for other API failures."""
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/keys/{key_id}",
+        method="DELETE",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "mas-cli/0.2",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30):
+            return
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return
+        raise ProvisioningError("api_error", f"GitHub API {exc.code}") from exc
+
+
 def cmd_pair_commit(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
@@ -842,6 +864,51 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
             # signed commit's repository_url is informational for local mode
             # (the real pointer is --local-relay-dir on both sides).
             commit_relay_url = "https://local.invalid/relay"
+        # Provision BEFORE committing: the deploy-key titles need the
+        # relationship id, so it is minted here and handed to commit_pairing.
+        # On any provisioning or local-commit failure, keys already
+        # registered are deleted, the locally generated private key is
+        # removed, and no relationship row is committed, so the invite can
+        # be retried cleanly.
+        relationship_id = None
+        inviter_key_path = None
+        if provider == "github":
+            repo = _parse_github_repo(relay_url)
+            token = _github_token(args)
+            relationship_id = str(uuid.uuid4())
+            key_title = deploy_key_title(relationship_id)
+            # The inviter also needs git access: generate our own deploy
+            # keypair, register the public half, keep the private half.
+            from muse_agent_social.model.invites import generate_deploy_keypair
+
+            inviter_key_path = (
+                ctx.keys_dir / "pairing" / invite_id / "deploy-inviter"
+            )
+            inviter_pub = generate_deploy_keypair(str(inviter_key_path))
+            peer_pub = acceptance["deploy_public_key"]
+            registered: list = []
+            try:
+                # Register the acceptor's (peer) public deploy key.
+                reg = register_peer_deploy_key(
+                    repo, peer_pub, key_title, lambda: token
+                )
+                registered.append(reg.get("id"))
+                reg_self = register_peer_deploy_key(
+                    repo, inviter_pub, key_title, lambda: token
+                )
+                registered.append(reg_self.get("id"))
+            except ProvisioningError as exc:
+                for key_id in registered:
+                    if key_id:
+                        try:
+                            _github_delete_deploy_key(repo, key_id, token)
+                        except ProvisioningError:
+                            pass
+                try:
+                    inviter_key_path.unlink()
+                except OSError:
+                    pass
+                raise CliError("provisioning_error", f"{exc.code}: {exc}")
         try:
             commit = commit_pairing(
                 ctx.conn,
@@ -851,56 +918,38 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
                 slots,
                 negotiated,
                 keys_dir=ctx.keys_dir,
+                relationship_id=relationship_id,
             )
         except PairingError as exc:
+            if provider == "github":
+                for key_id in registered:
+                    if key_id:
+                        try:
+                            _github_delete_deploy_key(repo, key_id, token)
+                        except ProvisioningError:
+                            pass
+                try:
+                    inviter_key_path.unlink()
+                except OSError:
+                    pass
             raise CliError("pairing_error", f"{exc.code}: {exc}")
         relationship_id = commit["relationship_id"]
         deploy_keys: list = []
         repos: list = []
         ssh_key_path: Optional[str] = None
         if provider == "github":
-            repo = _parse_github_repo(relay_url)
-            token = _github_token(args)
-            # Register the acceptor's (peer) public deploy key.
-            try:
-                reg = register_peer_deploy_key(
-                    repo,
-                    acceptance["deploy_public_key"],
-                    deploy_key_title(relationship_id),
-                    lambda: token,
-                )
-            except ProvisioningError as exc:
-                raise CliError("provisioning_error", f"{exc.code}: {exc}")
-            key_id = reg.get("id")
             deploy_keys.append(
                 {
-                    "id": key_id,
-                    "title": deploy_key_title(relationship_id),
-                    "key": acceptance["deploy_public_key"],
+                    "id": registered[0],
+                    "title": key_title,
+                    "key": peer_pub,
                     "role": "peer",
                 }
             )
-            # The inviter also needs git access: generate our own deploy
-            # keypair, register the public half, keep the private half.
-            from muse_agent_social.model.invites import generate_deploy_keypair
-
-            inviter_key_path = (
-                ctx.keys_dir / "pairing" / invite_id / "deploy-inviter"
-            )
-            inviter_pub = generate_deploy_keypair(str(inviter_key_path))
-            try:
-                reg_self = register_peer_deploy_key(
-                    repo,
-                    inviter_pub,
-                    deploy_key_title(relationship_id),
-                    lambda: token,
-                )
-            except ProvisioningError as exc:
-                raise CliError("provisioning_error", f"{exc.code}: {exc}")
             deploy_keys.append(
                 {
-                    "id": reg_self.get("id"),
-                    "title": deploy_key_title(relationship_id),
+                    "id": registered[1],
+                    "title": key_title,
                     "key": inviter_pub,
                     "role": "self",
                 }

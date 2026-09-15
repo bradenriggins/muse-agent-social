@@ -727,6 +727,7 @@ def commit_pairing(
     negotiated_capabilities,
     now: Optional[datetime] = None,
     keys_dir=None,
+    relationship_id: Optional[str] = None,
 ) -> dict:
     """Validate an acceptance and issue the signed pairing commit (step 4).
 
@@ -739,6 +740,9 @@ def commit_pairing(
     registers the peer's deploy public key, persists the relationship row as
     ``pending``, marks the invite ``committed``, and returns the signed
     commit dict.
+
+    Pass ``relationship_id`` to mint the id before calling (so relay
+    provisioning can reference it); when omitted a fresh uuid4 is used.
     """
     _ensure_pairing_tables(conn)
     now = _coerce_now(now)
@@ -755,7 +759,12 @@ def commit_pairing(
         raise PairingError("bad_capability", str(exc)) from exc
 
     kdir = keys_dir or default_keys_dir(conn)
-    relationship_id = str(uuid.uuid4())
+    if relationship_id is None:
+        relationship_id = str(uuid.uuid4())
+    else:
+        # Caller-minted id (the CLI provisions the relay before committing
+        # so deploy-key titles can reference it). Must still be a uuid4.
+        _require_uuid4(relationship_id, "relationship_id")
     rel_priv = X25519PrivateKey.generate()
     rel_pub_mb = agreement_key_multibase_from_pubkey(
         rel_priv.public_key().public_bytes_raw()
