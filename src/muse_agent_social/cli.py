@@ -1401,6 +1401,31 @@ def _flush_send_transports(ctx: Ctx, relationship_ids) -> None:
                 )
 
 
+def _warn_overdue_scheduled(ctx: Ctx) -> None:
+    """Warn when scheduled rows are past deliver_at and still undelivered.
+
+    Medium 2a: run_due only fires on `mas send` / `mas receive`, so an
+    idle install silently misses deliver_at. Every CLI invocation that
+    can release rows warns loudly about overdue rows before releasing
+    them, so the delay is visible instead of silent.
+    """
+    try:
+        overdue = ctx.conn.execute(
+            "SELECT COUNT(*) FROM scheduler_queue "
+            "WHERE state = 'scheduled' AND deliver_at < ?",
+            (utcnow(),),
+        ).fetchone()[0]
+    except Exception:
+        return
+    if overdue:
+        print(
+            f"warning: {overdue} scheduled event(s) are past deliver_at "
+            "and still undelivered (this install only releases on "
+            "send/receive); releasing them now, possibly late",
+            file=sys.stderr,
+        )
+
+
 def _send_event(
     ctx: Ctx,
     rel: dict,
@@ -1413,6 +1438,7 @@ def _send_event(
     deliver_at: Optional[str] = None,
     expires_at: Optional[str] = None,
     dry_run: bool = False,
+    clock_skew_seconds: Optional[float] = None,
 ) -> dict:
     """Persist, seal, and enqueue one outgoing event.
 
@@ -1500,8 +1526,26 @@ def _send_event(
     except ProjectionError as exc:
         raise CliError("send_error", f"projection failed: {exc.code}: {exc}")
     released: list[str] = []
+    cancel_outcome: Optional[str] = None
+    if event_type == "delivery.canceled":
+        # H7: cancel-before-release. The cancel must win if it arrives
+        # before deliver_at, so the cancellation is claimed BEFORE
+        # run_due() can release the row. Previously run_due ran first: a
+        # cancel racing a due release delivered the event while the CLI
+        # still reported success.
+        try:
+            scheduler.cancel(ctx.conn, payload["scheduled_event_id"])
+            cancel_outcome = "canceled"
+        except scheduler.SchedulerError as exc:
+            # already_released -> the delivery.canceled event now travels
+            # as a signed retraction request; unknown ids are reported
+            # honestly but do not fail the send.
+            cancel_outcome = exc.code
     try:
-        due = scheduler.run_due(ctx.conn, utcnow(), _release_fn(ctx))
+        due = scheduler.run_due(
+            ctx.conn, utcnow(), _release_fn(ctx),
+            clock_skew_seconds=clock_skew_seconds,
+        )
     except Exception as exc:
         raise CliError("send_error", f"scheduler release failed: {exc}")
     released.extend(due.get("released", []))
@@ -1510,11 +1554,6 @@ def _send_event(
     _flush_send_transports(ctx, [rid])
     if event_type == "relationship.ready":
         _maybe_mark_active_after_ready(ctx, rid)
-    if event_type == "delivery.canceled":
-        try:
-            scheduler.cancel(ctx.conn, payload["scheduled_event_id"])
-        except scheduler.SchedulerError:
-            pass
     object_names = [
         r["object_name"]
         for r in ctx.conn.execute(
@@ -1530,6 +1569,7 @@ def _send_event(
         "scheduled": not released,
         "object_names": object_names,
         "released": due,
+        "cancel_outcome": cancel_outcome,
     }
 
 
@@ -1556,6 +1596,7 @@ def _maybe_mark_active_after_ready(ctx: Ctx, rid: str) -> None:
 def cmd_send(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
+        _warn_overdue_scheduled(ctx)
         if args.type in _LEGACY_SEND_TYPES:
             if not args.to and not args.relationship:
                 raise CliError("bad_args", "legacy send needs --to")
@@ -1594,11 +1635,30 @@ def cmd_send(args: argparse.Namespace) -> int:
             deliver_at=args.deliver_at,
             expires_at=args.expires_at,
             dry_run=bool(args.dry_run),
+            clock_skew_seconds=args.clock_skew_seconds,
         )
         if args.json:
             print(_canon_text(result))
         elif result.get("dry_run"):
             print(_canon_text(result))
+        elif result.get("cancel_outcome") == "canceled":
+            print(
+                f"canceled {args.scheduled_event_id}; delivery.canceled "
+                f"event {result['event_id']} sent"
+            )
+        elif result.get("cancel_outcome") == "already_released":
+            print(
+                f"sent {result['event_id']} seq {result['sender_seq']} "
+                f"epoch {result['key_epoch']} (scheduled event "
+                f"{args.scheduled_event_id} already released; cancel became "
+                "a signed retraction request)"
+            )
+        elif result.get("cancel_outcome"):
+            print(
+                f"sent {result['event_id']} seq {result['sender_seq']} "
+                f"epoch {result['key_epoch']} "
+                f"(cancel outcome: {result['cancel_outcome']})"
+            )
         elif result.get("scheduled"):
             print(
                 f"scheduled {result['event_id']} seq {result['sender_seq']} "
@@ -2202,7 +2262,7 @@ def _post_receive_hooks(
 
 
 def _receive_relationship(
-    ctx: Ctx, rid: str, time_budget: float
+    ctx: Ctx, rid: str, time_budget: float, clock_skew_seconds: Optional[float] = None
 ) -> tuple[int, dict]:
     transport = _transport_for(ctx, rid, "receive")
     acc = {"surfaces": 0, "receipts_queued": 0}
@@ -2228,7 +2288,10 @@ def _receive_relationship(
         # Release accepted receipts (and any due scheduled sends) that the
         # receive commit queued in the scheduler outbox, then push them.
         try:
-            due = scheduler.run_due(ctx.conn, utcnow(), _release_fn(ctx))
+            due = scheduler.run_due(
+                ctx.conn, utcnow(), _release_fn(ctx),
+                clock_skew_seconds=clock_skew_seconds,
+            )
             receipts_sent = len(due.get("released", []))
         except Exception as exc:
             print(f"warning: release failed: {exc}", file=sys.stderr)
@@ -2240,6 +2303,7 @@ def _receive_relationship(
 def cmd_receive(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
+        _warn_overdue_scheduled(ctx)
         if args.relationship:
             rids = [ctx.resolve_relationship(args.relationship)["relationship_id"]]
         else:
@@ -2264,7 +2328,8 @@ def cmd_receive(args: argparse.Namespace) -> int:
         for rid in rids:
             try:
                 code, result = _receive_relationship(
-                    ctx, rid, float(args.timeout or 120)
+                    ctx, rid, float(args.timeout or 120),
+                    clock_skew_seconds=args.clock_skew_seconds,
                 )
             except CliError as exc:
                 code, result = exc.exit_code, {"error": exc.code}
@@ -2814,6 +2879,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--scheduled-event-id", default=None)
     p_send.add_argument("--canceled-at", default=None)
     p_send.add_argument("--migration-id", default=None)
+    p_send.add_argument(
+        "--clock-skew-seconds", type=float, default=None,
+        help="observed clock skew in seconds; passed to the scheduler so "
+        "blocking skew rejects scheduled sends instead of silently "
+        "mis-timing them",
+    )
     p_send.add_argument("--epoch", type=int, default=None)
     p_send.add_argument("--prepare-event-id", default=None)
     p_send.add_argument("--new-agreement-key", default=None)
@@ -2865,6 +2936,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_receive = subs.add_parser("receive", help="receive new relay objects")
     p_receive.add_argument("--relationship", default=None)
     p_receive.add_argument("--timeout", type=float, default=120.0)
+    p_receive.add_argument(
+        "--clock-skew-seconds", type=float, default=None,
+        help="observed clock skew in seconds; passed to the scheduler so "
+        "blocking skew rejects scheduled releases",
+    )
     _add_common(p_receive)
     p_receive.set_defaults(func=cmd_receive)
 
