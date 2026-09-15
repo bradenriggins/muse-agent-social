@@ -139,3 +139,50 @@ def test_revoke_confirmed_summary_renders_without_crash(paired):
     assert "cleanup" not in summary
     # The relationship is gone.
     assert db_row(paired["a"], rid) is None
+
+
+def test_revoke_revokes_remote_deploy_keys_by_id(paired, monkeypatch):
+    """relay.json stores deploy key ids under "id"; revoke must DELETE the
+    real key ids from the relay repo instead of falling back to manual."""
+    import argparse
+
+    sys.path.insert(0, str(SRC))
+    from muse_agent_social import cli as cli_mod
+
+    a = paired["a"]
+    rid = paired["rid"]
+    (a / "relay.json").write_text(
+        json.dumps(
+            {
+                "deploy_keys": [
+                    {
+                        "id": 4242,
+                        "title": "mas-pair-x",
+                        "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest",
+                        "role": "peer",
+                    }
+                ],
+                "repos": [{"repo": "owner/pair-relay", "transport": "github"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_api(self, method, path, payload=None):
+        calls.append((method, path))
+        return 204
+
+    monkeypatch.setattr(cli_mod._RevokeHooks, "_api", fake_api)
+    rc = cli_mod.cmd_revoke(
+        argparse.Namespace(
+            state_dir=str(a),
+            relationship=rid,
+            reason=None,
+            token="test-token",
+            delete_remote=False,
+            yes=True,
+        )
+    )
+    assert rc == 0
+    assert ("DELETE", "/repos/owner/pair-relay/keys/4242") in calls
