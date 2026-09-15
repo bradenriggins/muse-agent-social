@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Migration 2 gathers the auxiliary DDL owned by feature modules so that a
 # single migrate() call brings a fresh database to the full v0.2 schema.
@@ -20,6 +20,7 @@ SCHEMA_VERSION = 2
 from muse_agent_social.crypto.rotation import _ROTATION_TABLES
 from muse_agent_social.model.approvals import APPROVALS_DDL
 from muse_agent_social.store.projections import _V2_DDL as _PROJECTIONS_V2_DDL
+from muse_agent_social.store.projections import _V3_DDL as _PROJECTIONS_V3_DDL
 from muse_agent_social.transports.tables import TRANSPORT_DDL
 
 _V2_DDL = "\n".join(
@@ -160,6 +161,7 @@ CREATE INDEX IF NOT EXISTS idx_scheduler_deliver
 MIGRATIONS: list[tuple[int, str, str]] = [
     (1, "v1_initial_schema", _V1_DDL),
     (2, "v2_projections_rotation_transport", _V2_DDL),
+    (3, "v3_human_approval_attestation", _PROJECTIONS_V3_DDL),
 ]
 
 
