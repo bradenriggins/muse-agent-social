@@ -302,8 +302,11 @@ class TestRunDue:
     def test_release_fn_failure_rolls_back(self, conn, outbox):
         sid = scheduler.schedule(conn, ENVELOPE, "2026-09-15T19:00:00Z", None)
         calls = []
-        with pytest.raises(RuntimeError, match="boom"):
-            scheduler.run_due(conn, NOW, make_releaser(calls, fail_first=True))
+        # Per-row isolation (H6): the release_fn exception is contained
+        # and recorded against the row, never propagated.
+        summary = scheduler.run_due(conn, NOW, make_releaser(calls, fail_first=True))
+        assert summary["released"] == []
+        assert summary["failed"] == [sid]
         assert scheduler.get_scheduled(conn, sid)["state"] == "scheduled"
         assert outbox_rows(conn) == []
         summary = scheduler.run_due(conn, NOW, make_releaser(calls))

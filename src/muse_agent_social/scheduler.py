@@ -11,11 +11,14 @@ State machine (locked by the plan):
   built via request_retraction_after_release(), and unread delivery cannot
   be guaranteed.
 * run_due() releases due events through the same transactional outgoing
-  queue as immediate sends: the claim (scheduled -> released) and the
-  caller's enqueue happen inside one SQLite transaction, so a crash
-  either leaves the row scheduled (retried later) or released exactly
-  once. The scheduled_id is the idempotency key; release_fn must treat a
-  repeated call with the same scheduled_id as a no-op.
+  queue as immediate sends, with PER-ROW isolation: every due row is
+  processed in its own transaction inside its own try/except, so one
+  poison row (a release_fn that raises, e.g. a broken relay config) can
+  never wedge releases for other rows or relationships. A row whose
+  release_fn raises MAX_RELEASE_ATTEMPTS times (3) moves to the
+  dead-letter state "dead" and is never attempted again; dead-lettered
+  rows are visible through list_scheduled(conn, "dead") and the
+  `mas inspect scheduler` command.
 * A due event whose effective expiry has passed transitions to expired and
   is never released. With no explicit expires_at, the effective expiry is
   deliver_at plus the default 24h late window. A late but unexpired
@@ -56,6 +59,7 @@ from muse_agent_social.store.db import transaction
 __all__ = [
     "SCHEDULER_STATES",
     "DEFAULT_LATE_WINDOW_SECONDS",
+    "MAX_RELEASE_ATTEMPTS",
     "SchedulerError",
     "UnknownScheduledIdError",
     "AlreadyReleasedError",
@@ -69,8 +73,73 @@ __all__ = [
     "run_due",
 ]
 
-SCHEDULER_STATES = ("scheduled", "released", "canceled", "expired")
+SCHEDULER_STATES = ("scheduled", "released", "canceled", "expired", "dead")
 DEFAULT_LATE_WINDOW_SECONDS = LATE_WINDOW_SECONDS
+# A due row whose release_fn raises this many times is dead-lettered: it
+# moves to state "dead" and run_due never attempts it again. Three strikes
+# absorbs transient relay outages while bounding how long one poison row
+# can churn; the row stays inspectable via list_scheduled(conn, "dead").
+MAX_RELEASE_ATTEMPTS = 3
+
+# Idempotent dead-letter schema fragment. The owning module applies its
+# own fragment directly (the same pattern as rotation._ensure_tables()):
+# the release_failures counter is added with ALTER TABLE, and the state
+# CHECK is widened with 'dead' via a table rebuild because SQLite cannot
+# alter a CHECK constraint in place. Safe to run on every call; a no-op
+# once applied.
+_V3_TABLE_SQL = """CREATE TABLE scheduler_queue_new (
+    scheduled_id TEXT PRIMARY KEY,
+    inner_event  BLOB NOT NULL,
+    deliver_at   TEXT NOT NULL CHECK(deliver_at GLOB '????-??-??T??:??:??Z'),
+    expires_at   TEXT CHECK(expires_at IS NULL
+        OR expires_at GLOB '????-??-??T??:??:??Z'),
+    state        TEXT NOT NULL
+        CHECK(state IN ('scheduled', 'released', 'canceled', 'expired',
+                        'dead')),
+    release_failures INTEGER NOT NULL DEFAULT 0
+)"""
+
+
+def _ensure_dead_letter_schema(conn: sqlite3.Connection) -> None:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'scheduler_queue'"
+    ).fetchone()
+    if row is None:
+        return  # migrate() owns initial creation; nothing to widen yet
+    sql = row["sql"] or ""
+    if "release_failures" not in sql:
+        conn.execute(
+            "ALTER TABLE scheduler_queue ADD COLUMN release_failures "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'scheduler_queue'"
+        ).fetchone()
+        sql = row["sql"] or ""
+    if "'dead'" not in sql:
+        # The rebuild runs in one transaction so a crash can never leave
+        # the table half-migrated; a stale scheduler_queue_new from a
+        # crashed attempt is dropped first.
+        with transaction(conn):
+            conn.execute("DROP TABLE IF EXISTS scheduler_queue_new")
+            conn.execute(_V3_TABLE_SQL)
+            conn.execute(
+                "INSERT INTO scheduler_queue_new "
+                "(scheduled_id, inner_event, deliver_at, expires_at, state, "
+                "release_failures) SELECT scheduled_id, inner_event, "
+                "deliver_at, expires_at, state, release_failures "
+                "FROM scheduler_queue"
+            )
+            conn.execute("DROP TABLE scheduler_queue")
+            conn.execute(
+                "ALTER TABLE scheduler_queue_new RENAME TO scheduler_queue"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scheduler_deliver "
+                "ON scheduler_queue(deliver_at, state)"
+            )
 
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -148,6 +217,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "deliver_at": row["deliver_at"],
         "expires_at": row["expires_at"],
         "state": row["state"],
+        "release_failures": int(row["release_failures"] or 0),
     }
 
 
@@ -178,6 +248,7 @@ def schedule(
             expires_at not after deliver_at, a conflicting scheduled_id,
             or clock skew that blocks scheduled sends.
     """
+    _ensure_dead_letter_schema(conn)
     _check_clock(clock_skew_seconds, "schedule")
     if not isinstance(sealed_event_envelope, (bytes, bytearray)):
         raise SchedulerError("invalid_envelope", "envelope must be bytes")
@@ -219,9 +290,10 @@ def get_scheduled(
     conn: sqlite3.Connection, scheduled_id: str
 ) -> dict[str, Any] | None:
     """Return one scheduler row as a dict, or None when unknown."""
+    _ensure_dead_letter_schema(conn)
     row = conn.execute(
-        "SELECT scheduled_id, inner_event, deliver_at, expires_at, state "
-        "FROM scheduler_queue WHERE scheduled_id = ?",
+        "SELECT scheduled_id, inner_event, deliver_at, expires_at, state, "
+        "release_failures FROM scheduler_queue WHERE scheduled_id = ?",
         (scheduled_id,),
     ).fetchone()
     return _row_to_dict(row) if row is not None else None
@@ -231,17 +303,20 @@ def list_scheduled(
     conn: sqlite3.Connection, state: str | None = None
 ) -> list[dict[str, Any]]:
     """List scheduler rows, optionally filtered by state, by deliver_at."""
+    _ensure_dead_letter_schema(conn)
     if state is not None and state not in SCHEDULER_STATES:
         raise SchedulerError("invalid_state", str(state))
     if state is None:
         rows = conn.execute(
-            "SELECT scheduled_id, inner_event, deliver_at, expires_at, state "
-            "FROM scheduler_queue ORDER BY deliver_at, scheduled_id;"
+            "SELECT scheduled_id, inner_event, deliver_at, expires_at, state, "
+            "release_failures FROM scheduler_queue "
+            "ORDER BY deliver_at, scheduled_id;"
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT scheduled_id, inner_event, deliver_at, expires_at, state "
-            "FROM scheduler_queue WHERE state = ? ORDER BY deliver_at, scheduled_id;",
+            "SELECT scheduled_id, inner_event, deliver_at, expires_at, state, "
+            "release_failures FROM scheduler_queue WHERE state = ? "
+            "ORDER BY deliver_at, scheduled_id;",
             (state,),
         ).fetchall()
     return [_row_to_dict(row) for row in rows]
@@ -259,6 +334,7 @@ def cancel(conn: sqlite3.Connection, scheduled_id: str) -> str:
     Returns:
         The terminal state ("canceled").
     """
+    _ensure_dead_letter_schema(conn)
     row = get_scheduled(conn, scheduled_id)
     if row is None:
         raise UnknownScheduledIdError(scheduled_id)
@@ -328,6 +404,97 @@ def request_retraction_after_release(
 ReleaseFn = Callable[..., None]
 
 
+def _release_one_row(
+    conn: sqlite3.Connection,
+    now_dt: Any,
+    release_fn: ReleaseFn,
+    row: dict[str, Any],
+) -> tuple[str, int]:
+    """Process one due row inside its own transaction.
+
+    Returns (status, late_by_seconds) where status is one of "released",
+    "expired", "not_due", "skipped" (row left 'scheduled' by a concurrent
+    writer), or "skipped_canceled" (the row was canceled before the claim;
+    a stable no-op, never a delivery).
+
+    Raises:
+        Whatever release_fn raises (the caller records it per row), or
+        InvalidSchedulerTransition on a concurrent state change.
+    """
+    sid = row["scheduled_id"]
+    with transaction(conn):
+        current = conn.execute(
+            "SELECT state FROM scheduler_queue WHERE scheduled_id = ?",
+            (sid,),
+        ).fetchone()
+        if current is None:
+            return ("skipped", 0)
+        if current["state"] == "canceled":
+            # Cancel wins over release: a cancel that landed between the
+            # due-row scan and this claim is honored inside the release
+            # transaction, so a canceled row is never delivered.
+            return ("skipped_canceled", 0)
+        if current["state"] != "scheduled":
+            return ("skipped", 0)
+        effective = _effective_expires_at(row["deliver_at"], row["expires_at"])
+        if now_dt >= parse_canonical_utc(effective):
+            conn.execute(
+                "UPDATE scheduler_queue SET state = 'expired' "
+                "WHERE scheduled_id = ? AND state = 'scheduled'",
+                (sid,),
+            )
+            return ("expired", 0)
+        deliver_dt = parse_canonical_utc(row["deliver_at"])
+        if now_dt < deliver_dt:
+            return ("not_due", 0)
+        late_by = max(0, int((now_dt - deliver_dt).total_seconds()))
+        cursor = conn.execute(
+            "UPDATE scheduler_queue SET state = 'released' "
+            "WHERE scheduled_id = ? AND state = 'scheduled'",
+            (sid,),
+        )
+        if cursor.rowcount != 1:
+            raise InvalidSchedulerTransition(
+                sid, "row changed state concurrently"
+            )
+        release_fn(
+            conn,
+            scheduled_id=sid,
+            sealed_event_envelope=row["inner_event"],
+            late_by_seconds=late_by,
+        )
+    return ("released", late_by)
+
+
+def _record_release_failure(conn: sqlite3.Connection, scheduled_id: str) -> int:
+    """Count one release failure against a row; dead-letter at the limit.
+
+    Returns the new failure count. When the count reaches
+    MAX_RELEASE_ATTEMPTS the row moves to state "dead" and run_due stops
+    attempting it.
+    """
+    with transaction(conn):
+        conn.execute(
+            "UPDATE scheduler_queue SET release_failures = release_failures + 1 "
+            "WHERE scheduled_id = ?",
+            (scheduled_id,),
+        )
+        failures = int(
+            conn.execute(
+                "SELECT release_failures FROM scheduler_queue "
+                "WHERE scheduled_id = ?",
+                (scheduled_id,),
+            ).fetchone()[0]
+        )
+        if failures >= MAX_RELEASE_ATTEMPTS:
+            conn.execute(
+                "UPDATE scheduler_queue SET state = 'dead' "
+                "WHERE scheduled_id = ? AND state = 'scheduled'",
+                (scheduled_id,),
+            )
+    return failures
+
+
 def run_due(
     conn: sqlite3.Connection,
     now: str,
@@ -337,11 +504,22 @@ def run_due(
 ) -> dict[str, Any]:
     """Release due scheduled events through the transactional outgoing queue.
 
+    PER-ROW ISOLATION: every due row is processed in its own transaction
+    inside its own try/except. A release_fn exception rolls back only
+    that row's claim and is recorded against the row; it never propagates
+    and never blocks other rows or relationships. A row whose release_fn
+    raises MAX_RELEASE_ATTEMPTS times (3) moves to the dead-letter state
+    "dead" and is never attempted again.
+
     For each scheduled row with deliver_at <= now: rows past their
     effective expiry (explicit expires_at, else deliver_at plus the 24h
     default late window) transition to expired and are never released;
     the rest transition to released and are handed to release_fn inside
     the same transaction.
+
+    Releasing a canceled row is a stable no-op, never a delivery: the
+    row's state is re-checked inside the release transaction, so a cancel
+    that lands between the due-row scan and the claim is honored.
 
     release_fn(conn, *, scheduled_id, sealed_event_envelope,
     late_by_seconds) must enqueue the sealed event into the same
@@ -358,54 +536,53 @@ def run_due(
 
     Returns:
         {"released": [scheduled_id...], "expired": [scheduled_id...],
-         "late": {scheduled_id: late_by_seconds, ...}}
+         "late": {scheduled_id: late_by_seconds, ...},
+         "failed": [scheduled_id...], "dead": [scheduled_id...],
+         "skipped_canceled": [scheduled_id...]}
 
     Raises:
         SchedulerError: on a bad *now* timestamp or blocking clock skew.
-        Any exception from release_fn propagates after rollback.
+        release_fn exceptions are contained per row and never propagate.
     """
+    _ensure_dead_letter_schema(conn)
     _validate_moment(now, "now")
     _check_clock(clock_skew_seconds, "run_due")
     now_dt = parse_canonical_utc(now)
-    summary: dict[str, Any] = {"released": [], "expired": [], "late": {}}
-    with transaction(conn):
-        rows = conn.execute(
-            "SELECT scheduled_id, inner_event, deliver_at, expires_at, state "
-            "FROM scheduler_queue WHERE state = 'scheduled' "
-            "ORDER BY deliver_at, scheduled_id;"
-        ).fetchall()
-        for db_row in rows:
-            row = _row_to_dict(db_row)
-            sid = row["scheduled_id"]
-            effective = _effective_expires_at(row["deliver_at"], row["expires_at"])
-            if now_dt >= parse_canonical_utc(effective):
-                conn.execute(
-                    "UPDATE scheduler_queue SET state = 'expired' "
-                    "WHERE scheduled_id = ? AND state = 'scheduled'",
-                    (sid,),
-                )
-                summary["expired"].append(sid)
-                continue
-            deliver_dt = parse_canonical_utc(row["deliver_at"])
-            if now_dt < deliver_dt:
-                continue
-            late_by = max(0, int((now_dt - deliver_dt).total_seconds()))
-            cursor = conn.execute(
-                "UPDATE scheduler_queue SET state = 'released' "
-                "WHERE scheduled_id = ? AND state = 'scheduled'",
-                (sid,),
-            )
-            if cursor.rowcount != 1:
-                raise InvalidSchedulerTransition(
-                    sid, "row changed state concurrently"
-                )
-            release_fn(
-                conn,
-                scheduled_id=sid,
-                sealed_event_envelope=row["inner_event"],
-                late_by_seconds=late_by,
-            )
+    summary: dict[str, Any] = {
+        "released": [],
+        "expired": [],
+        "late": {},
+        "failed": [],
+        "dead": [],
+        "skipped_canceled": [],
+    }
+    rows = conn.execute(
+        "SELECT scheduled_id, inner_event, deliver_at, expires_at, state, "
+        "release_failures FROM scheduler_queue "
+        "WHERE state = 'scheduled' AND release_failures < ? "
+        "ORDER BY deliver_at, scheduled_id;",
+        (MAX_RELEASE_ATTEMPTS,),
+    ).fetchall()
+    for db_row in rows:
+        row = _row_to_dict(db_row)
+        sid = row["scheduled_id"]
+        try:
+            status, late_by = _release_one_row(conn, now_dt, release_fn, row)
+        except Exception:
+            # Per-row isolation: record the failure against this row only
+            # and continue with the next due row.
+            failures = _record_release_failure(conn, sid)
+            if failures >= MAX_RELEASE_ATTEMPTS:
+                summary["dead"].append(sid)
+            else:
+                summary["failed"].append(sid)
+            continue
+        if status == "released":
             summary["released"].append(sid)
             if late_by > 0:
                 summary["late"][sid] = late_by
+        elif status == "expired":
+            summary["expired"].append(sid)
+        elif status == "skipped_canceled":
+            summary["skipped_canceled"].append(sid)
     return summary
