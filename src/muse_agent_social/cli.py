@@ -203,7 +203,7 @@ def _receive_exit_precedence(codes: list[int]) -> int:
 
 def _canon_text(obj: Any) -> str:
     """Canonical JSON text for machine-readable CLI output."""
-    return restricted_jcs(obj).decode("ascii")
+    return restricted_jcs(obj).decode("utf-8")
 
 
 def _new_uuid() -> str:
@@ -1615,11 +1615,11 @@ def cmd_human_respond(args: argparse.Namespace) -> int:
         args.approval_record = approval_id
         args.type = "human.responded"
         args.approved = approved
-        event_type, payload = _build_payload(ctx, args)
+        payload = _build_payload(ctx, args)
         result = _send_event(
             ctx,
             rel,
-            event_type,
+            "human.responded",
             payload,
             conversation_id=args.conversation,
             thread_id=args.thread,
