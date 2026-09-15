@@ -31,6 +31,7 @@ import base64
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import sys
 import urllib.error
@@ -2400,9 +2401,115 @@ def cmd_receive(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _atomic_write_bytes(path: Path, data: bytes, mode: int) -> None:
+    """Write *data* to *path* atomically (temp file + rename)."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def _rotate_identity(ctx: Ctx, args: argparse.Namespace) -> int:
+    """Rotate the identity signing key (H11).
+
+    Uses the shipped crypto (rotate_identity_key / verify_identity_rotation),
+    reissues the local agent card under the new identity id, backs up the
+    old seed and card, and persists the rotation announcement for
+    out-of-band peer delivery.
+
+    There is deliberately no in-protocol peer notification: the v0.2 event
+    schemas define no identity-rotation event type (schema ownership sits
+    with another lane), so faking one would corrupt the event stream. The
+    command says this loudly instead.
+    """
+    if not args.confirm_identity:
+        raise CliError(
+            "confirmation_required",
+            "rotating the identity key changes your identity_id; existing "
+            "peers will not recognize the new identity until they receive "
+            "the rotation announcement. Pass --confirm-identity to proceed.",
+        )
+    from .crypto.identity import derive_identity_hierarchy
+    from .crypto.rotation import (
+        IdentityRotationError,
+        rotate_identity_key,
+        verify_identity_rotation,
+    )
+
+    old_card = ctx.card
+    new_seed = secrets.token_bytes(32)
+    new_hierarchy = derive_identity_hierarchy(new_seed)
+    try:
+        announcement = rotate_identity_key(
+            old_card,
+            ctx.hierarchy.ed25519_private,
+            new_hierarchy.ed25519_private,
+        )
+    except IdentityRotationError as exc:
+        raise CliError("identity_rotation_failed", str(exc))
+    # Fail closed: verify with the shipped verifier before touching disk.
+    if not verify_identity_rotation(announcement, old_card):
+        raise CliError(
+            "identity_rotation_failed",
+            "self-verification of the rotation announcement failed; "
+            "no state was changed",
+        )
+
+    identity_ref = ctx.config.get("identity_ref") or {}
+    seed_rel = identity_ref.get("master_seed_path") or f"keys/{_MASTER_SEED_NAME}"
+    card_rel = identity_ref.get("card_path") or _CARD_NAME
+    seed_path = ctx.state_dir / seed_rel
+    card_path = ctx.state_dir / card_rel
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    # Back up the old seed and card first; losing the old seed would brick
+    # anything sealed to the old identity.
+    backup_seed = seed_path.with_name(f"{seed_path.name}.backup-{stamp}")
+    backup_card = card_path.with_name(f"{card_path.name}.backup-{stamp}")
+    shutil.copy2(seed_path, backup_seed)
+    os.chmod(backup_seed, 0o600)
+    shutil.copy2(card_path, backup_card)
+
+    _atomic_write_bytes(seed_path, new_seed, 0o600)
+    _atomic_write_bytes(
+        card_path,
+        (_canon_text(announcement["new_card"]) + "\n").encode("utf-8"),
+        0o644,
+    )
+    rot_dir = ctx.state_dir / "identity-rotations"
+    rot_dir.mkdir(parents=True, exist_ok=True)
+    ann_path = rot_dir / f"{new_hierarchy.identity_id}.json"
+    ann_path.write_text(_canon_text(announcement) + "\n", encoding="utf-8")
+
+    print(
+        f"identity rotated: {ctx.identity_id} -> {new_hierarchy.identity_id}"
+    )
+    print(f"new card: {card_path}")
+    print(f"announcement: {ann_path}")
+    print(f"backups: {backup_seed}, {backup_card}")
+    print(
+        "warning: peer notification is out-of-band. No identity-rotation "
+        "event type exists in the v0.2 protocol schemas, so peers cannot "
+        "learn the new identity_id over the relay yet; share the "
+        "announcement file with each peer directly until the protocol "
+        "gains an identity.rotation event.",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def cmd_rotate(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
+        if args.identity:
+            return _rotate_identity(ctx, args)
+        if not args.relationship:
+            raise CliError(
+                "missing_relationship",
+                "mas rotate needs --relationship (or --identity for "
+                "identity-key rotation)",
+            )
         rel = ctx.resolve_relationship(args.relationship)
         rid = rel["relationship_id"]
         manager = RotationManager(ctx.conn, ctx.state_dir)
@@ -3118,7 +3225,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_pol_get.set_defaults(func=cmd_policy_get)
 
     p_rotate = subs.add_parser("rotate", help="agreement key rotation ceremony")
-    p_rotate.add_argument("--relationship", required=True)
+    p_rotate.add_argument("--relationship", default=None)
+    p_rotate.add_argument(
+        "--identity", action="store_true",
+        help="rotate the identity signing key instead of an agreement key",
+    )
+    p_rotate.add_argument(
+        "--confirm-identity", action="store_true",
+        help="required for --identity: acknowledge the identity_id changes",
+    )
     p_rotate.add_argument("--prepare", action="store_true")
     p_rotate.add_argument("--ack", action="store_true")
     p_rotate.add_argument("--confirm", action="store_true")
