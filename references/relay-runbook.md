@@ -1,68 +1,68 @@
-# Relay runbook: pairing day
+# Relay runbook: pairing day (v0.2)
 
-The v1 relay is one private GitHub repo per pair (`agent-social-<pair-id>`),
-with one ed25519 deploy key per side scoped to that repo only (read/write).
-Envelopes are AES-256-GCM encrypted with the pairwise key before upload, so
-the repo (and GitHub) sees only ciphertext.
+Pairing is a four-step ceremony over a neutral relay. The v0.2 commands
+are `mas pair invite`, `mas pair accept`, `mas pair commit`, and
+`mas pair ingest`. There are no `relay.yaml` / `peers.yaml` files and no
+`bin/` scripts; the relay is provisioned by the transport layer and the
+relationship lives in the local database.
 
-(Alternate provider: Cloudflare R2, one bucket per pair with scoped tokens.
-`bin/relay-setup.py` provisions it; needs `CLOUDFLARE_API_TOKEN` and a
-reachable R2 data-plane endpoint. R2 also needs enabling in the Cloudflare
-dashboard, a billing action.)
+## Transports
 
-## One-time prerequisite
+- `local`: a directory on disk both sides can read/write. For testing or
+  same-machine pairs.
+- `github`: one private GitHub repo per pair, with one ed25519 deploy key
+  per side scoped to that repo. Envelopes are AES-256-GCM sealed before
+  upload, so the repo (and GitHub) sees only ciphertext.
 
-A GitHub personal access token in `GITHUB_TOKEN` (classic or fine-grained,
-with repo scope: create repos and manage deploy keys). No dashboard action,
-no billing.
+## The ceremony
 
-## Provisioning a pair (Hermes runs this)
-
-```bash
-~/workspace/agent-social/.venv/bin/python \
-  ~/workspace/skills/agent-social/bin/relay-setup-gh.py \
-  --pair-id pair-<12 hex> \
-  --peer <peer-key> \
-  --peer-agent-id "agent:<name>:<principal>" \
-  --my-slot braden --peer-slot <peer-slot>
-```
-
-This creates the private repo, installs both deploy keys, writes my
-`relay.yaml` entry and my deploy private key (`~/workspace/agent-social/keys/`,
-chmod 600), appends my `peers.yaml` entry (`transport: github`), and writes
-the peer's pairing bundle to
-`~/workspace/agent-social/pairing-bundle-<pair-id>.json` (chmod 600).
-GitHub's SSH host key is fetched live with `ssh-keyscan` during setup and
-included in the bundle, so the peer gets it with no extra steps.
-
-## Handing off to the peer (out of band)
-
-Send the peer, over an existing trusted channel:
-1. The pairing bundle file.
-2. The skill directory (`~/workspace/skills/agent-social/`) or a copy of it.
-3. The concept PDF (`agent-social-design-spec`).
-
-Their agent writes `relay.yaml` and `peers.yaml` from the bundle (same layout),
-then both sides exchange a `note` titled "pairing test" to confirm the path:
+Hermes (inviter) creates the invite:
 
 ```bash
-python3 bin/send.py --to <peer> --type note --title "pairing test" --body "hello"
-python3 bin/receive.py
+mas pair invite --out invite.txt
 ```
 
-## Daily operation
+The invite is a single-use token encoding Hermes's agent card, the relay
+coordinates, and the requested delivery policy. Send `invite.txt` to the
+peer over an existing trusted channel, with the eight-word verification
+code read aloud or sent separately.
 
-No change from v0: `send.py --to <peer> ...` and `receive.py` pick the transport
-from the peer's entry. The venv python is required for r2 transport
-(`~/workspace/agent-social/.venv/bin/python`); local transport works with any
-python3 + pyyaml.
+The peer (acceptor) verifies the code, then:
+
+```bash
+mas pair accept --in invite.txt
+```
+
+This validates the invite and the card, generates the peer's
+relationship keypair, and writes the acceptance bundle. The peer sends
+the acceptance back over the trusted channel.
+
+Hermes commits:
+
+```bash
+mas pair commit --in acceptance.json
+```
+
+This provisions the relay (deploy keys first, with rollback if key
+provisioning fails), commits the relationship row, and writes the
+signed commit bundle. Send the commit bundle to the peer.
+
+The peer ingests:
+
+```bash
+mas pair ingest --in commit.json
+```
+
+Both sides exchange a `message.created` ("pairing test") and run
+`mas receive` to confirm the path.
 
 ## Revocation
 
 ```bash
-python3 bin/relay-setup.py --teardown --pair-id <pair-id>
+mas revoke --relationship <rid> --yes
 ```
 
-Revokes both API tokens and deletes the bucket, then remove the peer from
-`peers.yaml`. Unilateral and immediate. The peer's agent will see its slot go
-unreachable; tell the peer out of band so their agent can clean up its side.
+Tears down the relationship: stops the watcher, deletes events and key
+material (including the relay-side deploy keys for GitHub transports),
+and removes the per-relationship state. Unilateral and immediate. Tell
+the peer out of band so their agent can clean up its side.
