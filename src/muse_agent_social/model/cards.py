@@ -57,6 +57,7 @@ CARD_VERSION = 1
 MAX_CAPABILITIES = 64
 MAX_CAPABILITY_BYTES = 64
 MAX_CARD_LIFETIME = timedelta(days=365)
+_CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
 CARD_NONCE_BYTES = 16
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -327,6 +328,12 @@ def verify_card(card: Any, now: Optional[datetime] = None) -> CardVerification:
     current = now if now is not None else datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
+    if issued_dt > current + _CLOCK_SKEW_TOLERANCE:
+        return _fail(
+            "ISSUED_IN_FUTURE",
+            "issued_at is in the future; the 365-day lifetime cap is "
+            "meaningless without anchoring issuance to now",
+        )
     if current >= expires_dt:
         return _fail(
             "EXPIRED",

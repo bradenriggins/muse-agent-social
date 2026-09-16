@@ -21,7 +21,7 @@ import base64
 import hashlib
 import hmac
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import base58
 from cryptography.hazmat.primitives import hashes
@@ -61,21 +61,18 @@ def generate_master_seed() -> bytes:
 def store_master_seed(path: str | os.PathLike, seed: bytes) -> None:
     """Write *seed* to *path* with mode 0600. Refuses to overwrite an existing file.
 
-    Uses O_CREAT | O_EXCL so a concurrent creation cannot silently replace an
-    existing seed file. Raises FileExistsError if the file already exists and
-    ValueError if the seed is not exactly 32 bytes.
+    The write is atomic (temp file + fsync + atomic link): a crash mid-write
+    can never leave a partial seed file behind. Raises FileExistsError if the
+    file already exists and ValueError if the seed is not exactly 32 bytes.
     """
     seed = bytes(seed)
     if len(seed) != _MASTER_SEED_LEN:
         raise ValueError(
             f"master seed must be exactly {_MASTER_SEED_LEN} bytes, got {len(seed)}"
         )
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    fd = os.open(path, flags, 0o600)
-    try:
-        os.write(fd, seed)
-    finally:
-        os.close(fd)
+    from .._keyfiles import atomic_write_no_overwrite
+
+    atomic_write_no_overwrite(path, seed, 0o600)
 
 
 def _hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
@@ -109,12 +106,20 @@ def derive_identity_hierarchy(master_seed: bytes) -> "IdentityHierarchy":
         )
 
     prk = _hkdf_extract(_DOMAIN, seed)
-    ed25519_seed = _hkdf_expand(prk, _INFO_ID_SIGNING)
-    x25519_bootstrap = _hkdf_expand(prk, _INFO_KEY_AGREEMENT)
+    # Intermediate derivation outputs live in mutable bytearrays and are
+    # zeroed as soon as the key objects are constructed: raw key material is
+    # never retained on the process-lifetime hierarchy object.
+    ed25519_seed = bytearray(_hkdf_expand(prk, _INFO_ID_SIGNING))
+    x25519_bootstrap = bytearray(_hkdf_expand(prk, _INFO_KEY_AGREEMENT))
     local_store_key = _hkdf_expand(prk, _INFO_LOCAL_STORE)
 
-    ed25519_private = Ed25519PrivateKey.from_private_bytes(ed25519_seed)
-    x25519_private = X25519PrivateKey.from_private_bytes(x25519_bootstrap)
+    try:
+        ed25519_private = Ed25519PrivateKey.from_private_bytes(bytes(ed25519_seed))
+        x25519_private = X25519PrivateKey.from_private_bytes(bytes(x25519_bootstrap))
+    finally:
+        _zero(ed25519_seed)
+        _zero(x25519_bootstrap)
+        _zero(bytearray(prk))
 
     ed25519_public_bytes = ed25519_private.public_key().public_bytes_raw()
     x25519_public_bytes = x25519_private.public_key().public_bytes_raw()
@@ -127,10 +132,13 @@ def derive_identity_hierarchy(master_seed: bytes) -> "IdentityHierarchy":
         agreement_key_multibase=agreement_key_multibase_from_pubkey(
             x25519_public_bytes
         ),
-        # Retained only so tests can assert cross-purpose separation.
-        _ed25519_seed=ed25519_seed,
-        _x25519_bootstrap=x25519_bootstrap,
     )
+
+
+def _zero(buf: bytearray) -> None:
+    """Best-effort overwrite of a mutable key buffer."""
+    for i in range(len(buf)):
+        buf[i] = 0
 
 
 @dataclass
@@ -147,9 +155,12 @@ class IdentityHierarchy:
     local_store_key: bytes
     identity_id: str
     agreement_key_multibase: str
-    # Raw derivation outputs, kept for tests/audit; never persisted or sent.
-    _ed25519_seed: bytes = field(repr=False)
-    _x25519_bootstrap: bytes = field(repr=False)
+    # NOTE: raw derivation outputs (the Ed25519 seed and X25519 bootstrap)
+    # are deliberately NOT retained: they are zeroed in
+    # derive_identity_hierarchy as soon as the key objects are built, so a
+    # memory disclosure cannot reconstruct the private keys. Tests that need
+    # the golden derivation vectors re-extract them from the private key
+    # objects via serialization instead.
 
     @property
     def ed25519_public_bytes(self) -> bytes:

@@ -51,6 +51,7 @@ from muse_agent_social.crypto.sealing import (
     b64url_encode,
     seal_envelope,
 )
+from muse_agent_social.model.approvals import consume_approval
 from muse_agent_social.model.cards import parse_timestamp
 from muse_agent_social.store.db import transaction, utcnow
 from muse_agent_social.validation import PAYLOAD_DISPATCH
@@ -62,6 +63,7 @@ __all__ = [
     "new_thread_id",
     "validate_reply",
     "assign_and_persist_outgoing",
+    "persist_outgoing_in_txn",
 ]
 
 PROTECTED_FIELDS = (
@@ -269,12 +271,139 @@ def _classify_integrity(exc: sqlite3.IntegrityError) -> tuple[str, str]:
     return "integrity_error", text
 
 
+def persist_outgoing_in_txn(
+    conn: sqlite3.Connection,
+    protected: dict,
+    payload: dict,
+    identity_priv: Ed25519PrivateKey,
+    recipients: list,
+    approval_id: Optional[str] = None,
+) -> dict:
+    """Seal and persist an outgoing event inside the caller's transaction.
+
+    The shared core of :func:`assign_and_persist_outgoing`: assigns
+    sender_seq = max+1, seals, inserts the events row, upserts
+    sender_sequence, enqueues projection_queue and the scheduler outbox.
+    Raises EventStoreError on persistence conflicts, SealingError on
+    crypto/schema failure. Callers needing their own atomic scope use
+    this directly instead of duplicating the persist sequence.
+
+    When ``approval_id`` is given, the human-approval record is claimed
+    inside this same transaction: a failed send rolls the consumption
+    back, so a human approval is never burned without authorizing a
+    durably persisted event. Exactly one racing send can win the claim.
+    """
+    if approval_id is not None:
+        if not consume_approval(conn, approval_id, utcnow()):
+            raise EventStoreError(
+                "approval_consumed",
+                "approval was consumed by a concurrent send or expired",
+            )
+    relationship_id = protected.get("relationship_id")
+    sender = protected.get("sender")
+    if not relationship_id or not sender:
+        raise ValueError("protected needs relationship_id and sender")
+    missing = [f for f in PROTECTED_FIELDS if f not in protected]
+    if missing:
+        raise EventStoreError(
+            "bad_protected", f"missing protected fields: {missing}"
+        )
+
+    row = conn.execute(
+        "SELECT COALESCE(MAX(sender_seq), 0) FROM events "
+        "WHERE relationship_id = ? AND sender = ?",
+        (relationship_id, sender),
+    ).fetchone()
+    seq = int(row[0]) + 1
+    protected["sender_seq"] = seq
+
+    envelope = seal_envelope(protected, payload, identity_priv, recipients)
+    sealed_bytes = restricted_jcs(envelope)
+
+    conn.execute(
+        "INSERT OR IGNORE INTO conversations(conversation_id) VALUES (?)",
+        (protected["conversation_id"],),
+    )
+    thread_id = protected.get("thread_id")
+    if thread_id is not None:
+        existing = conn.execute(
+            "SELECT conversation_id FROM threads WHERE thread_id = ?",
+            (thread_id,),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO threads(thread_id, conversation_id) "
+                "VALUES (?, ?)",
+                (thread_id, protected["conversation_id"]),
+            )
+        elif existing["conversation_id"] != protected["conversation_id"]:
+            raise EventStoreError(
+                "thread_conversation_mismatch",
+                f"thread {thread_id} already belongs to another "
+                "conversation",
+            )
+    try:
+        conn.execute(
+            "INSERT INTO events(event_id, relationship_id, "
+            "conversation_id, thread_id, sender, sender_seq, created_at, "
+            "key_epoch, event_type, replay_nonce, sealed_envelope) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                protected["event_id"],
+                relationship_id,
+                protected["conversation_id"],
+                thread_id,
+                sender,
+                seq,
+                protected["created_at"],
+                protected["key_epoch"],
+                protected["event_type"],
+                protected["replay_nonce"],
+                sealed_bytes,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        code, message = _classify_integrity(exc)
+        raise EventStoreError(code, message) from None
+
+    conn.execute(
+        "INSERT INTO sender_sequence(relationship_id, sender, last_seq) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(relationship_id, sender) DO UPDATE SET "
+        "last_seq = MAX(sender_sequence.last_seq, excluded.last_seq)",
+        (relationship_id, sender, seq),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO projection_queue(event_id, queued_at) "
+        "VALUES (?, ?)",
+        (protected["event_id"], utcnow()),
+    )
+    try:
+        conn.execute(
+            "INSERT INTO scheduler_queue(scheduled_id, inner_event, "
+            "deliver_at, expires_at, state) "
+            "VALUES (?, ?, ?, ?, 'scheduled')",
+            (
+                protected["event_id"],
+                sealed_bytes,
+                protected.get("deliver_at") or utcnow(),
+                protected.get("expires_at"),
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        code, message = _classify_integrity(exc)
+        raise EventStoreError(code, message) from None
+
+    return envelope
+
+
 def assign_and_persist_outgoing(
     conn: sqlite3.Connection,
     protected: dict,
     payload: dict,
     identity_priv: Ed25519PrivateKey,
     recipients: list,
+    approval_id: Optional[str] = None,
 ) -> dict:
     """Assign sender_seq and persist a sealed outgoing event, atomically.
 
@@ -291,6 +420,9 @@ def assign_and_persist_outgoing(
     (relationship_id, sender, sender_seq)) are enforced by the schema; on
     conflict the transaction rolls back and EventStoreError is raised.
 
+    When ``approval_id`` is given, the human-approval claim is part of
+    the same transaction (see :func:`persist_outgoing_in_txn`).
+
     Returns:
         The sealed envelope dict.
 
@@ -299,100 +431,7 @@ def assign_and_persist_outgoing(
         SealingError: from seal_envelope on any crypto/schema failure.
         ValueError: when protected lacks relationship_id/sender.
     """
-    relationship_id = protected.get("relationship_id")
-    sender = protected.get("sender")
-    if not relationship_id or not sender:
-        raise ValueError("protected needs relationship_id and sender")
-    missing = [f for f in PROTECTED_FIELDS if f not in protected]
-    if missing:
-        raise EventStoreError(
-            "bad_protected", f"missing protected fields: {missing}"
-        )
-
     with transaction(conn):
-        row = conn.execute(
-            "SELECT COALESCE(MAX(sender_seq), 0) FROM events "
-            "WHERE relationship_id = ? AND sender = ?",
-            (relationship_id, sender),
-        ).fetchone()
-        seq = int(row[0]) + 1
-        protected["sender_seq"] = seq
-
-        envelope = seal_envelope(protected, payload, identity_priv, recipients)
-        sealed_bytes = restricted_jcs(envelope)
-
-        conn.execute(
-            "INSERT OR IGNORE INTO conversations(conversation_id) VALUES (?)",
-            (protected["conversation_id"],),
+        return persist_outgoing_in_txn(
+            conn, protected, payload, identity_priv, recipients, approval_id
         )
-        thread_id = protected.get("thread_id")
-        if thread_id is not None:
-            existing = conn.execute(
-                "SELECT conversation_id FROM threads WHERE thread_id = ?",
-                (thread_id,),
-            ).fetchone()
-            if existing is None:
-                conn.execute(
-                    "INSERT INTO threads(thread_id, conversation_id) "
-                    "VALUES (?, ?)",
-                    (thread_id, protected["conversation_id"]),
-                )
-            elif existing["conversation_id"] != protected["conversation_id"]:
-                raise EventStoreError(
-                    "thread_conversation_mismatch",
-                    f"thread {thread_id} already belongs to another "
-                    "conversation",
-                )
-        try:
-            conn.execute(
-                "INSERT INTO events(event_id, relationship_id, "
-                "conversation_id, thread_id, sender, sender_seq, created_at, "
-                "key_epoch, event_type, replay_nonce, sealed_envelope) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    protected["event_id"],
-                    relationship_id,
-                    protected["conversation_id"],
-                    thread_id,
-                    sender,
-                    seq,
-                    protected["created_at"],
-                    protected["key_epoch"],
-                    protected["event_type"],
-                    protected["replay_nonce"],
-                    sealed_bytes,
-                ),
-            )
-        except sqlite3.IntegrityError as exc:
-            code, message = _classify_integrity(exc)
-            raise EventStoreError(code, message) from None
-
-        conn.execute(
-            "INSERT INTO sender_sequence(relationship_id, sender, last_seq) "
-            "VALUES (?, ?, ?) "
-            "ON CONFLICT(relationship_id, sender) DO UPDATE SET "
-            "last_seq = MAX(sender_sequence.last_seq, excluded.last_seq)",
-            (relationship_id, sender, seq),
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO projection_queue(event_id, queued_at) "
-            "VALUES (?, ?)",
-            (protected["event_id"], utcnow()),
-        )
-        try:
-            conn.execute(
-                "INSERT INTO scheduler_queue(scheduled_id, inner_event, "
-                "deliver_at, expires_at, state) "
-                "VALUES (?, ?, ?, ?, 'scheduled')",
-                (
-                    protected["event_id"],
-                    sealed_bytes,
-                    protected.get("deliver_at") or utcnow(),
-                    protected.get("expires_at"),
-                ),
-            )
-        except sqlite3.IntegrityError as exc:
-            code, message = _classify_integrity(exc)
-            raise EventStoreError(code, message) from None
-
-    return envelope

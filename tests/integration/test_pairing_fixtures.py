@@ -43,7 +43,7 @@ def inviter(tmp_path):
             x_priv.public_key().public_bytes_raw()
         ),
         capabilities=["chat", "receipts"],
-        issued_at=datetime.now(UTC),
+        issued_at=datetime.now(UTC) - timedelta(hours=1),
         expires_at=datetime.now(UTC) + timedelta(days=30),
     )
     return {"conn": conn, "ed_priv": ed_priv, "card": card}

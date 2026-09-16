@@ -1,13 +1,17 @@
 """Versioned, idempotent SQLite migrations.
 
 The schema version is tracked in PRAGMA user_version. migrate() applies
-every pending migration in order inside its own transaction and is safe to
-run repeatedly: a second run is a no-op.
+every pending migration in order, each inside its own BEGIN IMMEDIATE
+transaction (DDL plus the version bump commit atomically), and is safe to
+run repeatedly and concurrently: a second run is a no-op, and a concurrent
+first run blocks on the write lock, then sees the bumped version and skips.
 """
 
 from __future__ import annotations
 
 import sqlite3
+
+from muse_agent_social.store.db import transaction
 
 SCHEMA_VERSION = 4
 
@@ -18,7 +22,7 @@ SCHEMA_VERSION = 4
 # directly (migrate_projections(), rotation._ensure_tables(), the github
 # transport's table setup) with identical results.
 from muse_agent_social.crypto.rotation import _ROTATION_TABLES
-from muse_agent_social.model.approvals import APPROVALS_DDL
+from muse_agent_social.model.approvals import APPROVALS_DDL, ensure_approvals_columns
 from muse_agent_social.store.projections import _V2_DDL as _PROJECTIONS_V2_DDL
 from muse_agent_social.store.projections import _V3_DDL as _PROJECTIONS_V3_DDL
 
@@ -26,8 +30,28 @@ from muse_agent_social.store.projections import _V3_DDL as _PROJECTIONS_V3_DDL
 # identity rotation, so delayed pre-rotation events and redelivered
 # rotation announcements from the old identity are still attributable
 # instead of being rejected as unknown_sender.
-_V4_DDL = """
-ALTER TABLE relationships ADD COLUMN prior_peer_identity_id TEXT;
+_V4_COLUMN = "prior_peer_identity_id"
+
+
+def _ensure_v4_column(conn: sqlite3.Connection) -> None:
+    """Idempotently add the migration-4 column to ``relationships``.
+
+    A bare ALTER TABLE ... ADD COLUMN is not re-runnable: a crash between
+    the ALTER and the version bump used to leave the column present with the
+    version still at 3, and the retry died with "duplicate column name".
+    Checking PRAGMA table_info first makes the migration genuinely
+    idempotent, so both crash-recovery and concurrent first-run migrate()
+    calls converge instead of wedging.
+    """
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(relationships);")]
+    if _V4_COLUMN not in cols:
+        conn.execute(
+            f"ALTER TABLE relationships ADD COLUMN {_V4_COLUMN} TEXT;"
+        )
+
+
+_V4_DDL = f"""
+ALTER TABLE relationships ADD COLUMN {_V4_COLUMN} TEXT;
 """
 from muse_agent_social.transports.tables import TRANSPORT_DDL
 
@@ -174,8 +198,50 @@ MIGRATIONS: list[tuple[int, str, str]] = [
 ]
 
 
+def _split_ddl(ddl: str) -> list[str]:
+    """Split multi-statement DDL into single complete statements.
+
+    ``executescript`` implicitly commits, so it must never run inside our
+    explicit per-migration transaction. ``sqlite3.complete_statement``
+    parses real SQLite syntax, so trigger bodies (which contain
+    semicolons) survive the split intact. Comment-only lines are
+    stripped from each statement (a statement that merely *starts* with
+    a comment is still a statement).
+    """
+    statements: list[str] = []
+    buf: list[str] = []
+    for line in ddl.splitlines(keepends=True):
+        buf.append(line)
+        if sqlite3.complete_statement("".join(buf)):
+            code = "\n".join(
+                ln for ln in "".join(buf).splitlines()
+                if not ln.strip().startswith("--")
+            )
+            stmt = code.strip().rstrip(";").strip()
+            if stmt:
+                statements.append(stmt)
+            buf = []
+    tail = "".join(buf).strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+def _exec_ddl_in_txn(conn: sqlite3.Connection, ddl: str) -> None:
+    """Run migration DDL inside the caller's explicit transaction."""
+    for stmt in _split_ddl(ddl):
+        conn.execute(stmt)
+
+
 def migrate(conn: sqlite3.Connection) -> int:
-    """Apply pending migrations in order. Idempotent; returns the version."""
+    """Apply pending migrations in order. Idempotent; returns the version.
+
+    Each migration runs inside its own BEGIN IMMEDIATE transaction covering
+    both the DDL and the user_version bump, so a crash can never leave a
+    half-applied migration behind. Concurrent migrate() calls serialize on
+    the write lock; the loser re-reads the version inside its transaction
+    and skips what the winner already applied.
+    """
     current = conn.execute("PRAGMA user_version;").fetchone()[0]
     if current > SCHEMA_VERSION:
         raise RuntimeError(
@@ -185,7 +251,21 @@ def migrate(conn: sqlite3.Connection) -> int:
     for version, name, ddl in MIGRATIONS:
         if version <= current:
             continue
-        with conn:
-            conn.executescript(ddl)
+        with transaction(conn):
+            # Re-check inside the write transaction: a concurrent migrate()
+            # may have applied this version while we waited for the lock.
+            now = conn.execute("PRAGMA user_version;").fetchone()[0]
+            if version <= now:
+                continue
+            if version == 4:
+                _ensure_v4_column(conn)
+            else:
+                # Never executescript() here: it implicitly commits and
+                # would break the per-migration atomic transaction.
+                _exec_ddl_in_txn(conn, ddl)
             conn.execute(f"PRAGMA user_version = {version};")
+    # Lifecycle columns for human_approvals (single-use + expiry) may be
+    # missing on databases created before that hardening; backfill them.
+    with transaction(conn):
+        ensure_approvals_columns(conn)
     return conn.execute("PRAGMA user_version;").fetchone()[0]

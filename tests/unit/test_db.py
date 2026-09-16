@@ -259,3 +259,37 @@ def test_utcnow_format():
     import re
 
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", db.utcnow())
+
+
+def test_connect_refuses_non_wal_mode(tmp_path, monkeypatch):
+    """If WAL cannot be engaged, connect() fails loudly with DbError
+    instead of silently running on the rollback journal."""
+    from muse_agent_social.store import db as dbmod
+
+    real_connect = sqlite3.connect
+
+    class _ConnProxy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            if isinstance(sql, str) and sql.strip().lower().startswith(
+                "pragma journal_mode"
+            ):
+                # Simulate a filesystem where WAL cannot be engaged.
+                return self._conn.execute("PRAGMA journal_mode=DELETE;")
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def close(self):
+            return self._conn.close()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def _fake_connect(*args, **kwargs):
+        return _ConnProxy(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", _fake_connect)
+    with pytest.raises(dbmod.DbError) as excinfo:
+        dbmod.connect(tmp_path / "no-wal.db")
+    assert "WAL" in str(excinfo.value)

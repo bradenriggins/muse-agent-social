@@ -92,3 +92,27 @@ def test_load_config_validates_relay(tmp_path):
 def test_default_poll_and_push_ceiling():
     assert config.DEFAULT_POLL_INTERVAL_SECONDS == 30
     assert config.DEFAULT_PUSH_CEILING_PER_MINUTE == 6
+
+
+def test_load_config_rejects_inline_secrets(tmp_path):
+    """load_config must enforce the no-inline-secrets invariant too."""
+    path = tmp_path / "config.yaml"
+    path.write_text("master_seed: deadbeef\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="secret"):
+        config.load_config(path)
+    path.write_text("relay:\n  api_token: abc\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="secret"):
+        config.load_config(path)
+
+
+def test_save_config_mode_0600_and_allows_updates(tmp_path):
+    import stat
+
+    path = tmp_path / "config.yaml"
+    obj = config.default_config()
+    config.save_config(path, obj)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    # Updates to an existing config must work (atomic replace).
+    obj["relay"]["poll_interval_seconds"] = 60
+    config.save_config(path, obj)
+    assert config.load_config(path)["relay"]["poll_interval_seconds"] == 60

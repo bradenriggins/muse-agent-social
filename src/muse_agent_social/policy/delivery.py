@@ -16,8 +16,9 @@ Ownership rules:
 
 * Only the receiver may change these settings, through the local setters
   in this module. There is deliberately no remote path: no event type can
-  mutate delivery policy, and apply_remote_policy_request() always rejects
-  with a stable code so the receive pipeline has a seam to call.
+  mutate delivery policy, and there is no seam that accepts a remote
+  mutation (the former apply_remote_policy_request() was dead code and
+  was removed in v0.2 hardening).
 * Every setter bumps the policy version. Every decision helper returns the
   policy version it used, so callers can store it with the decision (for
   example in surface_queue.policy_snapshot, per the plan's requirement
@@ -51,13 +52,11 @@ __all__ = [
     "ExpiryDecision",
     "PolicyError",
     "UnknownRelationshipError",
-    "RemotePolicyChangeRejected",
     "get_policy",
     "set_policy",
     "set_seen_receipts_enabled",
     "set_accepted_receipts_enabled",
     "set_expiry_policy",
-    "apply_remote_policy_request",
     "should_send_seen_receipt",
     "accepted_receipt_permitted",
     "surface_action",
@@ -96,19 +95,6 @@ class UnknownRelationshipError(PolicyError):
 
     def __init__(self, relationship_id: str) -> None:
         super().__init__("unknown_relationship", relationship_id)
-
-
-class RemotePolicyChangeRejected(PolicyError):
-    """A peer attempted to mutate delivery policy. Always rejected."""
-
-    def __init__(self, relationship_id: str, event_id: str) -> None:
-        super().__init__(
-            "remote_policy_mutation_rejected",
-            f"relationship {relationship_id} event {event_id}: "
-            "delivery policy is receiver-owned and no event type may mutate it",
-        )
-        self.relationship_id = relationship_id
-        self.event_id = event_id
 
 
 @dataclass(frozen=True)
@@ -292,24 +278,6 @@ def set_expiry_policy(
     data["expiry_handling"] = handling
     data["expiry_shorten_after_seconds"] = shorten_after_seconds
     return _store_delivery_dict(conn, relationship_id, data)
-
-
-def apply_remote_policy_request(
-    conn: sqlite3.Connection,
-    relationship_id: str,
-    event_id: str,
-    requested_mode: str,
-) -> NoReturn:
-    """Reject a peer's attempt to change delivery policy.
-
-    No event type can mutate delivery policy; the setting is receiver-owned.
-    The receive pipeline calls this seam when an event claims otherwise, so
-    the attempt is logged with a stable code and the policy is untouched.
-
-    Raises:
-        RemotePolicyChangeRejected: always.
-    """
-    raise RemotePolicyChangeRejected(relationship_id, event_id)
 
 
 def should_send_seen_receipt(

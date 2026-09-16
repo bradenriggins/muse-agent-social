@@ -64,6 +64,11 @@ CLOCK_WARN_SECONDS = 60
 # Default late window for scheduled delivery: a scheduled event with no
 # explicit expires_at expires 24h after deliver_at.
 LATE_WINDOW_SECONDS = 24 * 3600
+# Reaction flood bound: a single sender may hold at most this many active
+# distinct emoji reactions on one target event. Distinct emoji are
+# unbounded in principle, so without a cap a peer can bloat the reactions
+# table one 32-byte row at a time.
+MAX_ACTIVE_REACTIONS_PER_SENDER_TARGET = 8
 
 _CANONICAL_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _CANONICAL_UTC_FMT = "%Y-%m-%dT%H:%M:%SZ"

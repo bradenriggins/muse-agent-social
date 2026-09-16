@@ -650,21 +650,51 @@ def adapt_v01(
 
 _VAULT_PREFIX = "legacy-key-"
 
+_VAULT_AAD_DOMAIN = b"muse-agent-social/v1/migration-vault:"
+
+
+def _vault_aad(pair_id: str) -> bytes:
+    """Bind vault ciphertext to the pair id (AEAD associated data)."""
+    return _VAULT_AAD_DOMAIN + pair_id.encode("utf-8")
+
+
+def _check_vault_enc_key(enc_key: bytes) -> bytes:
+    key = bytes(enc_key)
+    if len(key) != 32:
+        raise ValueError(
+            f"vault encryption key must be 32 bytes, got {len(key)}"
+        )
+    return key
+
 
 def _vault_path(vault_dir: str | Path, pair_id: str) -> Path:
     digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()[:16]
     return Path(vault_dir) / f"{_VAULT_PREFIX}{digest}.json"
 
 
-def vault_store(vault_dir: str | Path, pair_id: str, key_hex: str) -> Path:
+def vault_store(
+    vault_dir: str | Path,
+    pair_id: str,
+    key_hex: str,
+    *,
+    enc_key: bytes | None = None,
+) -> Path:
     """Store the legacy pair key in the migration vault (mode 0600).
 
     The key arrives only via this path, never from peers.yaml. The vault
     directory is created with mode 0700. Returns the vault file path.
+
+    When *enc_key* (32 bytes) is given, the payload is sealed with
+    AES-256-GCM under that key (AAD binds the pair id) and the file holds
+    only ciphertext: no base64 key material is visible at rest. Without
+    *enc_key* the legacy plaintext JSON format is written (kept for
+    operator-handoff compatibility).
     """
     raw = bytes.fromhex(key_hex)
     if len(raw) != 32:
         raise ValueError("legacy pair key must be 32 bytes")
+    if enc_key is not None:
+        enc_key = _check_vault_enc_key(enc_key)
     vault_dir = Path(vault_dir)
     vault_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(vault_dir, 0o700)
@@ -675,18 +705,40 @@ def vault_store(vault_dir: str | Path, pair_id: str, key_hex: str) -> Path:
         "key_b64": base64.b64encode(raw).decode("ascii"),
         "stored_at": _utcnow_text(),
     }
-    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    if enc_key is None:
+        body = json.dumps(payload)
+    else:
+        nonce = os.urandom(12)
+        ct = AESGCM(enc_key).encrypt(
+            nonce, json.dumps(payload).encode("utf-8"), _vault_aad(pair_id)
+        )
+        body = json.dumps(
+            {
+                "v": 2,
+                "alg": "AES-256-GCM",
+                "nonce": base64.b64encode(nonce).decode("ascii"),
+                "ct": base64.b64encode(ct).decode("ascii"),
+            }
+        )
+    tmp.write_text(body, encoding="utf-8")
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
     os.chmod(path, 0o600)
     return path
 
 
-def vault_load(vault_dir: str | Path, pair_id: str) -> bytes:
+def vault_load(
+    vault_dir: str | Path,
+    pair_id: str,
+    *,
+    enc_key: bytes | None = None,
+) -> bytes:
     """Load the legacy pair key from the migration vault.
 
-    Fails closed if the file is missing or not mode 0600. The key is
-    returned only to the caller (migration/adapter), never logged.
+    Fails closed if the file is missing or not mode 0600. An entry sealed
+    with *enc_key* refuses to load without it (VaultError); a legacy
+    plaintext entry loads with or without *enc_key*. The key is returned
+    only to the caller (migration/adapter), never logged.
     """
     path = _vault_path(vault_dir, pair_id)
     if not path.is_file():
@@ -695,6 +747,24 @@ def vault_load(vault_dir: str | Path, pair_id: str) -> bytes:
     if mode != 0o600:
         raise VaultError(f"vault file has wrong mode {oct(mode)}: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if "ct" in payload:
+        if enc_key is None:
+            raise VaultError(
+                "vault entry is encrypted at rest; enc_key is required"
+            )
+        enc_key = _check_vault_enc_key(enc_key)
+        try:
+            nonce = base64.b64decode(payload["nonce"])
+            ct = base64.b64decode(payload["ct"])
+        except (binascii.Error, ValueError, KeyError) as exc:
+            raise VaultError(f"vault entry is corrupt: {exc}") from exc
+        try:
+            inner = AESGCM(enc_key).decrypt(nonce, ct, _vault_aad(pair_id))
+        except InvalidTag as exc:
+            raise VaultError(
+                "vault decryption failed: wrong key or tampered entry"
+            ) from exc
+        payload = json.loads(inner.decode("utf-8"))
     return base64.b64decode(payload["key_b64"])
 
 

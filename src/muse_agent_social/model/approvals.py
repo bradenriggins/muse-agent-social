@@ -20,8 +20,11 @@ from typing import Any, Mapping
 
 __all__ = [
     "APPROVALS_DDL",
+    "APPROVAL_TTL_SECONDS",
     "ApprovalError",
+    "consume_approval",
     "create_approval",
+    "ensure_approvals_columns",
     "get_approval",
 ]
 
@@ -35,11 +38,51 @@ CREATE TABLE IF NOT EXISTS human_approvals (
     answer          TEXT NOT NULL,
     approved        INTEGER NOT NULL CHECK(approved IN (0, 1)),
     created_at      TEXT NOT NULL,
+    -- Approvals are single-use and time-boxed: a record authorizes exactly
+    -- one send and dies APPROVAL_TTL_SECONDS after creation. Without this,
+    -- a leaked or observed approval_record_id could be replayed forever.
+    expires_at      TEXT NOT NULL,
+    consumed_at     TEXT,
     note            TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_human_approvals_subject
     ON human_approvals(relationship_id, subject_type, subject_id);
 """
+
+#: How long a human-approval record stays usable (24 hours).
+APPROVAL_TTL_SECONDS = 24 * 3600
+
+
+def ensure_approvals_columns(conn: sqlite3.Connection) -> None:
+    """Idempotently add the lifecycle columns to existing databases.
+
+    Fresh databases get them from APPROVALS_DDL; databases created before
+    the single-use/expiry hardening need the ALTERs. Column-existence is
+    checked first so this is safe to run on every migrate.
+    """
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(human_approvals);")]
+    if "expires_at" not in cols:
+        conn.execute("ALTER TABLE human_approvals ADD COLUMN expires_at TEXT;")
+        # Backfill: pre-hardening rows get the full TTL from creation.
+        conn.execute(
+            "UPDATE human_approvals SET expires_at ="
+            " datetime(created_at, '+24 hours') WHERE expires_at IS NULL;"
+        )
+    if "consumed_at" not in cols:
+        conn.execute("ALTER TABLE human_approvals ADD COLUMN consumed_at TEXT;")
+
+
+def _expiry_for(created_at: str, expires_at: str | None) -> str:
+    if expires_at is not None:
+        return expires_at
+    from datetime import datetime, timedelta, timezone
+
+    created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    return (
+        (created + timedelta(seconds=APPROVAL_TTL_SECONDS))
+        .astimezone(timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
 
 
 class ApprovalError(Exception):
@@ -60,15 +103,22 @@ def create_approval(
     approved: bool,
     created_at: str,
     note: str | None = None,
+    expires_at: str | None = None,
 ) -> str:
-    """Record the human's explicit response. Returns the approval ID."""
+    """Record the human's explicit response. Returns the approval ID.
+
+    The record expires APPROVAL_TTL_SECONDS after ``created_at`` unless an
+    explicit ``expires_at`` is given, and is single-use (see
+    :func:`consume_approval`).
+    """
     if subject_type not in ("human_request", "poll"):
         raise ApprovalError("bad_subject_type", f"unknown {subject_type}")
     approval_id = uuid.uuid4().hex
     conn.execute(
         "INSERT INTO human_approvals(approval_id, relationship_id,"
-        " subject_type, subject_id, answer, approved, created_at, note)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        " subject_type, subject_id, answer, approved, created_at,"
+        " expires_at, consumed_at, note)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
         (
             approval_id,
             relationship_id,
@@ -77,10 +127,27 @@ def create_approval(
             answer,
             1 if approved else 0,
             created_at,
+            _expiry_for(created_at, expires_at),
             note,
         ),
     )
     return approval_id
+
+
+def consume_approval(
+    conn: sqlite3.Connection, approval_id: str, now: str
+) -> bool:
+    """Atomically mark an approval consumed iff it is live. Returns True on success.
+
+    The UPDATE only fires when the row is unconsumed and unexpired, so two
+    racing sends cannot both claim the same approval: exactly one wins.
+    """
+    cur = conn.execute(
+        "UPDATE human_approvals SET consumed_at = ?"
+        " WHERE approval_id = ? AND consumed_at IS NULL AND expires_at > ?;",
+        (now, approval_id, now),
+    )
+    return cur.rowcount == 1
 
 
 def get_approval(

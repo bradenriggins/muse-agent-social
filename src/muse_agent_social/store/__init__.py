@@ -2,6 +2,7 @@
 
 from .db import (
     DEFAULT_DB_FILENAME,
+    DbError,
     connect,
     default_db_path,
     get_user_version,
@@ -14,6 +15,7 @@ from .migrations import SCHEMA_VERSION, migrate
 
 __all__ = [
     "DEFAULT_DB_FILENAME",
+    "DbError",
     "SCHEMA_VERSION",
     "connect",
     "default_db_path",

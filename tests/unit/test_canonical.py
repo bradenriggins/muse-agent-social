@@ -245,3 +245,21 @@ def test_errors_never_leak_values():
         assert secret not in exc.field_path
     else:
         pytest.fail("expected CanonicalizationError")
+
+
+def test_strict_parse_deeply_nested_becomes_too_deeply_nested():
+    from muse_agent_social.canonical import strict_parse
+
+    depth = 10000
+    raw = b"[" * depth + b"]" * depth
+    with pytest.raises(CanonicalizationError) as excinfo:
+        strict_parse(raw)
+    assert excinfo.value.code == "too_deeply_nested"
+
+
+def test_strict_parse_moderate_nesting_ok():
+    from muse_agent_social.canonical import strict_parse
+
+    depth = 100
+    raw = b"[" * depth + b"]" * depth
+    assert strict_parse(raw) is not None

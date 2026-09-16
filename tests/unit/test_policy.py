@@ -16,7 +16,6 @@ from muse_agent_social.policy.delivery import (
     DeliveryPolicy,
     ExpiryDecision,
     PolicyError,
-    RemotePolicyChangeRejected,
     UnknownRelationshipError,
 )
 from muse_agent_social.policy.retention import RetentionError
@@ -177,15 +176,43 @@ class TestSurfaceBehavior:
 # receiver ownership
 
 
+_SETTERS = (
+    "set_policy",
+    "set_seen_receipts_enabled",
+    "set_accepted_receipts_enabled",
+    "set_expiry_policy",
+)
+
+
 class TestReceiverOwnership:
+    def test_no_remote_mutation_seam_exists(self):
+        # The old apply_remote_policy_request() was dead code: no event
+        # type ever invoked it. It was removed; delivery policy has no
+        # remote entry point at all. This test fails if anyone re-adds
+        # a remote mutation seam.
+        assert not hasattr(delivery, "apply_remote_policy_request")
+
+    def test_no_event_path_writes_delivery_policy(self, tmp_path):
+        # Delivery policy is receiver-owned: only the local CLI policy
+        # command may call the setters. No projection handler, receive
+        # path, or watcher module may reference them.
+        import pathlib
+
+        src = pathlib.Path(delivery.__file__).parent.parent
+        forbidden = {
+            "store/projections.py": _SETTERS,
+            "watcher.py": _SETTERS,
+        }
+        for rel, names in forbidden.items():
+            text = (src / rel).read_text(encoding="utf-8")
+            for name in names:
+                assert f"{name}(" not in text, f"{rel} must not call {name}"
+
     def test_remote_change_always_rejected(self, conn, make_relationship):
+        # With no remote seam, the only mutation path is the local setter;
+        # projecting events must never change the receiver's policy.
         rid = make_relationship()
         delivery.set_policy(conn, rid, "alert")
-        with pytest.raises(RemotePolicyChangeRejected) as excinfo:
-            delivery.apply_remote_policy_request(conn, rid, "evt-1", "silent")
-        assert excinfo.value.code == "remote_policy_mutation_rejected"
-        assert excinfo.value.relationship_id == rid
-        assert excinfo.value.event_id == "evt-1"
         policy = delivery.get_policy(conn, rid)
         assert policy.mode == "alert"
         assert policy.version == 1
@@ -194,10 +221,6 @@ class TestReceiverOwnership:
         self, conn, make_relationship
     ):
         rid = make_relationship()
-        with pytest.raises(RemotePolicyChangeRejected):
-            delivery.apply_remote_policy_request(
-                conn, rid, "evt-1", "feed_eligible"
-            )
         assert delivery.get_policy(conn, rid).mode == "silent"
 
 
@@ -706,3 +729,67 @@ class TestRetentionScan:
         for item in retention.retention_scan(tmp_path):
             os.unlink(item["path"])
         assert retention.retention_scan(tmp_path) == []
+
+
+class TestReceivePurgesPlaintextCache:
+    """The expired plaintext cache must be purged on every receive run."""
+
+    def test_cmd_receive_purges_expired_cache(self, tmp_path, monkeypatch):
+        import json
+        from types import SimpleNamespace
+
+        import muse_agent_social.cli as cli_mod
+        from muse_agent_social.policy import retention
+
+        sd = tmp_path / "state"
+        cli_mod.cmd_init(
+            SimpleNamespace(
+                state_dir=str(sd),
+                display_name=None,
+                principal=None,
+                capability=None,
+            )
+        )
+        ctx = cli_mod.Ctx(sd)
+        rid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        ctx.conn.execute(
+            "INSERT INTO relationships(relationship_id, peer_identity_id, "
+            "peer_display_name, consent_state, policy, created_at) "
+            "VALUES (?, 'did:key:zPeer', 'peer', 'active', '{}', "
+            "'2026-09-16T00:00:00Z')",
+            (rid,),
+        )
+        ctx.conn.commit()
+        retention.set_plaintext_cache(ctx.conn, rid, "1d")
+        cache_file = retention.write_plaintext_cache(
+            ctx.conn, rid, "evt-1", b'{"body": "x"}'
+        )
+        assert cache_file.is_file()
+        # Backdate the opt-in so it is expired at receive time.
+        doc = json.loads(
+            ctx.conn.execute(
+                "SELECT policy FROM relationships WHERE relationship_id = ?",
+                (rid,),
+            ).fetchone()[0]
+        )
+        doc["retention"]["plaintext_cache"]["expires_at"] = "2020-01-01T00:00:00Z"
+        ctx.conn.execute(
+            "UPDATE relationships SET policy = ? WHERE relationship_id = ?",
+            (json.dumps(doc), rid),
+        )
+        ctx.conn.commit()
+
+        def _no_receive(ctx, rid, budget, clock_skew_seconds=None):
+            return 0, {"accepted": 0}
+
+        monkeypatch.setattr(cli_mod, "_receive_relationship", _no_receive)
+        args = SimpleNamespace(
+            state_dir=str(sd),
+            relationship=rid,
+            timeout=1,
+            json=True,
+            clock_skew_seconds=None,
+        )
+        assert cli_mod.cmd_receive(args) == 0
+        assert not cache_file.exists()
+        assert not (sd / "plaintext_cache" / rid).exists()

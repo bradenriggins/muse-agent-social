@@ -83,6 +83,7 @@ def load_config(path: str | os.PathLike[str]) -> dict[str, Any]:
         raise ValueError(f"cannot parse config file {path}: {exc}") from exc
     if not isinstance(obj, dict):
         raise ValueError(f"config file {path} must contain a mapping at top level")
+    _assert_no_secrets(obj)
     _validate_config(obj)
     return obj
 
@@ -99,7 +100,11 @@ def save_config(path: str | os.PathLike[str], obj: dict[str, Any]) -> None:
     text = _dump_yaml(obj)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    # Write atomically with owner-only permissions: config lives next to
+    # key material and must never be left world-readable or half-written.
+    from ._keyfiles import atomic_write_file
+
+    atomic_write_file(path, text.encode("utf-8"), 0o600)
 
 
 def _validate_config(obj: dict[str, Any]) -> None:

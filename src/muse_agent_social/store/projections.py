@@ -45,6 +45,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from muse_agent_social.canonical import restricted_jcs, strict_parse
+from muse_agent_social.policy.limits import (
+    FUTURE_TOLERANCE_SECONDS,
+    MAX_ACTIVE_REACTIONS_PER_SENDER_TARGET,
+    add_seconds,
+)
 from muse_agent_social.store.db import get_user_version, transaction, utcnow
 from muse_agent_social.validation import PAYLOAD_DISPATCH, validate_payload
 
@@ -221,6 +226,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
     canceled_at        TEXT,
     cancel_event_id    TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_deliveries_inner
+    ON deliveries(inner_event_id);
 
 -- Projected stream of key-rotation events. The rotation track owns the
 -- key_epochs table; this table is the queryable event stream only.
@@ -372,6 +379,19 @@ def migrate_projections(conn: sqlite3.Connection) -> int:
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(human_requests);")]
         if "attestation" not in cols:
             _exec_ddl(conn, _V3_DDL)
+        # Keep the shared version counter honest: version 4 means the v4
+        # column exists too. migrate_projections() used to stamp version 4
+        # after only the v2/v3 DDL, which left a version-4 database missing
+        # prior_peer_identity_id and made migrate() skip it forever.
+        # (Lazy import: migrations.py imports this module at load time.)
+        from muse_agent_social.store.migrations import _ensure_v4_column
+
+        _ensure_v4_column(conn)
+        # Same story for the approval lifecycle columns: this track also
+        # stamps version 4, so it must also guarantee the columns exist.
+        from muse_agent_social.model.approvals import ensure_approvals_columns
+
+        ensure_approvals_columns(conn)
         if current < PROJECTIONS_SCHEMA_VERSION:
             conn.execute(
                 f"PRAGMA user_version = {PROJECTIONS_SCHEMA_VERSION};"
@@ -877,6 +897,24 @@ def _handle_reaction_added(
     ).fetchone()
     if row is not None and row["active"] and row["added_event_id"] == ev["event_id"]:
         return [_mutation("noop", "reactions", target_id, {"reason": "already_projected"})]
+    # Flood bound: one sender may hold at most
+    # MAX_ACTIVE_REACTIONS_PER_SENDER_TARGET active distinct emoji on one
+    # target. Re-adding an existing reaction is idempotent and exempt;
+    # a brand-new emoji past the cap is quarantined as sender misbehavior.
+    is_new = row is None or not row["active"]
+    if is_new:
+        active_count = conn.execute(
+            "SELECT COUNT(*) FROM reactions"
+            " WHERE target_event_id = ? AND sender = ? AND active = 1;",
+            (target_id, ev["sender"]),
+        ).fetchone()[0]
+        if active_count >= MAX_ACTIVE_REACTIONS_PER_SENDER_TARGET:
+            raise ProjectionError(
+                "reaction_cap_exceeded",
+                f"sender already holds {active_count} active reactions on"
+                f" {target_id}; cap is"
+                f" {MAX_ACTIVE_REACTIONS_PER_SENDER_TARGET}",
+            )
     conn.execute(
         "INSERT INTO reactions(target_event_id, sender, emoji, active,"
         " added_event_id, added_at, removed_event_id, removed_at)"
@@ -967,6 +1005,13 @@ def _handle_poll_created(
         return mutations + [
             _mutation("noop", "polls", ev["event_id"], {"reason": "already_projected"})
         ]
+    # A poll that closes before (or when) it is created can never accept a
+    # response; reject it instead of storing a dead poll.
+    if payload["closes_at"] <= ev["created_at"]:
+        raise ProjectionError(
+            "poll_bad_closes_at",
+            "poll closes_at is not after the poll's created_at",
+        )
     conn.execute(
         "INSERT INTO polls(poll_id, relationship_id, conversation_id, thread_id,"
         " sender, created_at, question, choices, closes_at, multi_select,"
@@ -994,16 +1039,40 @@ def _handle_poll_responded(
 ) -> list[dict[str, Any]]:
     payload = ev["payload"]
     poll_id = payload["poll_id"]
-    if (
-        conn.execute(
-            "SELECT 1 FROM polls WHERE poll_id = ?;", (poll_id,)
-        ).fetchone()
-        is None
-    ):
+    poll_row = conn.execute(
+        "SELECT choices, closes_at, multi_select FROM polls WHERE poll_id = ?;",
+        (poll_id,),
+    ).fetchone()
+    if poll_row is None:
         _target_status(
             conn, ev, poll_id, "poll.created", "poll_response_target_not_poll"
         )
         return [_add_pending(conn, ev, poll_id, "poll_response")]
+    declared = json.loads(poll_row["choices"])
+    choice_ids = payload["choice_ids"]
+    # Semantic validation the schema cannot express: choices must be real,
+    # unique, and honor single-select; late responses are rejected.
+    if not choice_ids:
+        raise ProjectionError("poll_no_choice", "poll response selects no choice")
+    if len(set(choice_ids)) != len(choice_ids):
+        raise ProjectionError(
+            "poll_duplicate_choice", "poll response repeats a choice"
+        )
+    unknown = [c for c in choice_ids if c not in declared]
+    if unknown:
+        raise ProjectionError(
+            "poll_unknown_choice",
+            f"poll response selects undeclared choices: {unknown}",
+        )
+    if not poll_row["multi_select"] and len(choice_ids) != 1:
+        raise ProjectionError(
+            "poll_multi_choice_single_select",
+            "single-select poll response must choose exactly one choice",
+        )
+    if ev["created_at"] > poll_row["closes_at"]:
+        raise ProjectionError(
+            "poll_closed", "poll response arrived after closes_at"
+        )
     conn.execute(
         "INSERT INTO poll_responses(poll_id, sender, choice_ids, human_confirmed,"
         " approval_record_id, response_event_id, responded_at)"
@@ -1076,17 +1145,30 @@ def _handle_task_updated(
     payload = ev["payload"]
     task_id = payload["task_id"]
     row = conn.execute(
-        "SELECT status FROM tasks WHERE task_id = ?;", (task_id,)
+        "SELECT status, owner_identity, sender FROM tasks WHERE task_id = ?;",
+        (task_id,),
     ).fetchone()
     if row is None:
         _target_status(
             conn, ev, task_id, "task.created", "task_update_target_not_task"
         )
         return [_add_pending(conn, ev, task_id, "task_update")]
+    # Authorization: only the task's owner or its creator may change its
+    # status. Without this, either side could mark the other's tasks done.
+    if ev["sender"] not in (row["owner_identity"], row["sender"]):
+        raise ProjectionError(
+            "task_not_authorized",
+            "task.updated sender is neither the task owner nor its creator",
+        )
     if row["status"] in _TASK_TERMINAL:
         raise ProjectionError(
             "task_transition_terminal",
             f"task is {row['status']}; terminal states accept no updates",
+        )
+    if payload["status"] not in ("open", "in_progress", "blocked", "done", "canceled"):
+        raise ProjectionError(
+            "task_bad_status",
+            f"unknown task status {payload['status']!r}",
         )
     conn.execute(
         "UPDATE tasks SET status = ?, status_event_id = ?,"
@@ -1227,6 +1309,14 @@ def _handle_delivery_scheduled(
             payload.get("late_by_seconds"),
         ),
     )
+    # Out-of-order arrival: the inner event may already be stored. The
+    # inner event's created_at is author time, which legitimately
+    # precedes deliver_at in the author-now/deliver-later flow, so no
+    # timing check is applied here. (A previous capsule_released_early
+    # check compared created_at to deliver_at; it was removed as a
+    # false positive: created_at is sender-controlled author time, not
+    # proof of release time, and the scheduler holds the announcement,
+    # not the inner event's content.)
     return [_mutation("insert", "deliveries", ev["event_id"], {"state": "scheduled"})]
 
 
@@ -1525,8 +1615,15 @@ def rebuild_projections(conn: sqlite3.Connection, relationship_id: str) -> None:
     relationship is deleted, then each staged event is projected in
     deterministic order ``(created_at, sender, sender_seq)``. Sequence forks
     and semantically rejected events are quarantined with stable codes
-    instead of aborting the rebuild. ``quarantine`` and ``event_payloads``
-    are input evidence, not derived state, and are never wiped.
+    instead of aborting the rebuild. ``event_payloads`` are input evidence,
+    not derived state, and are never wiped.
+
+    ``quarantine`` rows for events present in the log are re-derived: the
+    rebuild deletes them first and re-quarantines only what still fails in
+    deterministic order, so a quarantine entry recorded under one arrival
+    order cannot survive a rebuild that now projects the same event cleanly.
+    Quarantine rows for events absent from the log (true orphans) are kept
+    as evidence.
 
     Rebuilds run at the same wall-clock second are byte-identical.
     """
@@ -1546,6 +1643,13 @@ def rebuild_projections(conn: sqlite3.Connection, relationship_id: str) -> None:
             )
         for _table, wipe_sql in _WIPES:
             conn.execute(wipe_sql, (relationship_id,))
+        # Re-derive quarantine for logged events: drop rows the rebuild is
+        # about to re-evaluate, so stale arrival-order entries cannot linger.
+        conn.execute(
+            "DELETE FROM quarantine WHERE relationship_id = ? AND event_id IN"
+            " (SELECT event_id FROM events WHERE relationship_id = ?);",
+            (relationship_id, relationship_id),
+        )
         for ev in _iter_relationship_events(conn, relationship_id):
             try:
                 _apply_inner(conn, ev, now)

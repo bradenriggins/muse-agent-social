@@ -13,6 +13,11 @@ import sys
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+)
 
 from muse_agent_social.crypto.identity import (
     agreement_key_multibase_from_pubkey,
@@ -45,11 +50,28 @@ def _hierarchy():
     return derive_identity_hierarchy(TEST_SEED)
 
 
+def _raw_private(key):
+    """Re-extract the raw 32-byte seed from a private key object.
+
+    The IdentityHierarchy deliberately does not retain raw seeds (they are
+    zeroed after derivation); tests that assert the golden derivation
+    vectors re-extract them from the key objects via serialization.
+    """
+    return key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+
+
 def test_golden_derived_keys():
     h = _hierarchy()
-    assert h._ed25519_seed.hex() == GOLDEN_ED25519_SEED
-    assert h._x25519_bootstrap.hex() == GOLDEN_X25519_BOOTSTRAP
+    assert _raw_private(h.ed25519_private).hex() == GOLDEN_ED25519_SEED
+    assert _raw_private(h.x25519_private).hex() == GOLDEN_X25519_BOOTSTRAP
     assert h.local_store_key.hex() == GOLDEN_LOCAL_STORE_KEY
+
+
+def test_hierarchy_does_not_retain_raw_seeds():
+    """Raw derivation outputs must not linger on the hierarchy object."""
+    h = _hierarchy()
+    assert not hasattr(h, "_ed25519_seed")
+    assert not hasattr(h, "_x25519_bootstrap")
 
 
 def test_golden_public_keys():
@@ -75,13 +97,15 @@ def test_golden_vectors_match_across_two_processes():
     """Checkpoint 4 gate: golden vectors are deterministic across processes."""
     code = (
         "from muse_agent_social.crypto.identity import derive_identity_hierarchy;"
+        "from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption;"
         "h = derive_identity_hierarchy(bytes(range(32)));"
+        "raw = lambda k: k.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()).hex();"
         "print(h.identity_id);"
         "print(h.agreement_key_multibase);"
         "print(h.ed25519_public_bytes.hex());"
         "print(h.x25519_public_bytes.hex());"
-        "print(h._ed25519_seed.hex());"
-        "print(h._x25519_bootstrap.hex());"
+        "print(raw(h.ed25519_private));"
+        "print(raw(h.x25519_private));"
         "print(h.local_store_key.hex())"
     )
     env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
@@ -146,7 +170,11 @@ def test_derive_rejects_wrong_seed_length():
 
 def test_each_purpose_gets_a_distinct_key():
     h = _hierarchy()
-    keys = {h._ed25519_seed, h._x25519_bootstrap, h.local_store_key}
+    keys = {
+        h.ed25519_public_bytes,
+        h.x25519_public_bytes,
+        h.local_store_key,
+    }
     assert len(keys) == 3
 
 

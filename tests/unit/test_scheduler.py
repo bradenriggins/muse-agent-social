@@ -363,3 +363,152 @@ class TestRunDue:
         calls = []
         summary = scheduler.run_due(conn, NOW, make_releaser(calls))
         assert summary["released"] == [first, second]
+
+
+# ---------------------------------------------------------------------------
+# schedule() same-ID concurrency
+# ---------------------------------------------------------------------------
+
+
+class TestScheduleConcurrency:
+    def test_concurrent_same_id_same_bytes_is_idempotent(self, db_path):
+        """Two threads racing schedule() with the same id and bytes.
+
+        The dedup check and INSERT share one BEGIN IMMEDIATE transaction,
+        so exactly one row exists and both callers get the id back (no
+        leaked sqlite3.IntegrityError, no duplicate row).
+        """
+        import threading
+
+        from muse_agent_social.store import migrations
+
+        seed = db.connect(db_path)
+        migrations.migrate(seed)
+        seed.close()
+
+        sid = "11111111-1111-4111-8111-111111111111"
+        deliver = "2026-09-15T21:00:00Z"
+        results = []
+        barrier = threading.Barrier(2)
+
+        def worker():
+            c = db.connect(db_path)
+            try:
+                barrier.wait(timeout=10)
+                rid = scheduler.schedule(c, ENVELOPE, deliver, None, scheduled_id=sid)
+                results.append(("ok", rid))
+            except Exception as exc:  # noqa: BLE001
+                results.append(("error", type(exc).__name__, getattr(exc, "code", "")))
+            finally:
+                c.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert len(results) == 2
+        assert all(r[0] == "ok" and r[1] == sid for r in results), results
+        check = db.connect(db_path)
+        try:
+            rows = check.execute(
+                "SELECT COUNT(*) FROM scheduler_queue WHERE scheduled_id = ?;",
+                (sid,),
+            ).fetchone()[0]
+            assert rows == 1
+        finally:
+            check.close()
+
+    def test_concurrent_same_id_conflicting_bytes_rejected(self, db_path):
+        """Same id, different bytes: exactly one caller wins; the loser
+        gets ScheduledIdConflictError, never a raw IntegrityError."""
+        import threading
+
+        from muse_agent_social.store import migrations
+
+        seed = db.connect(db_path)
+        migrations.migrate(seed)
+        seed.close()
+
+        sid = "22222222-2222-4222-8222-222222222222"
+        deliver = "2026-09-15T21:00:00Z"
+        other = b'{"protected": {"event_id": "evt-inner-2"}}'
+        results = []
+        barrier = threading.Barrier(2)
+
+        def worker(payload):
+            c = db.connect(db_path)
+            try:
+                barrier.wait(timeout=10)
+                rid = scheduler.schedule(c, payload, deliver, None, scheduled_id=sid)
+                results.append(("ok", rid))
+            except ScheduledIdConflictError as exc:
+                results.append(("conflict", exc.code))
+            except Exception as exc:  # noqa: BLE001
+                results.append(("error", type(exc).__name__, getattr(exc, "code", "")))
+            finally:
+                c.close()
+
+        threads = [
+            threading.Thread(target=worker, args=(ENVELOPE,)),
+            threading.Thread(target=worker, args=(other,)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        kinds = sorted(r[0] for r in results)
+        assert kinds == ["conflict", "ok"], results
+        check = db.connect(db_path)
+        try:
+            rows = check.execute(
+                "SELECT COUNT(*) FROM scheduler_queue WHERE scheduled_id = ?;",
+                (sid,),
+            ).fetchone()[0]
+            assert rows == 1
+        finally:
+            check.close()
+
+    def test_ensure_dead_letter_schema_concurrent_first_run(self, db_path):
+        """Four threads racing the first-ever _ensure_dead_letter_schema on
+        a fresh DB: the check-then-ALTER must converge instead of losers
+        dying with 'duplicate column name'. (SQLite has no ADD COLUMN IF
+        NOT EXISTS, so the race is absorbed in code.)"""
+        import threading
+
+        from muse_agent_social.store import migrations
+
+        seed = db.connect(db_path)
+        migrations.migrate(seed)
+        seed.close()
+
+        barrier = threading.Barrier(8)
+        errors = []
+
+        def worker():
+            c = db.connect(db_path)
+            try:
+                barrier.wait(timeout=10)
+                scheduler._ensure_dead_letter_schema(c)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                c.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not errors, [str(e) for e in errors]
+        check = db.connect(db_path)
+        try:
+            cols = [
+                r["name"]
+                for r in check.execute("PRAGMA table_info(scheduler_queue);")
+            ]
+            assert "release_failures" in cols
+        finally:
+            check.close()

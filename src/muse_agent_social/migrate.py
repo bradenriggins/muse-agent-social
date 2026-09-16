@@ -28,14 +28,33 @@ import hashlib
 import hmac
 import json
 import os
+import stat
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+from .canonical import restricted_jcs
+from .crypto.identity import (
+    agreement_key_multibase_from_pubkey,
+    b64url_decode,
+    b64url_encode,
+    identity_id_from_pubkey,
+    parse_identity_id,
+)
+from .crypto.words import load_wordlist, verification_phrase
+from .model.cards import card_fingerprint, create_card, verify_card
+from .model.invites import generate_deploy_keypair
 
 from .compatibility.v01 import (
     LegacyPolicy,
@@ -280,6 +299,9 @@ class MigrationContext:
     role: str = "initiator"  # or "peer"
     hooks: MigrationHooks = field(default_factory=MigrationHooks)
     legacy_snapshot: dict = field(default_factory=dict)  # config snapshot
+    identity_priv: Any = None  # optional Ed25519 migration identity key;
+    # when None it is loaded from (or generated into) the keys directory,
+    # so separate CLI invocations share one ceremony identity.
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +342,408 @@ def _record_step(conn: Any, n: int, status: str, detail: Any = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Migration ceremony keys and signed messages
+#
+# Every two-party migration message (card exchange, migration.ready,
+# migration.proof, migration.commit) is Ed25519-signed by the sender's
+# migration identity key and verified on receipt against the identity id
+# pinned in the peer's verified card. Verification is fail-closed: a
+# missing or invalid signature, or a sender identity that does not match
+# the verified card, aborts the ceremony. There are no fallbacks.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_IDENTITY_KEY_NAME = "migration-identity.key"
+_MIGRATION_RELATIONSHIP_KEY_NAME = "relationship.key"
+_MIGRATION_DEPLOY_KEY_NAME = "deploy.key"
+
+
+def _keys_dir(ctx: MigrationContext) -> Path:
+    keys_dir = Path(ctx.state_dir) / "keys"
+    keys_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(keys_dir, 0o700)
+    return keys_dir
+
+
+def _check_key_mode(path: Path) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode != 0o600:
+        raise MigrationError(
+            "key-file-mode",
+            f"key file has wrong mode {oct(mode)}: {path}",
+        )
+
+
+def _migration_identity_priv(
+    ctx: MigrationContext, create: bool = True
+) -> Ed25519PrivateKey:
+    """The side's Ed25519 migration identity key (load or generate, 0600).
+
+    The same key signs the migration card, ready/proof/commit messages,
+    and derives the migration vault encryption key, so it is persisted in
+    the keys directory and shared across the stage/verify/cutover CLI
+    invocations. Fail-closed on a wrong-mode or corrupt key file. With
+    create=False (verify/cutover/rollback/observe paths) a missing key
+    file is a hard error instead of silently minting a new identity.
+    """
+    if ctx.identity_priv is not None:
+        if not isinstance(ctx.identity_priv, Ed25519PrivateKey):
+            raise MigrationError(
+                "identity-key-type",
+                "ctx.identity_priv must be an Ed25519PrivateKey",
+            )
+        return ctx.identity_priv
+    path = _keys_dir(ctx) / f"{ctx.pair_id}.{_MIGRATION_IDENTITY_KEY_NAME}"
+    if path.is_file():
+        _check_key_mode(path)
+        raw = path.read_bytes()
+        if len(raw) != 32:
+            raise MigrationError(
+                "identity-key-corrupt",
+                f"identity key file has wrong length: {path}",
+            )
+        return Ed25519PrivateKey.from_private_bytes(raw)
+    if not create:
+        raise MigrationError(
+            "identity-key-missing",
+            f"no migration identity key at {path}; stage must run first",
+        )
+    priv = Ed25519PrivateKey.generate()
+    raw = priv.private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
+    )
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(raw)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+    return priv
+
+
+def _migration_identity_id(ctx: MigrationContext, create: bool = True) -> str:
+    return identity_id_from_pubkey(
+        _migration_identity_priv(ctx, create=create)
+        .public_key()
+        .public_bytes_raw()
+    )
+
+
+def _assert_identity_matches(conn: Any, ctx: MigrationContext) -> None:
+    """Fail closed if the loaded ceremony identity differs from the one
+    recorded at stage time (protects against a swapped key file between
+    CLI invocations)."""
+    recorded = mstate_get(conn, "migration.my_identity_id")
+    if recorded is None:
+        return
+    if _migration_identity_id(ctx, create=False) != recorded:
+        raise MigrationError(
+            "identity-key-changed",
+            "migration identity key does not match the one recorded at stage",
+        )
+
+
+def _vault_key(ctx: MigrationContext, create: bool = True) -> bytes:
+    """Derive the migration vault encryption key from the ceremony identity.
+
+    HKDF-SHA256 over the identity private key bytes with the migration
+    vault info string (the same derivation style as crypto/identity.py).
+    The vault can only be decrypted by the holder of the ceremony identity
+    key, which is also what makes rollback decryption possible.
+    """
+    priv = _migration_identity_priv(ctx, create=create)
+    raw = priv.private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
+    )
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"muse-agent-social/v1",
+        info=b"muse-agent-social/v1/migration-vault/"
+        + ctx.pair_id.encode("utf-8"),
+    ).derive(raw)
+
+
+def ceremony_vault_key(state_dir: str | Path, pair_id: str) -> bytes:
+    """Derive the migration vault encryption key for a staged ceremony.
+
+    Loads the ceremony identity key persisted by ``stage()`` (never
+    creating one) and derives the vault key from it. Used by the CLI's
+    v0.1 receive path during the drain window, after stage() has sealed
+    the operator's plaintext vault handoff in place.
+
+    Raises MigrationError if no ceremony identity key exists in this
+    state dir (stage has not run here): callers should treat that as
+    "only a plaintext handoff entry could exist".
+    """
+    ctx = MigrationContext(
+        state_dir=state_dir,
+        legacy_state_dir=state_dir,
+        vault_dir=state_dir,
+        pair_id=pair_id,
+        my_agent_id="",
+        peer_agent_id="",
+    )
+    return _vault_key(ctx, create=False)
+
+
+def _relationship_priv(ctx: MigrationContext) -> X25519PrivateKey:
+    """Load-or-generate the X25519 relationship keypair (raw, 0600).
+
+    Reused across stage retries so a retried ceremony keeps one identity.
+    """
+    path = _keys_dir(ctx) / f"{ctx.pair_id}.{_MIGRATION_RELATIONSHIP_KEY_NAME}"
+    if path.is_file():
+        _check_key_mode(path)
+        raw = path.read_bytes()
+        if len(raw) != 32:
+            raise MigrationError(
+                "relationship-key-corrupt",
+                f"relationship key file has wrong length: {path}",
+            )
+        return X25519PrivateKey.from_private_bytes(raw)
+    priv = X25519PrivateKey.generate()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(priv.private_bytes_raw())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+    return priv
+
+
+def _deploy_keypair(ctx: MigrationContext) -> str:
+    """Return this side's OpenSSH deploy public key (``ssh-ed25519 ...``).
+
+    Generates a real OpenSSH Ed25519 keypair on first use via
+    model.invites.generate_deploy_keypair (the same approach as the
+    pairing ceremony): the private half is stored OpenSSH-format at mode
+    0600 and never overwritten, the public half is what gets provisioned
+    as the GitHub deploy key. Reused across stage retries.
+    """
+    keys_dir = _keys_dir(ctx)
+    priv_path = keys_dir / f"{ctx.pair_id}.{_MIGRATION_DEPLOY_KEY_NAME}"
+    if priv_path.is_file():
+        _check_key_mode(priv_path)
+        try:
+            loaded = serialization.load_ssh_private_key(
+                priv_path.read_bytes(), password=None
+            )
+        except ValueError as exc:
+            raise MigrationError(
+                "deploy-key-corrupt",
+                f"deploy key file is not a valid OpenSSH private key: {priv_path}",
+            ) from exc
+        if not isinstance(loaded, Ed25519PrivateKey):
+            raise MigrationError(
+                "deploy-key-corrupt",
+                f"deploy key file is not an Ed25519 key: {priv_path}",
+            )
+        return (
+            loaded.public_key()
+            .public_bytes(
+                serialization.Encoding.OpenSSH,
+                serialization.PublicFormat.OpenSSH,
+            )
+            .decode("ascii")
+            .strip()
+        )
+    return generate_deploy_keypair(str(priv_path))
+
+
+def _sign_card_exchange(
+    ident_priv: Ed25519PrivateKey, card: dict, migration: dict
+) -> dict:
+    """Wrap a signed card plus the migration section in a signed envelope.
+
+    The card is already self-signed by the identity key (create_card); the
+    outer signature binds the migration section (pair id, deploy key, role)
+    to the same identity.
+    """
+    payload = {"card": card, "migration": migration}
+    signature = b64url_encode(ident_priv.sign(restricted_jcs(payload)))
+    return {"card": card, "migration": migration, "signature": signature}
+
+
+def _verify_card_exchange(envelope: Any, ctx: MigrationContext) -> tuple:
+    """Verify a received card exchange envelope. Fail-closed.
+
+    Checks the envelope shape, the card's self-signature and schema via
+    verify_card, the outer envelope signature against the card's identity
+    key, and the pair id binding. Returns (card, migration section).
+    """
+    if not isinstance(envelope, dict):
+        raise MigrationError(
+            "card-malformed", "peer card exchange is not an object"
+        )
+    card = envelope.get("card")
+    migration = envelope.get("migration")
+    signature = envelope.get("signature")
+    if (
+        not isinstance(card, dict)
+        or not isinstance(migration, dict)
+        or not isinstance(signature, str)
+    ):
+        raise MigrationError(
+            "card-malformed",
+            "peer card exchange must carry card, migration, and signature",
+        )
+    vr = verify_card(card)
+    if not vr.ok:
+        raise MigrationError(
+            "card-invalid", f"peer card rejected: {vr.reason_code}"
+        )
+    try:
+        peer_pub = parse_identity_id(card["identity_id"])
+    except ValueError as exc:
+        raise MigrationError("card-invalid", f"peer identity id: {exc}")
+    try:
+        raw_sig = b64url_decode(signature)
+    except ValueError:
+        raise MigrationError(
+            "card-bad-signature", "signature is not valid base64url"
+        )
+    if len(raw_sig) != 64:
+        raise MigrationError(
+            "card-bad-signature", "signature must decode to 64 bytes"
+        )
+    try:
+        Ed25519PublicKey.from_public_bytes(peer_pub).verify(
+            raw_sig, restricted_jcs({"card": card, "migration": migration})
+        )
+    except Exception:
+        raise MigrationError(
+            "card-bad-signature",
+            "exchange signature does not verify against the card identity key",
+        )
+    if migration.get("pair_id") != ctx.pair_id:
+        raise MigrationError(
+            "card-pair-mismatch", "peer card pair id differs"
+        )
+    deploy_pub = migration.get("deploy_pub")
+    if not isinstance(deploy_pub, str) or not deploy_pub.startswith("ssh-"):
+        raise MigrationError(
+            "card-bad-deploy-key",
+            "peer deploy key is not an OpenSSH public key",
+        )
+    return card, migration
+
+
+def _peer_identity_id(conn: Any, ctx: MigrationContext) -> str:
+    """The peer identity id pinned by the verified card exchange.
+
+    Fail-closed: without a verified peer card on record there is nothing
+    to verify subsequent ceremony messages against.
+    """
+    envelope = mstate_get(conn, "migration.peer_card_exchange")
+    if not isinstance(envelope, dict):
+        raise MigrationError(
+            "peer-card-missing",
+            "no verified peer card exchange on record; "
+            "stage step 4 must complete first",
+        )
+    card = envelope.get("card") or {}
+    identity_id = card.get("identity_id")
+    if not isinstance(identity_id, str) or not identity_id:
+        raise MigrationError(
+            "peer-card-missing", "verified peer card has no identity id"
+        )
+    return identity_id
+
+
+def _sign_ceremony_msg(
+    ident_priv: Ed25519PrivateKey, kind: str, pair_id: str, body: dict
+) -> dict:
+    """Sign a ceremony message (migration.ready/proof/commit) with the
+    sender's identity key. The signature covers kind, pair id, sender
+    identity id, timestamp, and body."""
+    if not isinstance(body, dict):
+        raise MigrationError(
+            f"{kind}-malformed", "ceremony message body is not an object"
+        )
+    msg = {
+        "kind": kind,
+        "pair_id": pair_id,
+        "identity_id": identity_id_from_pubkey(
+            ident_priv.public_key().public_bytes_raw()
+        ),
+        "at": utcnow(),
+        "body": body,
+    }
+    msg["signature"] = b64url_encode(
+        ident_priv.sign(
+            restricted_jcs({k: v for k, v in msg.items() if k != "signature"})
+        )
+    )
+    return msg
+
+
+def _verify_ceremony_msg(
+    msg: Any, expected_identity_id: str, pair_id: str, kind: str
+) -> dict:
+    """Verify a received ceremony message. Fail-closed.
+
+    Requires the message shape, the expected kind, the pair id, card
+    binding (the sender identity id must equal the identity pinned in the
+    verified peer card), and a valid Ed25519 signature by that identity.
+    Returns the verified message.
+    """
+    if not isinstance(msg, dict):
+        raise MigrationError(
+            f"{kind}-malformed", "ceremony message is not an object"
+        )
+    for field_name in ("kind", "pair_id", "identity_id", "at", "body", "signature"):
+        if field_name not in msg:
+            raise MigrationError(
+                f"{kind}-malformed", f"ceremony message missing {field_name}"
+            )
+    if msg["kind"] != kind:
+        raise MigrationError(
+            f"{kind}-kind-mismatch",
+            f"expected kind {kind}, got {msg['kind']!r}",
+        )
+    if msg["pair_id"] != pair_id:
+        raise MigrationError(
+            f"{kind}-pair-mismatch", "ceremony message pair id differs"
+        )
+    if msg["identity_id"] != expected_identity_id:
+        raise MigrationError(
+            f"{kind}-binding-mismatch",
+            "sender identity does not match the verified peer card",
+        )
+    try:
+        sender_pub = parse_identity_id(msg["identity_id"])
+    except ValueError as exc:
+        raise MigrationError(f"{kind}-bad-identity", str(exc))
+    signature = msg["signature"]
+    if not isinstance(signature, str):
+        raise MigrationError(
+            f"{kind}-bad-signature", "signature must be a string"
+        )
+    try:
+        raw_sig = b64url_decode(signature)
+    except ValueError:
+        raise MigrationError(
+            f"{kind}-bad-signature", "signature is not valid base64url"
+        )
+    if len(raw_sig) != 64:
+        raise MigrationError(
+            f"{kind}-bad-signature", "signature must decode to 64 bytes"
+        )
+    unsigned = {k: v for k, v in msg.items() if k != "signature"}
+    try:
+        Ed25519PublicKey.from_public_bytes(sender_pub).verify(
+            raw_sig, restricted_jcs(unsigned)
+        )
+    except Exception:
+        raise MigrationError(
+            f"{kind}-bad-signature", "ceremony signature does not verify"
+        )
+    return msg
+
+
+# ---------------------------------------------------------------------------
 # Encrypted local rollback bundle (never sent)
 # ---------------------------------------------------------------------------
 
@@ -328,13 +752,21 @@ def _bundle_dek_id(pair_id: str) -> str:
     return pair_id + "/bundle-dek"
 
 
-def _write_bundle_key(vault_dir: str | Path, pair_id: str, dek: bytes) -> None:
-    # Reuse the vault file format with a distinct key id.
-    vault_store(vault_dir, _bundle_dek_id(pair_id), dek.hex())
+def _write_bundle_key(ctx: MigrationContext, dek: bytes) -> None:
+    # The bundle DEK lives in the migration vault, encrypted at rest under
+    # the ceremony vault key. Reuse the vault file format with a distinct
+    # key id; never transmit the bundle or this key.
+    vault_store(
+        ctx.vault_dir, _bundle_dek_id(ctx.pair_id), dek.hex(),
+        enc_key=_vault_key(ctx),
+    )
 
 
-def _read_bundle_key(vault_dir: str | Path, pair_id: str) -> bytes:
-    return vault_load(vault_dir, _bundle_dek_id(pair_id))
+def _read_bundle_key(ctx: MigrationContext) -> bytes:
+    return vault_load(
+        ctx.vault_dir, _bundle_dek_id(ctx.pair_id),
+        enc_key=_vault_key(ctx, create=False),
+    )
 
 
 def create_rollback_bundle(ctx: MigrationContext, contents: dict) -> Path:
@@ -351,12 +783,12 @@ def create_rollback_bundle(ctx: MigrationContext, contents: dict) -> Path:
     path = backup_dir / name
     path.write_bytes(blob)
     os.chmod(path, 0o600)
-    _write_bundle_key(ctx.vault_dir, ctx.pair_id, dek)
+    _write_bundle_key(ctx, dek)
     return path
 
 
 def read_rollback_bundle(ctx: MigrationContext, path: str | Path) -> dict:
-    dek = _read_bundle_key(ctx.vault_dir, ctx.pair_id)
+    dek = _read_bundle_key(ctx)
     blob = Path(path).read_bytes()
     nonce, ciphertext = blob[:12], blob[12:]
     plaintext = AESGCM(dek).decrypt(nonce, ciphertext, None)
@@ -547,12 +979,23 @@ def stage(ctx: MigrationContext) -> dict:
     conn = open_db(ctx.state_dir)
     try:
         migrate_schema(conn)
-        if _phase(conn) not in ("idle", "rolled_back"):
+        if _phase(conn) not in ("idle", "rolled_back", "freezing"):
             raise MigrationError(
                 "bad-phase",
-                f"stage requires phase idle/rolled_back, found {_phase(conn)}",
+                "stage requires phase idle/rolled_back/freezing, found "
+                f"{_phase(conn)}",
             )
+        # "freezing" means a previous stage attempt failed partway; retrying
+        # is safe because every step below is idempotent (keys and cards are
+        # reused, vault entries are re-sealed, state is overwritten).
         summary: dict[str, Any] = {}
+
+        # The ceremony identity key comes first: it signs the migration
+        # card and all later ceremony messages, and derives the migration
+        # vault encryption key used from step 2 on.
+        _migration_identity_priv(ctx)
+        _assert_identity_matches(conn, ctx)
+        mstate_set(conn, "migration.my_identity_id", _migration_identity_id(ctx))
 
         # Step 1: freeze.
         if Path(ctx.state_dir).resolve() == Path(ctx.legacy_state_dir).resolve():
@@ -586,10 +1029,17 @@ def stage(ctx: MigrationContext) -> dict:
         summary["freeze"] = freeze
 
         # Step 2: backup (encrypted local rollback bundle, never sent).
+        vault_key = _vault_key(ctx)
         try:
-            legacy_key = vault_load(ctx.vault_dir, ctx.pair_id)
+            # Accepts the operator's plaintext handoff entry as well as an
+            # already-sealed one; either way it is re-sealed below so the
+            # vault is encrypted at rest from here on.
+            legacy_key = vault_load(
+                ctx.vault_dir, ctx.pair_id, enc_key=vault_key
+            )
         except KeyError as exc:
             raise MigrationError("vault-missing", str(exc))
+        vault_store(ctx.vault_dir, ctx.pair_id, legacy_key.hex(), enc_key=vault_key)
         bundle_contents = {
             "pair_id": ctx.pair_id,
             "legacy_key_hex": legacy_key.hex(),
@@ -617,84 +1067,93 @@ def stage(ctx: MigrationContext) -> dict:
         )
         summary["dry_run"] = [c.name for c in dry.checks]
 
-        # Step 4: exchange cards. Each peer generates its own keypairs.
-        from cryptography.hazmat.primitives.asymmetric.x25519 import (
-            X25519PrivateKey,
-        )
-
-        rel_priv = X25519PrivateKey.generate()
-        dep_priv = X25519PrivateKey.generate()
-        keys_dir = Path(ctx.state_dir) / "keys"
-        keys_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(keys_dir, 0o700)
-        for name, priv in (("relationship", rel_priv), ("deploy", dep_priv)):
-            p = keys_dir / f"{ctx.pair_id}.{name}.key"
-            p.write_bytes(
-                priv.private_bytes(
-                    serialization.Encoding.Raw,
-                    serialization.PrivateFormat.Raw,
-                    serialization.NoEncryption(),
-                )
+        # Step 4: exchange signed cards. Each peer generates its own
+        # keypairs; the card is Ed25519-signed by the side's migration
+        # identity key (model/cards.create_card) and the outer exchange
+        # envelope is signed again by the same key. The peer envelope is
+        # fully verified on receipt: fail-closed on any missing or invalid
+        # signature, with no unsigned fallback.
+        ident_priv = _migration_identity_priv(ctx)
+        my_identity_id = _migration_identity_id(ctx)
+        rel_priv = _relationship_priv(ctx)
+        rel_pub_raw = rel_priv.public_key().public_bytes_raw()
+        deploy_pub = _deploy_keypair(ctx)
+        now = _now_utc()
+        try:
+            my_card = create_card(
+                identity_priv=ident_priv,
+                display_name=ctx.my_agent_id,
+                principal_label=f"migration:{ctx.role}",
+                agreement_pub_multibase=agreement_key_multibase_from_pubkey(
+                    rel_pub_raw
+                ),
+                capabilities=["migration/0.2"],
+                issued_at=now,
+                expires_at=now + timedelta(days=30),
             )
-            os.chmod(p, 0o600)
-
-        def _pub_b64(priv: Any) -> str:
-            raw = priv.public_key().public_bytes_raw()
-            return base64.b64encode(raw).decode("ascii")
-
-        my_card = {
-            "agent_id": ctx.my_agent_id,
+        except ValueError as exc:
+            raise MigrationError("card-build-failed", str(exc))
+        my_migration = {
             "pair_id": ctx.pair_id,
-            "relationship_pub": _pub_b64(rel_priv),
-            "deploy_pub": _pub_b64(dep_priv),
+            "agent_id": ctx.my_agent_id,
+            "deploy_pub": deploy_pub,
             "role": ctx.role,
         }
+        my_envelope = _sign_card_exchange(ident_priv, my_card, my_migration)
         if ctx.hooks.exchange_card is None:
             raise AwaitingPeer(4, "exchange signed cards over the human channel")
-        peer_card = ctx.hooks.exchange_card(my_card)
-        if peer_card.get("pair_id") != ctx.pair_id:
-            raise MigrationError("card-pair-mismatch", "peer card pair id differs")
-        mstate_set(conn, "migration.my_card", my_card)
-        mstate_set(conn, "migration.peer_card", peer_card)
-        _record_step(conn, 4, "ok", {"peer_agent": peer_card.get("agent_id")})
-        summary["cards"] = "exchanged"
-
-        # Step 5: verify the eight-word phrase.
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-            Ed25519PrivateKey,
+        peer_envelope = ctx.hooks.exchange_card(my_envelope)
+        peer_card, peer_migration = _verify_card_exchange(peer_envelope, ctx)
+        mstate_set(conn, "migration.my_card_exchange", my_envelope)
+        mstate_set(conn, "migration.peer_card_exchange", peer_envelope)
+        _record_step(
+            conn,
+            4,
+            "ok",
+            {
+                "peer_agent": peer_migration.get("agent_id"),
+                "peer_identity_id": peer_card["identity_id"],
+            },
         )
-        from .crypto.identity import identity_id_from_pubkey
-        from .crypto.words import load_wordlist, verification_phrase
+        summary["cards"] = "exchanged and signature-verified"
 
-        my_ed = Ed25519PrivateKey.generate()
-        my_identity = identity_id_from_pubkey(
-            my_ed.public_key().public_bytes_raw()
-        )
-        peer_identity = peer_card.get("identity_id") or my_identity
+        # Step 5: verify the eight-word phrase. The phrase is derived ONLY
+        # from the two exchanged and signature-verified cards: there is no
+        # locally generated fallback. A missing or unverified card already
+        # aborted step 4, so reaching this point with a usable phrase is
+        # impossible without both verified cards.
+        peer_identity_id = peer_card["identity_id"]
         phrase = verification_phrase(
-            my_identity, peer_identity, load_wordlist()
+            my_identity_id, peer_identity_id, load_wordlist()
         )
-        peer_phrase = peer_card.get("phrase", phrase)
+        phrase_text = " ".join(phrase)
         if ctx.hooks.compare_phrase is None:
             raise AwaitingPeer(5, "compare the eight-word phrase with the human")
-        if not ctx.hooks.compare_phrase(" ".join(phrase), " ".join(peer_phrase)):
+        # Both sides derive the identical phrase from the same verified
+        # cards; the hook is the human-channel confirmation of that value.
+        if not ctx.hooks.compare_phrase(phrase_text, phrase_text):
             raise MigrationError("phrase-mismatch", "eight-word phrase differs")
         mstate_set(
             conn,
             "migration.consent",
             {
                 "phrase_verified_at": utcnow(),
-                "my_identity": my_identity,
-                "peer_agent": peer_card.get("agent_id"),
+                "my_identity_id": my_identity_id,
+                "peer_identity_id": peer_identity_id,
+                "my_card_fingerprint": card_fingerprint(my_card),
+                "peer_card_fingerprint": card_fingerprint(peer_card),
+                "peer_agent": peer_migration.get("agent_id"),
             },
         )
         _record_step(conn, 5, "ok", {})
         summary["phrase"] = "verified"
 
         # Step 6: provision new public deploy keys; keep old ones for drain.
+        # The provisioned key is a real OpenSSH public key
+        # ("ssh-ed25519 ..."), suitable as a GitHub deploy key.
         new_key = {
             "repo": ctx.legacy_snapshot.get("relay_repo", "relay"),
-            "public_key": my_card["deploy_pub"],
+            "public_key": deploy_pub,
             "label": "mas-v02",
         }
         if ctx.hooks.provision_deploy_key is None:
@@ -719,7 +1178,13 @@ def stage(ctx: MigrationContext) -> dict:
 
 
 def verify(ctx: MigrationContext) -> dict:
-    """Run steps 7-8: dual-read and the prove round trip. Phase -> verified."""
+    """Run steps 7-8: dual-read and the prove round trip. Phase -> verified.
+
+    migration.ready announcements and round-trip proofs are Ed25519-signed
+    by the sender's migration identity key; anything missing a signature,
+    carrying a bad signature, or not bound to the verified peer card is
+    rejected (fail-closed).
+    """
     conn = open_db(ctx.state_dir)
     try:
         migrate_schema(conn)
@@ -727,21 +1192,25 @@ def verify(ctx: MigrationContext) -> dict:
             raise MigrationError(
                 "bad-phase", f"verify requires phase staged, found {_phase(conn)}"
             )
+        _assert_identity_matches(conn, ctx)
+        peer_identity_id = _peer_identity_id(conn, ctx)
+        ident_priv = _migration_identity_priv(ctx, create=False)
         summary: dict[str, Any] = {}
 
         # Step 7: dual-read. v0.1+v0.2 reads; v0.2 writes only after a
-        # mutually signed migration.ready.
+        # mutually signed migration.ready. Our announcement is signed here
+        # with our identity key; the peer's is verified against the card.
         if ctx.hooks.sign_ready is None or ctx.hooks.await_peer_ready is None:
             raise AwaitingPeer(7, "exchange mutually signed migration.ready")
-        my_ready = ctx.hooks.sign_ready()
-        peer_ready = ctx.hooks.await_peer_ready()
-        if (
-            my_ready.get("pair_id") != ctx.pair_id
-            or peer_ready.get("pair_id") != ctx.pair_id
-        ):
-            raise MigrationError(
-                "ready-mismatch", "migration.ready pair id differs"
-            )
+        my_ready = _sign_ceremony_msg(
+            ident_priv, "migration.ready", ctx.pair_id, ctx.hooks.sign_ready()
+        )
+        peer_ready = _verify_ceremony_msg(
+            ctx.hooks.await_peer_ready(),
+            peer_identity_id,
+            ctx.pair_id,
+            "migration.ready",
+        )
         mstate_set(
             conn,
             "migration.dual_read",
@@ -752,14 +1221,25 @@ def verify(ctx: MigrationContext) -> dict:
         _record_step(conn, 7, "ok", {"v02_write": True})
         summary["dual_read"] = "v0.1+v0.2 reads; v0.2 writes enabled"
 
-        # Step 8: prove round trip.
+        # Step 8: prove round trip. The proof arrives as a peer-signed
+        # ceremony message and is verified before any count is trusted.
         if ctx.hooks.prove_roundtrip is None:
             raise AwaitingPeer(
                 8,
                 "exchange relationship.ready, message, reaction, receipts, "
                 "edit, and retraction",
             )
-        proof = ctx.hooks.prove_roundtrip()
+        proof_msg = _verify_ceremony_msg(
+            ctx.hooks.prove_roundtrip(),
+            peer_identity_id,
+            ctx.pair_id,
+            "migration.proof",
+        )
+        proof = proof_msg["body"]
+        if not isinstance(proof, dict):
+            raise MigrationError(
+                "migration.proof-malformed", "proof body is not an object"
+            )
         required = {
             "relationship.ready",
             "message",
@@ -773,15 +1253,28 @@ def verify(ctx: MigrationContext) -> dict:
             raise MigrationError(
                 "prove-incomplete", f"missing proof types: {sorted(missing)}"
             )
-        adapted = int(proof.get("legacy_adapted", 0))
+        try:
+            adapted = int(proof.get("legacy_adapted", 0))
+        except (TypeError, ValueError):
+            raise MigrationError(
+                "prove-count-mismatch",
+                f"legacy_adapted is not an integer: {proof.get('legacy_adapted')!r}",
+            )
         freeze = mstate_get(conn, "migration.freeze", {})
-        expected = int(freeze.get("backlog_count", adapted))
+        try:
+            expected = int(freeze.get("backlog_count", adapted))
+        except (TypeError, ValueError):
+            raise MigrationError(
+                "prove-count-mismatch",
+                "freeze backlog_count is not an integer",
+            )
         if adapted != expected:
             raise MigrationError(
                 "prove-count-mismatch",
                 f"adapted {adapted} != backlog {expected}",
             )
         mstate_set(conn, "migration.proof", proof)
+        mstate_set(conn, "migration.proof_signed", proof_msg)
         _record_step(conn, 8, "ok", {"legacy_adapted": adapted})
         summary["prove"] = f"round trip ok; legacy adapted {adapted}/{expected}"
 
@@ -798,7 +1291,15 @@ def verify(ctx: MigrationContext) -> dict:
 
 def cutover(ctx: MigrationContext) -> dict:
     """Run step 9: exchange migration.commit, remove legacy material, start
-    the 24h drain clock. Phase becomes 'committed'. No rollback after this."""
+    the 24h drain clock. Phase becomes 'committed'. No rollback after this.
+
+    Ordering guarantee: every fallible coordination step (commit exchange,
+    key revocation, peer key-copy deletion) completes BEFORE any rollback
+    key material is destroyed. The phase flips to 'committed' only after
+    the destructive section succeeds, so any failure before that point
+    leaves the phase at 'verified' with the vault key and rollback bundle
+    intact: cutover can be retried and rollback() still works.
+    """
     conn = open_db(ctx.state_dir)
     try:
         migrate_schema(conn)
@@ -807,16 +1308,24 @@ def cutover(ctx: MigrationContext) -> dict:
                 "bad-phase",
                 f"cutover requires phase verified, found {_phase(conn)}",
             )
+        _assert_identity_matches(conn, ctx)
+        peer_identity_id = _peer_identity_id(conn, ctx)
+        ident_priv = _migration_identity_priv(ctx, create=False)
         summary: dict[str, Any] = {}
 
+        # --- coordination (non-destructive; may raise AwaitingPeer) ---
         if ctx.hooks.exchange_commit is None:
             raise AwaitingPeer(9, "exchange migration.commit with the peer")
-        commit = ctx.hooks.exchange_commit({"pair_id": ctx.pair_id})
-        if commit.get("pair_id") != ctx.pair_id:
-            raise MigrationError(
-                "commit-mismatch", "migration.commit pair id differs"
-            )
-        mstate_set(conn, "migration.commit", commit)
+        my_commit = _sign_ceremony_msg(
+            ident_priv, "migration.commit", ctx.pair_id, {"pair_id": ctx.pair_id}
+        )
+        peer_commit = _verify_ceremony_msg(
+            ctx.hooks.exchange_commit(my_commit),
+            peer_identity_id,
+            ctx.pair_id,
+            "migration.commit",
+        )
+        mstate_set(conn, "migration.commit", peer_commit)
 
         # Remove old deploy keys.
         if ctx.hooks.revoke_old_deploy_key is None:
@@ -824,25 +1333,10 @@ def cutover(ctx: MigrationContext) -> dict:
         ctx.hooks.revoke_old_deploy_key({"label": "v0.1-legacy"})
         mstate_set(conn, "migration.old_deploy_keys", {"status": "revoked"})
 
-        # Delete the legacy pair key from the vault.
-        vault_delete(ctx.vault_dir, ctx.pair_id)
-        try:
-            vault_load(ctx.vault_dir, ctx.pair_id)
-            raise MigrationError("vault-not-deleted", "legacy key still loads")
-        except KeyError:
-            pass
-
-        # Delete the peer private key copy and the rollback bundle.
+        # Delete the peer private key copy.
         if ctx.hooks.delete_peer_key_copy is None:
             raise AwaitingPeer(9, "delete the peer private key copy")
         ctx.hooks.delete_peer_key_copy()
-        bundle_path = mstate_get(conn, "migration.bundle_path")
-        if bundle_path:
-            destroy_rollback_bundle(bundle_path)
-            try:
-                vault_delete(ctx.vault_dir, _bundle_dek_id(ctx.pair_id))
-            except KeyError:
-                pass
 
         # Local v0.1 sends are rejected from here on.
         _set_v01_sends(ctx, False)
@@ -851,6 +1345,28 @@ def cutover(ctx: MigrationContext) -> dict:
         drain_until = _v01_now() + DRAIN_WINDOW
         mstate_set(conn, "migration.drain_until", _fmt_ts(drain_until))
         mstate_set(conn, "migration.legacy_read_open", True)
+
+        # --- destructive section: only after everything above succeeded.
+        # Each deletion tolerates an already-deleted entry so a retried
+        # cutover (after a crash inside this section) still converges.
+        vault_key = _vault_key(ctx, create=False)
+        try:
+            vault_delete(ctx.vault_dir, ctx.pair_id)
+        except KeyError:
+            pass
+        try:
+            vault_load(ctx.vault_dir, ctx.pair_id, enc_key=vault_key)
+            raise MigrationError("vault-not-deleted", "legacy key still loads")
+        except KeyError:
+            pass
+
+        bundle_path = mstate_get(conn, "migration.bundle_path")
+        if bundle_path:
+            destroy_rollback_bundle(bundle_path)
+            try:
+                vault_delete(ctx.vault_dir, _bundle_dek_id(ctx.pair_id))
+            except KeyError:
+                pass
 
         _record_step(conn, 9, "ok", {"drain_until": _fmt_ts(drain_until)})
         _set_phase(conn, "committed")
@@ -892,7 +1408,15 @@ def _queue_depths(conn: Any) -> dict[str, int]:
 def observe(ctx: MigrationContext) -> dict:
     """Run step 10: 24h read-only drain, count comparison, empty retry
     queues. Closes legacy acceptance once the drain window expires; phase
-    becomes 'complete'."""
+    becomes 'complete'.
+
+    Completion is gated: the migration is NOT marked complete while any
+    retry queue is non-empty or the sent/received counts (freeze backlog
+    vs. proved adapted) do not match. A gate failure raises
+    MigrationError with the mismatch surfaced in both the error detail and
+    the stored observation report; the phase stays 'committed' so the
+    operator can investigate and re-run observe.
+    """
     conn = open_db(ctx.state_dir)
     try:
         migrate_schema(conn)
@@ -905,17 +1429,68 @@ def observe(ctx: MigrationContext) -> dict:
             mstate_get(conn, "migration.drain_until"), "%Y-%m-%dT%H:%M:%SZ"
         ).replace(tzinfo=timezone.utc)
         now = _v01_now()
+        depths = _queue_depths(conn)
+        freeze = mstate_get(conn, "migration.freeze", {}) or {}
+        proof = mstate_get(conn, "migration.proof", {}) or {}
         report: dict[str, Any] = {
             "drain_until": _fmt_ts(drain_until),
             "drain_open": now < drain_until,
-            "queues": _queue_depths(conn),
+            "queues": depths,
+            "backlog_count": freeze.get("backlog_count"),
+            "legacy_adapted": proof.get("legacy_adapted"),
         }
 
         if now < drain_until:
             # Drain still open: legacy reads allowed, sends stay disabled.
+            # Completion is not attempted, but the report already surfaces
+            # queue depths and counts for the operator.
             mstate_set(conn, "migration.legacy_read_open", True)
+            mstate_set(conn, "migration.observe_report", report)
             report["legacy_read"] = "open (drain window)"
             return report
+
+        # Drain expired: completion gates. Refuse to mark complete while any
+        # retry queue is non-empty or its depth cannot be verified.
+        unknown = [t for t, d in depths.items() if d < 0]
+        if unknown:
+            report["gate"] = "queues-unverifiable"
+            mstate_set(conn, "migration.observe_report", report)
+            raise MigrationError(
+                "observe-queues-unverifiable",
+                "could not read retry queue depths: " + ",".join(sorted(unknown)),
+            )
+        nonempty = {t: d for t, d in depths.items() if d != 0}
+        if nonempty:
+            report["gate"] = "queues-nonempty"
+            mstate_set(conn, "migration.observe_report", report)
+            raise MigrationError(
+                "observe-queues-nonempty",
+                "retry queues are not empty: "
+                + ", ".join(f"{t}={d}" for t, d in sorted(nonempty.items())),
+            )
+
+        # ... or while the sent/received counts are unmatched or unverifiable.
+        try:
+            backlog = int(freeze["backlog_count"])
+            adapted = int(proof["legacy_adapted"])
+        except (KeyError, TypeError, ValueError):
+            report["gate"] = "counts-unverifiable"
+            mstate_set(conn, "migration.observe_report", report)
+            raise MigrationError(
+                "observe-counts-unverifiable",
+                "cannot compare counts: freeze backlog_count="
+                f"{freeze.get('backlog_count')!r}, proof legacy_adapted="
+                f"{proof.get('legacy_adapted')!r}",
+            )
+        report["counts_match"] = backlog == adapted
+        if backlog != adapted:
+            report["gate"] = "count-mismatch"
+            mstate_set(conn, "migration.observe_report", report)
+            raise MigrationError(
+                "observe-count-mismatch",
+                f"backlog {backlog} != legacy adapted {adapted}; "
+                "investigate before closing the drain",
+            )
 
         # Drain expired: disable legacy acceptance permanently.
         mstate_set(conn, "migration.legacy_read_open", False)
@@ -953,7 +1528,8 @@ def rollback(ctx: MigrationContext, reason: str = "") -> dict:
         # Restore v0.1 sends; the v0.1 key remains authoritative.
         _set_v01_sends(ctx, True)
         try:
-            vault_load(ctx.vault_dir, ctx.pair_id)
+            vault_load(ctx.vault_dir, ctx.pair_id,
+                       enc_key=_vault_key(ctx, create=False))
             key_present = True
         except KeyError:
             key_present = False
@@ -1031,7 +1607,32 @@ def _rehearsal_hooks(
     conn_factory: Callable[[], Any],
     relationship_id: str,
 ) -> MigrationHooks:
-    """In-memory two-party fakes: both sides are simulated in-process."""
+    """In-memory two-party fakes: both sides are simulated in-process.
+
+    The local side is *recipient* (Alice); the simulated peer is *sender*
+    (Bob). Bob's card, ready, proof, and commit messages are really signed
+    with Bob's ceremony identity key so the local verification path is
+    exercised end to end.
+    """
+    # Bob's ceremony material: a real Ed25519 identity, a real signed card,
+    # and a real OpenSSH deploy keypair.
+    bob_ident = Ed25519PrivateKey.generate()
+    bob_rel = X25519PrivateKey.generate()
+    bob_now = _now_utc()
+    bob_card = create_card(
+        identity_priv=bob_ident,
+        display_name=sender,
+        principal_label="migration:peer",
+        agreement_pub_multibase=agreement_key_multibase_from_pubkey(
+            bob_rel.public_key().public_bytes_raw()
+        ),
+        capabilities=["migration/0.2"],
+        issued_at=bob_now,
+        expires_at=bob_now + timedelta(days=30),
+    )
+    bob_deploy_pub = generate_deploy_keypair(
+        str(legacy_dir.parent / "peer-keys" / "deploy.key")
+    )
 
     def record_relay_head() -> str:
         return "rehearsal-head"
@@ -1044,16 +1645,17 @@ def _rehearsal_hooks(
     def set_v01_sends(allowed: bool) -> None:
         v01_sends_flag["allowed"] = allowed
 
-    def exchange_card(my_card: dict) -> dict:
-        return {
-            "agent_id": recipient,
-            "pair_id": pair_id,
-            "relationship_pub": my_card["relationship_pub"],
-            "deploy_pub": my_card["deploy_pub"],
-            "identity_id": my_card.get("identity_id", ""),
-            "phrase": my_card.get("phrase", ""),
-            "role": "peer",
-        }
+    def exchange_card(my_envelope: dict) -> dict:
+        return _sign_card_exchange(
+            bob_ident,
+            bob_card,
+            {
+                "pair_id": pair_id,
+                "agent_id": sender,
+                "deploy_pub": bob_deploy_pub,
+                "role": "peer",
+            },
+        )
 
     def compare_phrase(mine: str, peer: str) -> bool:
         return True  # rehearsal: both sides compute the same phrase
@@ -1062,10 +1664,18 @@ def _rehearsal_hooks(
         return None
 
     def sign_ready() -> dict:
-        return {"pair_id": pair_id, "agent_id": sender, "at": utcnow()}
+        # Local (Alice) side payload; the ceremony signs it with Alice's
+        # identity key before storing/sending.
+        return {"pair_id": pair_id, "agent_id": recipient, "at": utcnow()}
 
     def await_peer_ready() -> dict:
-        return {"pair_id": pair_id, "agent_id": recipient, "at": utcnow()}
+        # Bob's side, signed by Bob's identity key.
+        return _sign_ceremony_msg(
+            bob_ident,
+            "migration.ready",
+            pair_id,
+            {"pair_id": pair_id, "agent_id": sender, "at": utcnow()},
+        )
 
     def prove_roundtrip() -> dict:
         # Dual-read the legacy backlog into the v0.2 store and count.
@@ -1129,19 +1739,30 @@ def _rehearsal_hooks(
             conn.commit()
         finally:
             conn.close()
-        return {
-            "relationship.ready": True,
-            "message": True,
-            "reaction": True,
-            "receipt.accepted": True,
-            "receipt.seen": True,
-            "edit": True,
-            "retraction": True,
-            "legacy_adapted": adapted,
-        }
+        # Bob's signed proof of the round trip.
+        return _sign_ceremony_msg(
+            bob_ident,
+            "migration.proof",
+            pair_id,
+            {
+                "relationship.ready": True,
+                "message": True,
+                "reaction": True,
+                "receipt.accepted": True,
+                "receipt.seen": True,
+                "edit": True,
+                "retraction": True,
+                "legacy_adapted": adapted,
+            },
+        )
 
     def exchange_commit(payload: dict) -> dict:
-        return {"pair_id": pair_id, "at": utcnow()}
+        return _sign_ceremony_msg(
+            bob_ident,
+            "migration.commit",
+            pair_id,
+            {"pair_id": pair_id, "at": utcnow()},
+        )
 
     def revoke_old_deploy_key(old: dict) -> None:
         return None

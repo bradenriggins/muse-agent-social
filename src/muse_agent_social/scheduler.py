@@ -109,10 +109,17 @@ def _ensure_dead_letter_schema(conn: sqlite3.Connection) -> None:
         return  # migrate() owns initial creation; nothing to widen yet
     sql = row["sql"] or ""
     if "release_failures" not in sql:
-        conn.execute(
-            "ALTER TABLE scheduler_queue ADD COLUMN release_failures "
-            "INTEGER NOT NULL DEFAULT 0"
-        )
+        try:
+            conn.execute(
+                "ALTER TABLE scheduler_queue ADD COLUMN release_failures "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError as exc:
+            # Lost a race with a concurrent _ensure_dead_letter_schema on
+            # another connection: the column is there now. Anything else
+            # is a real failure.
+            if "duplicate column name" not in str(exc):
+                raise
         row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' "
             "AND name = 'scheduler_queue'"
@@ -267,22 +274,41 @@ def schedule(
     sid = str(uuid.uuid4()) if scheduled_id is None else _validate_scheduled_id(
         scheduled_id
     )
-    existing = conn.execute(
-        "SELECT scheduled_id, inner_event FROM scheduler_queue "
-        "WHERE scheduled_id = ?",
-        (sid,),
-    ).fetchone()
-    if existing is not None:
-        if bytes(existing["inner_event"]) != bytes(sealed_event_envelope):
-            raise ScheduledIdConflictError(sid)
-        return sid
+    # The dedup check and the INSERT must be atomic: two concurrent
+    # schedule() calls with the same id could otherwise both see no row and
+    # collide on INSERT. Do the whole thing inside one BEGIN IMMEDIATE
+    # transaction and treat a UNIQUE conflict on re-check as the idempotent
+    # path instead of leaking sqlite3.IntegrityError.
     with transaction(conn):
-        conn.execute(
-            "INSERT INTO scheduler_queue "
-            "(scheduled_id, inner_event, deliver_at, expires_at, state) "
-            "VALUES (?, ?, ?, ?, 'scheduled')",
-            (sid, bytes(sealed_event_envelope), deliver_at, expires_at),
-        )
+        existing = conn.execute(
+            "SELECT scheduled_id, inner_event FROM scheduler_queue "
+            "WHERE scheduled_id = ?",
+            (sid,),
+        ).fetchone()
+        if existing is not None:
+            if bytes(existing["inner_event"]) != bytes(sealed_event_envelope):
+                raise ScheduledIdConflictError(sid)
+            return sid
+        try:
+            conn.execute(
+                "INSERT INTO scheduler_queue "
+                "(scheduled_id, inner_event, deliver_at, expires_at, state) "
+                "VALUES (?, ?, ?, ?, 'scheduled')",
+                (sid, bytes(sealed_event_envelope), deliver_at, expires_at),
+            )
+        except sqlite3.IntegrityError:
+            # Lost a race with a concurrent schedule() of the same id;
+            # re-read inside the same transaction and apply idempotency.
+            existing = conn.execute(
+                "SELECT scheduled_id, inner_event FROM scheduler_queue "
+                "WHERE scheduled_id = ?",
+                (sid,),
+            ).fetchone()
+            if existing is None:
+                raise
+            if bytes(existing["inner_event"]) != bytes(sealed_event_envelope):
+                raise ScheduledIdConflictError(sid)
+            return sid
     return sid
 
 

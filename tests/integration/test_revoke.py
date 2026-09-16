@@ -157,7 +157,7 @@ def test_revoke_revokes_remote_deploy_keys_by_id(paired, monkeypatch):
                 "deploy_keys": [
                     {
                         "id": 4242,
-                        "title": "mas-pair-x",
+                        "title": f"mas-pair-{rid}",
                         "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest",
                         "role": "peer",
                     }

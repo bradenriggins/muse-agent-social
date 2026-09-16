@@ -142,14 +142,16 @@ def test_commit_rolls_back_second_key_registration_failure(tmp_path, monkeypatch
     inviter_keys = list((a / "keys" / "pairing").rglob("deploy-inviter"))
     assert inviter_keys == []
 
-    # The invite is still usable for a retry: still in 'accepted' state,
-    # not burned or marked committed.
+    # The invite is still usable for a retry: back in 'issued' state,
+    # not burned or marked committed. Provisioning runs before
+    # validate_invite, so a provisioning failure leaves the invite
+    # unconsumed and the human can retry cleanly.
     conn = sqlite3.connect(str(a / "state.db"))
     try:
         state = conn.execute("SELECT state FROM invites").fetchone()[0]
     finally:
         conn.close()
-    assert state == "accepted"
+    assert state == "issued"
 
 
 def test_commit_provisions_before_local_commit_and_succeeds(tmp_path, monkeypatch):

@@ -17,6 +17,10 @@ DEFAULT_DB_FILENAME = "state.db"
 _BUSY_TIMEOUT_MS = 30_000
 
 
+class DbError(Exception):
+    """SQLite store setup or operation failed."""
+
+
 def utcnow() -> str:
     """Current time as canonical UTC text: YYYY-MM-DDTHH:MM:SSZ."""
     return datetime.now(timezone.utc).replace(microsecond=0).strftime(
@@ -30,10 +34,23 @@ def default_db_path(state_dir: str | Path) -> Path:
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
-    """Open a SQLite connection with WAL mode and foreign keys enforced."""
+    """Open a SQLite connection with WAL mode and foreign keys enforced.
+
+    Raises DbError if WAL mode cannot be engaged: the rest of the design
+    (30s busy timeout, BEGIN IMMEDIATE everywhere) assumes WAL's
+    reader/writer behavior, and a silent fallback to rollback journal would
+    change contention semantics invisibly.
+    """
     conn = sqlite3.connect(str(db_path), timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
+    mode = conn.execute("PRAGMA journal_mode=WAL;").fetchone()
+    engaged = (mode[0] if mode else "").lower()
+    if engaged != "wal" and str(db_path) != ":memory:":
+        conn.close()
+        raise DbError(
+            f"could not engage WAL journal mode on {db_path} (got {engaged!r}); "
+            "refusing to run with rollback-journal contention semantics"
+        )
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS};")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -53,7 +70,7 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     conn.execute("BEGIN IMMEDIATE;")
     try:
         yield conn
-    except Exception:
+    except BaseException:
         conn.execute("ROLLBACK;")
         raise
     else:

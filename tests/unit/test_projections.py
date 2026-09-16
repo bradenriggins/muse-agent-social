@@ -8,6 +8,7 @@ and the track src dir.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sqlite3
 import sys
 import uuid
@@ -1113,3 +1114,480 @@ def test_record_projection_input_validates_payload(conn, log):
             event_type="message.created",
             payload={"body": "missing format"},
         )
+
+
+# ---------------------------------------------------------------------------
+# Hardening regression: poll, task, reaction, capsule enforcement
+# ---------------------------------------------------------------------------
+
+
+def _make_poll(log, **over):
+    payload = {
+        "question": "lunch?",
+        "choices": ["tacos", "sushi", "ramen"],
+        "closes_at": ts(log.base, 3600),
+        "multi_select": False,
+    }
+    payload.update(over)
+    created = log.add("poll.created", payload, at=0)
+    return created
+
+
+def test_poll_closes_before_created_rejected(conn, log):
+    created = log.add(
+        "poll.created",
+        {
+            "question": "lunch?",
+            "choices": ["tacos", "sushi"],
+            "closes_at": ts(log.base, -10),
+            "multi_select": False,
+        },
+        at=0,
+    )
+    with pytest.raises(projections.ProjectionError) as excinfo:
+        log.apply(created)
+    assert excinfo.value.code == "poll_bad_closes_at"
+    row = conn.execute(
+        "SELECT 1 FROM polls WHERE poll_id = ?;", (created["event_id"],)
+    ).fetchone()
+    assert row is None
+
+
+def test_poll_response_unknown_choice_rejected(conn, log):
+    created = _make_poll(log)
+    log.apply(created)
+    with pytest.raises(projections.ProjectionError) as excinfo:
+        log.apply(
+            log.add(
+                "poll.responded",
+                {
+                    "poll_id": created["event_id"],
+                    "choice_ids": ["pizza"],
+                    "human_confirmed": False,
+                },
+                sender=SENDER_B,
+                at=10,
+            )
+        )
+    assert excinfo.value.code == "poll_unknown_choice"
+
+
+def test_poll_response_duplicate_choice_rejected(conn, log):
+    # The schema's uniqueItems already rejects duplicates at staging;
+    # this exercises the projection's defense-in-depth branch directly.
+    created = _make_poll(log, multi_select=True)
+    log.apply(created)
+    dup_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO events(event_id, relationship_id, conversation_id,"
+        " thread_id, sender, sender_seq, created_at, key_epoch, event_type,"
+        " replay_nonce, sealed_envelope)"
+        " VALUES (?, ?, ?, NULL, ?, 999, ?, 1, 'poll.responded', ?, ?);",
+        (
+            dup_id,
+            REL,
+            CONV,
+            SENDER_B,
+            ts(log.base, 10),
+            uuid.uuid4().hex,
+            b"sealed",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO event_payloads(event_id, event_type, payload, reply_to)"
+        " VALUES (?, 'poll.responded', ?, NULL);",
+        (
+            dup_id,
+            restricted_jcs(
+                {
+                    "poll_id": created["event_id"],
+                    "choice_ids": ["tacos", "tacos"],
+                    "human_confirmed": False,
+                }
+            ).decode("utf-8"),
+        ),
+    )
+    row = dict(
+        conn.execute(
+            "SELECT e.*, p.payload, p.reply_to FROM events e"
+            " JOIN event_payloads p ON p.event_id = e.event_id"
+            " WHERE e.event_id = ?;",
+            (dup_id,),
+        ).fetchone()
+    )
+    row["payload"] = json.loads(row["payload"])
+    with pytest.raises(projections.ProjectionError) as excinfo:
+        projections.apply_event(conn, row)
+    assert excinfo.value.code == "poll_duplicate_choice"
+
+
+def test_poll_response_multi_choice_single_select_rejected(conn, log):
+    created = _make_poll(log)
+    log.apply(created)
+    with pytest.raises(projections.ProjectionError) as excinfo:
+        log.apply(
+            log.add(
+                "poll.responded",
+                {
+                    "poll_id": created["event_id"],
+                    "choice_ids": ["tacos", "sushi"],
+                    "human_confirmed": False,
+                },
+                sender=SENDER_B,
+                at=10,
+            )
+        )
+    assert excinfo.value.code == "poll_multi_choice_single_select"
+
+
+def test_poll_response_empty_choices_rejected(conn, log):
+    # The schema's minItems already rejects empty selections at staging;
+    # this exercises the projection's defense-in-depth branch directly.
+    created = _make_poll(log)
+    log.apply(created)
+    empty_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO events(event_id, relationship_id, conversation_id,"
+        " thread_id, sender, sender_seq, created_at, key_epoch, event_type,"
+        " replay_nonce, sealed_envelope)"
+        " VALUES (?, ?, ?, NULL, ?, 999, ?, 1, 'poll.responded', ?, ?);",
+        (
+            empty_id,
+            REL,
+            CONV,
+            SENDER_B,
+            ts(log.base, 10),
+            uuid.uuid4().hex,
+            b"sealed",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO event_payloads(event_id, event_type, payload, reply_to)"
+        " VALUES (?, 'poll.responded', ?, NULL);",
+        (
+            empty_id,
+            restricted_jcs(
+                {
+                    "poll_id": created["event_id"],
+                    "choice_ids": [],
+                    "human_confirmed": False,
+                }
+            ).decode("utf-8"),
+        ),
+    )
+    row = dict(
+        conn.execute(
+            "SELECT e.*, p.payload, p.reply_to FROM events e"
+            " JOIN event_payloads p ON p.event_id = e.event_id"
+            " WHERE e.event_id = ?;",
+            (empty_id,),
+        ).fetchone()
+    )
+    row["payload"] = json.loads(row["payload"])
+    with pytest.raises(projections.ProjectionError) as excinfo:
+        projections.apply_event(conn, row)
+    assert excinfo.value.code == "poll_no_choice"
+
+
+def test_poll_response_after_close_rejected(conn, log):
+    created = _make_poll(log)
+    log.apply(created)
+    with pytest.raises(projections.ProjectionError) as excinfo:
+        log.apply(
+            log.add(
+                "poll.responded",
+                {
+                    "poll_id": created["event_id"],
+                    "choice_ids": ["tacos"],
+                    "human_confirmed": False,
+                },
+                sender=SENDER_B,
+                at=7200,
+            )
+        )
+    assert excinfo.value.code == "poll_closed"
+
+
+def test_poll_multi_select_accepts_multiple(conn, log):
+    created = _make_poll(log, multi_select=True)
+    log.apply(created)
+    log.apply(
+        log.add(
+            "poll.responded",
+            {
+                "poll_id": created["event_id"],
+                "choice_ids": ["tacos", "sushi"],
+                "human_confirmed": False,
+            },
+            sender=SENDER_B,
+            at=10,
+        )
+    )
+    poll = projections.get_poll(conn, created["event_id"])
+    assert poll["response_count"] == 1
+
+
+def _make_task(log, owner=SENDER_A, sender=SENDER_A):
+    created = log.add(
+        "task.created",
+        {"title": "write the plan", "owner_identity": owner},
+        sender=sender,
+        at=0,
+    )
+    log.apply(created)
+    return created
+
+
+def test_task_update_by_owner_allowed(conn, log):
+    created = _make_task(log, owner=SENDER_B, sender=SENDER_A)
+    log.apply(
+        log.add(
+            "task.updated",
+            {"task_id": created["event_id"], "status": "in_progress"},
+            sender=SENDER_B,
+            at=10,
+        )
+    )
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE task_id = ?;", (created["event_id"],)
+    ).fetchone()
+    assert row["status"] == "in_progress"
+
+
+def test_task_update_by_creator_allowed(conn, log):
+    created = _make_task(log, owner=SENDER_B, sender=SENDER_A)
+    log.apply(
+        log.add(
+            "task.updated",
+            {"task_id": created["event_id"], "status": "blocked"},
+            sender=SENDER_A,
+            at=10,
+        )
+    )
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE task_id = ?;", (created["event_id"],)
+    ).fetchone()
+    assert row["status"] == "blocked"
+
+
+def test_task_update_by_stranger_rejected(conn, log):
+    stranger = "did:key:zStranger3333333333333333333333"
+    created = _make_task(log, owner=SENDER_A, sender=SENDER_A)
+    with pytest.raises(projections.ProjectionError) as excinfo:
+        log.apply(
+            log.add(
+                "task.updated",
+                {"task_id": created["event_id"], "status": "done"},
+                sender=stranger,
+                at=10,
+            )
+        )
+    assert excinfo.value.code == "task_not_authorized"
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE task_id = ?;", (created["event_id"],)
+    ).fetchone()
+    assert row["status"] == "open"
+
+
+def test_task_update_terminal_rejected(conn, log):
+    created = _make_task(log)
+    log.apply(
+        log.add(
+            "task.updated",
+            {"task_id": created["event_id"], "status": "done"},
+            sender=SENDER_A,
+            at=10,
+        )
+    )
+    with pytest.raises(projections.ProjectionError) as excinfo:
+        log.apply(
+            log.add(
+                "task.updated",
+                {"task_id": created["event_id"], "status": "open"},
+                sender=SENDER_A,
+                at=20,
+            )
+        )
+    assert excinfo.value.code == "task_transition_terminal"
+
+
+def _react(log, target_id, emoji, sender=SENDER_A, at=10):
+    return log.add(
+        "reaction.added",
+        {"target_event_id": target_id, "emoji": emoji},
+        sender=sender,
+        at=at,
+    )
+
+
+def test_reaction_cap_per_sender_per_target(conn, log):
+    from muse_agent_social.policy.limits import (
+        MAX_ACTIVE_REACTIONS_PER_SENDER_TARGET as CAP,
+    )
+
+    target = log.add("message.created", msg_body(), at=0)
+    log.apply(target)
+    emojis = ["\U0001f600", "\U0001f601", "\U0001f602", "\U0001f603",
+              "\U0001f604", "\U0001f605", "\U0001f606", "\U0001f607",
+              "\U0001f608", "\U0001f609", "\U0001f60a", "\U0001f60b"]
+    assert len(emojis) > CAP
+    for i, emoji in enumerate(emojis[:CAP]):
+        log.apply(_react(log, target["event_id"], emoji, at=10 + i))
+    with pytest.raises(projections.ProjectionError) as excinfo:
+        log.apply(_react(log, target["event_id"], emojis[CAP], at=100))
+    assert excinfo.value.code == "reaction_cap_exceeded"
+    count = conn.execute(
+        "SELECT COUNT(*) FROM reactions WHERE target_event_id = ?"
+        " AND sender = ? AND active = 1;",
+        (target["event_id"], SENDER_A),
+    ).fetchone()[0]
+    assert count == CAP
+
+
+def test_reaction_cap_is_per_sender(conn, log):
+    from muse_agent_social.policy.limits import (
+        MAX_ACTIVE_REACTIONS_PER_SENDER_TARGET as CAP,
+    )
+
+    target = log.add("message.created", msg_body(), at=0)
+    log.apply(target)
+    emojis = ["\U0001f600", "\U0001f601", "\U0001f602", "\U0001f603",
+              "\U0001f604", "\U0001f605", "\U0001f606", "\U0001f607"]
+    assert len(emojis) == CAP
+    for i, emoji in enumerate(emojis):
+        log.apply(_react(log, target["event_id"], emoji, sender=SENDER_A, at=10 + i))
+    # The peer still has their own full budget on the same target.
+    log.apply(_react(log, target["event_id"], "\U0001f600", sender=SENDER_B, at=200))
+    count = conn.execute(
+        "SELECT COUNT(*) FROM reactions WHERE target_event_id = ?"
+        " AND sender = ? AND active = 1;",
+        (target["event_id"], SENDER_B),
+    ).fetchone()[0]
+    assert count == 1
+
+
+def test_reaction_cap_is_per_target(conn, log):
+    from muse_agent_social.policy.limits import (
+        MAX_ACTIVE_REACTIONS_PER_SENDER_TARGET as CAP,
+    )
+
+    t1 = log.add("message.created", msg_body(), at=0)
+    t2 = log.add("message.created", msg_body(), at=1)
+    log.apply(t1)
+    log.apply(t2)
+    emojis = ["\U0001f600", "\U0001f601", "\U0001f602", "\U0001f603",
+              "\U0001f604", "\U0001f605", "\U0001f606", "\U0001f607"]
+    assert len(emojis) == CAP
+    for i, emoji in enumerate(emojis):
+        log.apply(_react(log, t1["event_id"], emoji, at=10 + i))
+        log.apply(_react(log, t2["event_id"], emoji, at=100 + i))
+    count = conn.execute(
+        "SELECT COUNT(*) FROM reactions WHERE sender = ? AND active = 1;",
+        (SENDER_A,),
+    ).fetchone()[0]
+    assert count == 2 * CAP
+
+
+def test_reaction_readd_after_remove_within_cap(conn, log):
+    target = log.add("message.created", msg_body(), at=0)
+    log.apply(target)
+    added = _react(log, target["event_id"], "\U0001f600", at=10)
+    log.apply(added)
+    log.apply(
+        log.add(
+            "reaction.removed",
+            {"target_event_id": target["event_id"], "emoji": "\U0001f600"},
+            at=20,
+        )
+    )
+    # Re-adding a removed reaction does not exceed the cap.
+    log.apply(_react(log, target["event_id"], "\U0001f600", at=30))
+    row = conn.execute(
+        "SELECT active FROM reactions WHERE target_event_id = ?"
+        " AND sender = ? AND emoji = ?;",
+        (target["event_id"], SENDER_A, "\U0001f600"),
+    ).fetchone()
+    assert row["active"] == 1
+
+
+def _schedule_capsule(log, inner_id, deliver_at):
+    return log.add(
+        "delivery.scheduled",
+        {"inner_event_id": inner_id, "deliver_at": deliver_at},
+        sender=SENDER_B,
+        at=0,
+    )
+
+
+def test_capsule_inner_authored_before_deliver_at_accepted(conn, log):
+    # The author-now/deliver-later flow: the inner event's created_at is
+    # author time, which legitimately precedes deliver_at. No recipient-
+    # side timing quarantine applies (created_at is sender-controlled
+    # and cannot prove release time; the scheduler holds the
+    # announcement, not the content).
+    inner_id = str(uuid.uuid4())
+    log.apply(_schedule_capsule(log, inner_id, ts(log.base, 3600)))
+    inner = log.add(
+        "message.created", msg_body(), sender=SENDER_B, at=60, event_id=inner_id
+    )
+    log.apply(inner)
+    assert (
+        conn.execute(
+            "SELECT 1 FROM messages WHERE event_id = ?;", (inner_id,)
+        ).fetchone()
+        is not None
+    )
+
+
+def test_capsule_on_time_release_accepted(conn, log):
+    inner_id = str(uuid.uuid4())
+    log.apply(_schedule_capsule(log, inner_id, ts(log.base, 3600)))
+    inner = log.add(
+        "message.created", msg_body(), sender=SENDER_B, at=3600, event_id=inner_id
+    )
+    log.apply(inner)
+    assert (
+        conn.execute(
+            "SELECT 1 FROM messages WHERE event_id = ?;", (inner_id,)
+        ).fetchone()
+        is not None
+    )
+
+
+def test_capsule_announcement_accepted_when_inner_predates_it(conn, log):
+    # Out-of-order arrival: the inner event is already stored when the
+    # delivery.scheduled announcement projects. The announcement is
+    # accepted; no timing quarantine on the inner event's author time.
+    inner_id = str(uuid.uuid4())
+    inner = log.add(
+        "message.created", msg_body(), sender=SENDER_B, at=60, event_id=inner_id
+    )
+    log.apply(inner)
+    log.apply(_schedule_capsule(log, inner_id, ts(log.base, 3600)))
+    assert (
+        conn.execute(
+            "SELECT state FROM deliveries WHERE inner_event_id = ?;",
+            (inner_id,),
+        ).fetchone()["state"]
+        == "scheduled"
+    )
+
+
+def test_capsule_skew_tolerance(conn, log):
+    # Within the 5-minute clock-skew tolerance: accepted.
+    inner_id = str(uuid.uuid4())
+    log.apply(_schedule_capsule(log, inner_id, ts(log.base, 3600)))
+    inner = log.add(
+        "message.created",
+        msg_body(),
+        sender=SENDER_B,
+        at=3600 - 299,
+        event_id=inner_id,
+    )
+    log.apply(inner)
+    assert (
+        conn.execute(
+            "SELECT 1 FROM messages WHERE event_id = ?;", (inner_id,)
+        ).fetchone()
+        is not None
+    )

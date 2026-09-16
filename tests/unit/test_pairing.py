@@ -755,3 +755,146 @@ def test_assert_no_peer_private_key_dirty(tmp_path):
     (bundle2 / "id_ed25519").write_text("whatever")
     with pytest.raises(PrivateKeyMaterialFound):
         assert_no_peer_private_key(str(bundle2))
+
+
+def test_invite_file_size_cap_rejects_oversize(tmp_path):
+    from muse_agent_social.model.invites import MAX_INVITE_FILE_BYTES
+
+    path = tmp_path / "big.json"
+    path.write_bytes(b"x" * (MAX_INVITE_FILE_BYTES + 1))
+    with pytest.raises(PairingError) as excinfo:
+        read_invite_file(str(path))
+    assert excinfo.value.code == "invite_too_large"
+
+
+def test_invite_file_at_cap_boundary(tmp_path):
+    from muse_agent_social.model.invites import MAX_INVITE_FILE_BYTES
+
+    path = tmp_path / "big.json"
+    # Exactly at the cap: passes the size gate (then fails as bad JSON,
+    # which proves the size check did not fire first).
+    path.write_bytes(b" " * MAX_INVITE_FILE_BYTES)
+    with pytest.raises(PairingError) as excinfo:
+        read_invite_file(str(path))
+    assert excinfo.value.code != "invite_too_large"
+
+
+def test_commit_binds_exact_human_verified_cards(inviter, tmp_path):
+    """The commit must bind to the EXACT cards the human verified: an
+    acceptance from a different (validly signed) identity must not pair
+    the human's approval to an identity they never verified."""
+    acceptor = make_agent("Acceptor")
+    intruder = make_agent("Intruder")
+    conn_i, conn_a = make_db(), make_db()
+    invite = make_invite(conn_i, inviter)
+    keys_a, deploy = str(tmp_path / "ka"), str(tmp_path / "d")
+    os.makedirs(keys_a)
+    os.makedirs(deploy)
+    # The intruder answers the same invite with their own valid card.
+    intruder_acceptance, _, _, _ = accept_invite(
+        conn_a, invite, intruder, T0 + timedelta(seconds=30), keys_a, deploy
+    )
+    validate_invite(conn_i, invite, now=T0 + timedelta(seconds=60))
+    # The human verified the REAL acceptor's card, not the intruder's.
+    record_verification(
+        conn_i,
+        invite["invite_id"],
+        (
+            card_fingerprint(invite["inviter_card"]),
+            card_fingerprint(acceptor[1]),
+        ),
+        True,
+    )
+    with pytest.raises(PairingError) as excinfo:
+        commit_pairing(
+            conn_i,
+            intruder_acceptance,
+            inviter[0].ed25519_private,
+            "https://github.com/example-org/relay-1",
+            {"inviter_send_slot": "s1", "inviter_receive_slot": "r1"},
+            CAPS,
+            now=T0 + timedelta(seconds=90),
+            keys_dir=str(tmp_path / "ki"),
+        )
+    assert excinfo.value.code == "acceptor_card_changed"
+    # A swapped card is a hostile act: the invite is burned, not retried.
+    row = conn_i.execute(
+        "SELECT state FROM invites WHERE invite_id=?", (invite["invite_id"],)
+    ).fetchone()
+    assert row["state"] == "canceled"
+
+
+def test_commit_rejects_swapped_inviter_card(inviter, acceptor, tmp_path):
+    """The inviter side is bound too: recording a verification whose
+    inviter fingerprint does not match the issued invite burns the
+    invite at verification time, so no commit can ever bind to it."""
+    conn_i, conn_a = make_db(), make_db()
+    invite = make_invite(conn_i, inviter)
+    keys_a, deploy = str(tmp_path / "ka"), str(tmp_path / "d")
+    os.makedirs(keys_a)
+    os.makedirs(deploy)
+    acceptance, _, _, _ = accept_invite(
+        conn_a, invite, acceptor, T0 + timedelta(seconds=30), keys_a, deploy
+    )
+    validate_invite(conn_i, invite, now=T0 + timedelta(seconds=60))
+    # The human-approved inviter fingerprint does not match the invite's
+    # stored inviter card: the ceremony is hostile, burn immediately.
+    with pytest.raises(PairingError) as excinfo:
+        record_verification(
+            conn_i,
+            invite["invite_id"],
+            ("0" * 64, card_fingerprint(acceptance["acceptor_card"])),
+            True,
+        )
+    assert excinfo.value.code == "altered_card"
+    row = conn_i.execute(
+        "SELECT state FROM invites WHERE invite_id=?", (invite["invite_id"],)
+    ).fetchone()
+    assert row["state"] == "canceled"
+
+
+def _invite_in_state(conn, invite_id, state):
+    conn.execute(
+        "UPDATE invites SET state=? WHERE invite_id=?", (state, invite_id)
+    )
+    conn.commit()
+
+
+def test_reset_invite_for_retry_restores_accepted_to_issued(inviter):
+    """A commit that failed WITHOUT burning (invite still 'accepted')
+    returns the invite to 'issued' so the human can retry cleanly."""
+    import muse_agent_social.cli as cli_mod
+
+    conn = make_db()
+    invite = make_invite(conn, inviter)
+    _invite_in_state(conn, invite["invite_id"], "accepted")
+    cli_mod._reset_invite_for_retry(conn, invite["invite_id"])
+    row = conn.execute(
+        "SELECT state FROM invites WHERE invite_id=?", (invite["invite_id"],)
+    ).fetchone()
+    assert row["state"] == "issued"
+
+
+def test_reset_invite_for_retry_leaves_terminal_states(inviter):
+    """Burned, expired, and committed invites are never touched: those
+    are terminal decisions, not retryable errors."""
+    import muse_agent_social.cli as cli_mod
+
+    conn = make_db()
+    invite = make_invite(conn, inviter)
+    for terminal in ("canceled", "expired", "committed"):
+        _invite_in_state(conn, invite["invite_id"], terminal)
+        cli_mod._reset_invite_for_retry(conn, invite["invite_id"])
+        row = conn.execute(
+            "SELECT state FROM invites WHERE invite_id=?", (invite["invite_id"],)
+        ).fetchone()
+        assert row["state"] == terminal
+
+
+def test_reset_invite_for_retry_unknown_invite_is_noop(inviter):
+    import muse_agent_social.cli as cli_mod
+
+    conn = make_db()
+    make_invite(conn, inviter)
+    # Must not raise on an invite id that was never issued here.
+    cli_mod._reset_invite_for_retry(conn, "12345678-1234-4234-8234-123456789abc")

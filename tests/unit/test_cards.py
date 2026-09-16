@@ -312,3 +312,16 @@ def test_card_fingerprint_stable_and_sensitive():
     assert card_fingerprint(copy.deepcopy(card)) == fp
     other = _card()
     assert card_fingerprint(other) != fp  # nonce differs
+
+
+def test_verify_rejects_card_issued_in_future():
+    card = _card(issued_at=NOW + timedelta(minutes=6))
+    result = verify_card(card, now=NOW)
+    assert result.ok is False
+    assert result.reason_code == "ISSUED_IN_FUTURE"
+
+
+def test_verify_accepts_card_issued_within_skew():
+    card = _card(issued_at=NOW + timedelta(minutes=4))
+    result = verify_card(card, now=NOW)
+    assert result.ok is True

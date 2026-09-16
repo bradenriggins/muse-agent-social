@@ -85,11 +85,12 @@ from .crypto.rotation import (
     RotationError,
     RotationManager,
 )
-from .crypto.sealing import SealingError, seal_envelope, unseal_envelope
+from .crypto.sealing import SealingError, unseal_envelope
 from .migrate import (
     AwaitingPeer,
     MigrationContext,
     MigrationError,
+    ceremony_vault_key,
     cutover,
     mstate_get,
     mstate_set,
@@ -886,6 +887,28 @@ def _ssh_key_fingerprint(openssh_pub: str) -> str:
         return ""
 
 
+def _reset_invite_for_retry(conn, invite_id: str) -> None:
+    """Return an ``accepted`` invite to ``issued`` after a failed commit.
+
+    Only when the commit failed WITHOUT burning (state still
+    ``accepted``): nothing was persisted externally (provisioned keys were
+    deleted by the caller, no relationship row was committed), so the
+    single-use invite is still unspent and the human can retry.
+    Burned (``canceled``), expired, or committed invites are never
+    touched: those states are terminal decisions, not retryable errors.
+    """
+    from muse_agent_social.store.db import transaction
+
+    with transaction(conn):
+        row = conn.execute(
+            "SELECT state FROM invites WHERE invite_id=?", (invite_id,)
+        ).fetchone()
+        if row is not None and row["state"] == "accepted":
+            conn.execute(
+                "UPDATE invites SET state='issued' WHERE invite_id=?", (invite_id,)
+            )
+
+
 def cmd_pair_commit(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
@@ -919,9 +942,10 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
                 "re-run with --i-compared-phrase after comparing the phrase",
             )
         try:
-            # Consume the invite's one-use status on the inviter's ledger,
-            # then record the human-approved phrase comparison.
-            validate_invite(ctx.conn, invite)
+            # Record the human-approved phrase comparison. The invite's
+            # one-use consumption (validate_invite) happens AFTER
+            # provisioning below: a provisioning failure must leave the
+            # invite in 'issued' so the human can retry without reissuing.
             record_verification(
                 ctx.conn, invite_id, (inviter_fp, acceptor_fp), human_approved=True
             )
@@ -960,6 +984,9 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
         # be retried cleanly.
         relationship_id = None
         inviter_key_path = None
+        repo = None
+        token = None
+        registered: list = []
         if provider == "github":
             repo = _parse_github_repo(relay_url)
             token = _github_token(args)
@@ -974,7 +1001,6 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
             )
             inviter_pub = generate_deploy_keypair(str(inviter_key_path))
             peer_pub = acceptance["deploy_public_key"]
-            registered: list = []
             try:
                 # Register the acceptor's (peer) public deploy key.
                 reg = register_peer_deploy_key(
@@ -997,7 +1023,26 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
                 except OSError:
                     pass
                 raise CliError("provisioning_error", f"{exc.code}: {exc}")
+        def _cleanup_provisioned() -> None:
+            if provider != "github":
+                return
+            for key_id in registered:
+                if key_id:
+                    try:
+                        _github_delete_deploy_key(repo, key_id, token)
+                    except ProvisioningError:
+                        pass
+            if inviter_key_path is not None:
+                try:
+                    inviter_key_path.unlink()
+                except OSError:
+                    pass
+
         try:
+            # Consume the invite's one-use status only after provisioning
+            # succeeded: anything above that raised left the invite in
+            # 'issued', so the human can retry cleanly.
+            validate_invite(ctx.conn, invite)
             commit = commit_pairing(
                 ctx.conn,
                 acceptance,
@@ -1009,18 +1054,17 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
                 relationship_id=relationship_id,
             )
         except PairingError as exc:
-            if provider == "github":
-                for key_id in registered:
-                    if key_id:
-                        try:
-                            _github_delete_deploy_key(repo, key_id, token)
-                        except ProvisioningError:
-                            pass
-                try:
-                    inviter_key_path.unlink()
-                except OSError:
-                    pass
+            _cleanup_provisioned()
+            _reset_invite_for_retry(ctx.conn, invite_id)
             raise CliError("pairing_error", f"{exc.code}: {exc}")
+        except Exception as exc:
+            # commit_pairing can also fail outside PairingError (storage
+            # I/O, key-file errors). Same cleanup and retry semantics.
+            _cleanup_provisioned()
+            _reset_invite_for_retry(ctx.conn, invite_id)
+            raise CliError(
+                "pairing_error", f"commit_failed: {type(exc).__name__}: {exc}"
+            )
         relationship_id = commit["relationship_id"]
         deploy_keys: list = []
         repos: list = []
@@ -1212,6 +1256,16 @@ def _iso_now() -> str:
     return utcnow()
 
 
+def _poll_answer(choice_ids) -> str:
+    """Unambiguous encoding of a poll response's choice list for approvals.
+
+    Comma-joining is ambiguous: ["a,b", "c"] and ["a", "b,c"] both encode
+    to "a,b,c", so one approval record could authorize a different choice
+    set than the human confirmed. Canonical JSON of the list is injective.
+    """
+    return restricted_jcs(list(choice_ids)).decode("utf-8")
+
+
 def _require_approval_record(
     ctx: "Ctx",
     args: argparse.Namespace,
@@ -1222,10 +1276,25 @@ def _require_approval_record(
     approved: bool,
 ) -> str:
     """Verify the --approval-record references a real local human-approval
-    record matching this send. Returns the approval ID for the payload."""
-    from muse_agent_social.model.approvals import get_approval
+    record matching this send. Returns the approval ID for the payload.
 
+    Approval records are single-use and expire after
+    APPROVAL_TTL_SECONDS. This function only VALIDATES the record
+    (existence, relationship/subject/answer match, unconsumed,
+    unexpired). The atomic single-use claim happens inside the send's
+    persistence transaction (see persist_outgoing_in_txn): a failed send
+    rolls the claim back, so a human approval is never burned without
+    authorizing a durably persisted event. Dry runs validate the record
+    without consuming it and without any other side effect.
+    """
+    from muse_agent_social.model.approvals import get_approval
+    from muse_agent_social.store.db import utcnow
+
+    dry_run = bool(getattr(args, "dry_run", False))
     rid = args._relationship_id
+    if dry_run and args.approval_record == "dry_run":
+        # cmd_human_respond --dry-run: validate-only, no record was created.
+        return "dry_run"
     record = get_approval(ctx.conn, args.approval_record)
     if record is None:
         raise CliError(
@@ -1248,6 +1317,21 @@ def _require_approval_record(
             "approval_record_mismatch",
             "approval record answer/approved does not match this send",
         )
+    now = utcnow()
+    if record["consumed_at"] is not None:
+        raise CliError(
+            "approval_consumed",
+            "approval record was already used for a previous send;"
+            " the human must respond again",
+        )
+    if record["expires_at"] is not None and record["expires_at"] <= now:
+        raise CliError(
+            "approval_expired",
+            "approval record has expired; the human must respond again",
+        )
+    # NOTE: no consumption here. The claim is atomic with event
+    # persistence inside _send_event -> persist_outgoing_in_txn, so a
+    # send that fails after this validation leaves the approval live.
     return record["approval_id"]
 
 
@@ -1343,7 +1427,7 @@ def _build_payload(ctx: "Ctx", args: argparse.Namespace) -> dict:
                 args,
                 subject_type="poll",
                 subject_id=args.poll_id,
-                answer=",".join(args.choice_ids),
+                answer=_poll_answer(args.choice_ids),
                 approved=True,
             )
     elif t == "task.created":
@@ -1714,8 +1798,23 @@ def _send_event(
             "payload": payload,
         }
     try:
+        # The human-approval claim is atomic with event persistence: the
+        # record ID travels in the payload for the approval-gated types,
+        # and persist_outgoing_in_txn claims it inside the same
+        # transaction that inserts the event. A failed send rolls the
+        # claim back instead of burning the human's approval.
+        approval_id = (
+            payload.get("approval_record_id")
+            if event_type in ("human.responded", "poll.responded")
+            else None
+        )
         sealed = assign_and_persist_outgoing(
-            ctx.conn, protected, payload, ctx.hierarchy.ed25519_private, recipients
+            ctx.conn,
+            protected,
+            payload,
+            ctx.hierarchy.ed25519_private,
+            recipients,
+            approval_id=approval_id,
         )
     except Exception as exc:
         raise CliError("send_error", f"persist failed: {exc}")
@@ -1741,7 +1840,11 @@ def _send_event(
         )
         event_row["payload"] = payload
         event_row["reply_to"] = reply_to
-        apply_event(ctx.conn, event_row)
+        # Atomic per-event projection: a crash mid-apply must roll back the
+        # whole event, never leave half-applied markers that redelivery
+        # would then treat as "already done".
+        with transaction(ctx.conn):
+            apply_event(ctx.conn, event_row)
     except ProjectionError as exc:
         raise CliError("send_error", f"projection failed: {exc.code}: {exc}")
     released: list[str] = []
@@ -1901,13 +2004,49 @@ def cmd_send(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _require_human_presence(action: str) -> None:
+    """Best-effort check that a human is driving this approval command.
+
+    Refuses non-interactive stdin and requires the operator to type an
+    explicit confirmation naming the action. This is the technical control
+    behind "the human drives this command": a non-interactive agent
+    subprocess cannot pass it by accident, and a casual scripted misuse
+    fails loudly instead of minting a live approval.
+
+    It is NOT a cryptographic attestation of humanity. A fully compromised
+    local process with the same OS access as the operator can allocate a
+    pty and answer the prompt. The trust boundary is the operator's
+    machine: if the local agent runtime itself is malicious, no in-process
+    check can distinguish it from the human. This gate raises the cost of
+    misuse; it does not move the trust boundary.
+    """
+    import sys
+
+    if not sys.stdin.isatty():
+        raise CliError(
+            "human_presence_required",
+            "this command approves an action as the human; it refuses to"
+            " run with non-interactive stdin. Run it from a real terminal.",
+        )
+    print(f"Human approval requested: {action}")
+    print("Type APPROVE (all caps) to confirm, anything else aborts.")
+    try:
+        typed = input("> ").strip()
+    except EOFError:
+        raise CliError("human_approval_declined", "no confirmation typed; aborted")
+    if typed != "APPROVE":
+        raise CliError("human_approval_declined", "confirmation not typed; aborted")
+
+
 def cmd_human_respond(args: argparse.Namespace) -> int:
     """The human's explicit response to a human.requested event.
 
     This command IS the local human-approval step required by the plan:
     running it creates the local human-approval record, then sends the
     human.responded event carrying that record's ID. Agents must never
-    send human.responded on their own; the human drives this command.
+    send human.responded on their own; the human drives this command,
+    proven best-effort by the interactive confirmation gate
+    (_require_human_presence). Dry runs create no approval record.
     """
     from muse_agent_social.model.approvals import create_approval
 
@@ -1926,17 +2065,27 @@ def cmd_human_respond(args: argparse.Namespace) -> int:
         if args.approved and args.rejected:
             raise CliError("bad_args", "cannot pass both --approved and --rejected")
         approved = bool(args.approved)
-        with ctx.conn:
-            approval_id = create_approval(
-                ctx.conn,
-                relationship_id=rid,
-                subject_type="human_request",
-                subject_id=args.request_id,
-                answer=args.answer,
-                approved=approved,
-                created_at=utcnow(),
-                note=args.note,
+        dry_run = bool(args.dry_run)
+        if dry_run:
+            # No side effects: validate only. The payload carries a
+            # placeholder record ID; nothing is persisted or consumed.
+            approval_id = "dry_run"
+        else:
+            _require_human_presence(
+                f"respond to human.requested {args.request_id} "
+                f"({'approved' if approved else 'rejected'})"
             )
+            with ctx.conn:
+                approval_id = create_approval(
+                    ctx.conn,
+                    relationship_id=rid,
+                    subject_type="human_request",
+                    subject_id=args.request_id,
+                    answer=args.answer,
+                    approved=approved,
+                    created_at=utcnow(),
+                    note=args.note,
+                )
         args._relationship_id = rid
         args.approval_record = approval_id
         args.type = "human.responded"
@@ -1950,9 +2099,12 @@ def cmd_human_respond(args: argparse.Namespace) -> int:
             conversation_id=args.conversation,
             thread_id=args.thread,
             reply_to=args.reply_to,
-            dry_run=bool(args.dry_run),
+            dry_run=dry_run,
         )
-        print(f"approval {approval_id} recorded; sent {result['event_id']}")
+        if dry_run:
+            print(f"dry run ok; no approval recorded, nothing sent")
+        else:
+            print(f"approval {approval_id} recorded; sent {result['event_id']}")
         return 0
     finally:
         ctx.close()
@@ -1965,7 +2117,10 @@ def cmd_human_poll_respond(args: argparse.Namespace) -> int:
     poll.responded with human_confirmed=true carrying that record's ID.
     This is the only honest path to a human-confirmed poll response:
     the schema requires approval_record_id when human_confirmed is true,
-    and the human drives this command.
+    and the human drives this command (interactive confirmation gate).
+    The choice list is encoded as canonical JSON so the approval cannot
+    authorize a different choice set than the human confirmed. Dry runs
+    create no approval record.
     """
     from muse_agent_social.model.approvals import create_approval
 
@@ -1980,18 +2135,25 @@ def cmd_human_poll_respond(args: argparse.Namespace) -> int:
         choice_ids = list(args.choice_ids or [])
         if not choice_ids:
             raise CliError("bad_args", "human poll-respond needs --choice-ids")
-        answer = ",".join(choice_ids)
-        with ctx.conn:
-            approval_id = create_approval(
-                ctx.conn,
-                relationship_id=rid,
-                subject_type="poll",
-                subject_id=args.poll_id,
-                answer=answer,
-                approved=True,
-                created_at=utcnow(),
-                note=args.note,
+        answer = _poll_answer(choice_ids)
+        dry_run = bool(args.dry_run)
+        if dry_run:
+            approval_id = "dry_run"
+        else:
+            _require_human_presence(
+                f"confirm poll response {args.poll_id} choices {choice_ids}"
             )
+            with ctx.conn:
+                approval_id = create_approval(
+                    ctx.conn,
+                    relationship_id=rid,
+                    subject_type="poll",
+                    subject_id=args.poll_id,
+                    answer=answer,
+                    approved=True,
+                    created_at=utcnow(),
+                    note=args.note,
+                )
         args._relationship_id = rid
         args.approval_record = approval_id
         args.type = "poll.responded"
@@ -2006,9 +2168,12 @@ def cmd_human_poll_respond(args: argparse.Namespace) -> int:
             conversation_id=args.conversation,
             thread_id=args.thread,
             reply_to=args.reply_to,
-            dry_run=bool(args.dry_run),
+            dry_run=dry_run,
         )
-        print(f"approval {approval_id} recorded; sent {result['event_id']}")
+        if dry_run:
+            print("dry run ok; no approval recorded, nothing sent")
+        else:
+            print(f"approval {approval_id} recorded; sent {result['event_id']}")
         return 0
     finally:
         ctx.close()
@@ -2050,8 +2215,22 @@ def _receive_v01(
     if not pair_id or not vault_dir.exists():
         return _quarantine_outcome(ctx, rid, object_name, "v01_no_vault")
     try:
-        pair_key = vault_load(vault_dir, pair_id)
-    except (LegacyError, VaultError) as exc:
+        # Prefer the sealed entry: stage() encrypts the operator's
+        # plaintext vault handoff in place under the ceremony vault key.
+        # Fall back to the plaintext handoff for a ceremony whose stage
+        # has not run in this state dir yet (or a pre-seal vault).
+        try:
+            enc_key = ceremony_vault_key(ctx.state_dir, pair_id)
+        except (MigrationError, OSError):
+            enc_key = None
+        if enc_key is not None:
+            try:
+                pair_key = vault_load(vault_dir, pair_id, enc_key=enc_key)
+            except VaultError:
+                pair_key = vault_load(vault_dir, pair_id)
+        else:
+            pair_key = vault_load(vault_dir, pair_id)
+    except (LegacyError, VaultError, KeyError) as exc:
         return _quarantine_outcome(ctx, rid, object_name, "v01_no_vault", str(exc))
     drain_open = phase in ("dual_read", "observing")
     policy = LegacyPolicy(
@@ -2177,7 +2356,14 @@ def _queue_accepted_receipt(
     sequence update, the projection queue entry, and the scheduler
     outbox row all commit or roll back together. The relay upload itself
     is queued through the scheduler outbox and pushed after the commit.
+
+    Persistence goes through the same ``persist_outgoing_in_txn`` core as
+    every other send (same seq assignment, same conflict classification),
+    so receipts cannot diverge from the guarded send path. Recipients go
+    through the rotation send gate (``_recipients_for``) like any send.
     """
+    from .model.events import persist_outgoing_in_txn
+
     rel = get_relationship(ctx.conn, rid)
     if rel is None:
         raise CliError("unknown_relationship", f"unknown relationship {rid}")
@@ -2199,73 +2385,36 @@ def _queue_accepted_receipt(
         )
     except (SchemaError, ValueError) as exc:
         raise CliError("send_error", f"cannot build receipt: {exc}")
-    row = ctx.conn.execute(
-        "SELECT COALESCE(MAX(sender_seq), 0) FROM events "
-        "WHERE relationship_id = ? AND sender = ?",
-        (rid, ctx.identity_id),
-    ).fetchone()
-    rprotected["sender_seq"] = int(row[0]) + 1
     try:
-        renvelope = seal_envelope(
-            rprotected, payload, ctx.hierarchy.ed25519_private, recipients
+        persist_outgoing_in_txn(
+            ctx.conn, rprotected, payload, ctx.hierarchy.ed25519_private, recipients
         )
-    except SealingError as exc:
-        raise CliError(f"send_error", f"receipt seal failed ({exc.code}): {exc}")
-    rsealed = restricted_jcs(renvelope)
-    ctx.conn.execute(
-        "INSERT OR IGNORE INTO conversations (conversation_id) VALUES (?)",
-        (rid,),
-    )
-    ctx.conn.execute(
-        "INSERT OR IGNORE INTO threads (thread_id, conversation_id) "
-        "VALUES (?, ?)",
-        (rprotected["thread_id"], rid),
-    )
-    ctx.conn.execute(
-        "INSERT INTO events (event_id, relationship_id, conversation_id, "
-        "thread_id, sender, sender_seq, created_at, key_epoch, event_type, "
-        "replay_nonce, sealed_envelope) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            rprotected["event_id"],
-            rid,
-            rid,
-            rprotected["thread_id"],
-            ctx.identity_id,
-            rprotected["sender_seq"],
-            rprotected["created_at"],
-            key_epoch,
-            "receipt.accepted",
-            rprotected["replay_nonce"],
-            rsealed,
-        ),
-    )
-    ctx.conn.execute(
-        "INSERT INTO sender_sequence (relationship_id, sender, last_seq) "
-        "VALUES (?, ?, ?) ON CONFLICT(relationship_id, sender) "
-        "DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)",
-        (rid, ctx.identity_id, rprotected["sender_seq"]),
-    )
-    ctx.conn.execute(
-        "INSERT OR IGNORE INTO projection_queue (event_id, queued_at) "
-        "VALUES (?, ?)",
-        (rprotected["event_id"], now),
-    )
-    ctx.conn.execute(
-        "INSERT INTO scheduler_queue(scheduled_id, inner_event, deliver_at, "
-        "expires_at, state) VALUES (?, ?, ?, ?, 'scheduled')",
-        (rprotected["event_id"], rsealed, now, None),
-    )
+    except EventStoreError as exc:
+        # Same outcome code the receive commit used for storage conflicts
+        # before the unification; callers already map it.
+        raise CliError("integrity_conflict", f"storage conflict: {exc}")
 
 
 def _receive_object(
     ctx: Ctx, rid: str, object_name: str, data: bytes, acc: dict
 ) -> dict:
-    """Full per-object receive pipeline. Never raises."""
+    """Full per-object receive pipeline. Never raises.
+
+    Failure classification matters: hostile input (CliError, unexpected
+    bugs) becomes a terminal quarantine and the object is consumed, but
+    INFRASTRUCTURE failures (lock timeout after the 30s busy timeout,
+    disk I/O errors, full disk) mean the event was never stored. Those
+    return ``retry_pending`` so the watcher leaves the object on the relay
+    for a later poll instead of deleting a peer's event we never saved.
+    """
     try:
         return _receive_object_inner(ctx, rid, object_name, data, acc)
     except CliError as exc:
         return _quarantine_outcome(ctx, rid, object_name, exc.code, exc.message)
+    except (sqlite3.OperationalError, OSError) as exc:
+        # Never raised by validation: only the storage layer raises these.
+        # Redelivery is safe (duplicate resume path / _redrain_projection).
+        return {"outcome": "retry_pending", "surfaces": 0, "receipts_queued": 0}
     except Exception as exc:  # never let the watcher see a traceback
         return _quarantine_outcome(
             ctx, rid, object_name, "receive_error", f"{type(exc).__name__}: {exc}"
@@ -2306,7 +2455,11 @@ def _redrain_projection(ctx: Ctx, rid: str, event_id: str) -> None:
     event_row["payload"] = payload_row["payload"]
     event_row["reply_to"] = payload_row["reply_to"]
     try:
-        apply_event(ctx.conn, event_row)
+        # Atomic per-event projection (see the send path): a crash between
+        # the handler's statements must roll back, so redelivery re-applies
+        # the whole event instead of hitting a half-written marker.
+        with transaction(ctx.conn):
+            apply_event(ctx.conn, event_row)
     except ProjectionError as exc:
         with transaction(ctx.conn):
             quarantine_event(
@@ -2630,7 +2783,10 @@ def _receive_object_inner(
         raise CliError("integrity_conflict", f"storage conflict: {exc}")
     acc["surfaces"] += surfaces
     acc["receipts_queued"] += receipts_queued
-    # Incremental projection (outside the atomic commit, per the plan).
+    # Incremental projection (outside the atomic commit, per the plan), but
+    # itself atomic per event: a crash between the handler's statements
+    # rolls back, so redelivery re-applies the whole event and the
+    # projection converges exactly once.
     try:
         event_row = dict(
             ctx.conn.execute(
@@ -2639,7 +2795,8 @@ def _receive_object_inner(
         )
         event_row["payload"] = payload
         event_row["reply_to"] = protected.get("reply_to")
-        apply_event(ctx.conn, event_row)
+        with transaction(ctx.conn):
+            apply_event(ctx.conn, event_row)
     except ProjectionError as exc:
         # Quarantine insert and projection-queue delete must be atomic for
         # the same autocommit reason as the receive commit above.
@@ -2814,6 +2971,17 @@ def cmd_receive(args: argparse.Namespace) -> int:
             for key in totals:
                 totals[key] += int(result.get(key, 0) or 0)
         exit_code = _receive_exit_precedence(codes)
+        # Proactive retention: enforce plaintext-cache periods on every
+        # receive run. The purge function existed but no runtime path ever
+        # called it, so expired plaintext could linger indefinitely.
+        # Best-effort: a purge failure must never fail the receive run.
+        try:
+            from muse_agent_social.policy import purge_expired_plaintext_cache
+
+            purged = purge_expired_plaintext_cache(ctx.conn, ctx.state_dir)
+            totals["plaintext_purged"] = purged
+        except Exception:
+            pass
         if args.json:
             print(_canon_text({"relationships": per, "totals": totals}))
         else:

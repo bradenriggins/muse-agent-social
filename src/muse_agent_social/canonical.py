@@ -169,7 +169,7 @@ def strict_parse(data: bytes) -> Any:
 
     Raises:
         CanonicalizationError: "invalid_utf8", "duplicate_key",
-            "nan_or_infinity", or "invalid_json".
+            "nan_or_infinity", "too_deeply_nested", or "invalid_json".
         TypeError: if *data* is not bytes.
     """
     if not isinstance(data, bytes):
@@ -186,5 +186,10 @@ def strict_parse(data: bytes) -> Any:
         )
     except CanonicalizationError:
         raise
+    except RecursionError as exc:
+        # json raises RecursionError (not JSONDecodeError) on deeply nested
+        # input. Convert it so hostile nesting can never escape as an
+        # unhandled exception past callers' error handling.
+        raise CanonicalizationError("", "too_deeply_nested") from exc
     except json.JSONDecodeError as exc:
         raise CanonicalizationError("", "invalid_json") from exc

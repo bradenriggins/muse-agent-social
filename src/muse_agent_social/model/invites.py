@@ -103,6 +103,9 @@ COMMIT_VERSION = 1
 INVITE_LIFETIME = timedelta(minutes=15)
 MAX_CLOCK_SKEW = timedelta(minutes=5)
 INVITE_URI_SCHEME = "muse-agent-social://pair/v1#"
+# Invite files/URIs are small JSON documents; cap reads at the same 262144
+# byte ceiling every envelope path enforces.
+MAX_INVITE_FILE_BYTES = 262144
 
 _UUID4_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -399,8 +402,15 @@ def write_invite_file(invite: dict, path) -> None:
 
 def read_invite_file(path) -> dict:
     """Read and schema-validate an invite file. Returns the invite dict."""
+    # Bounded read: invite files are small JSON documents; never buffer an
+    # unbounded file into memory (every envelope path caps at 262144 bytes).
     with open(path, "rb") as fh:
-        raw = fh.read()
+        raw = fh.read(MAX_INVITE_FILE_BYTES + 1)
+    if len(raw) > MAX_INVITE_FILE_BYTES:
+        raise PairingError(
+            "invite_too_large",
+            f"invite file exceeds {MAX_INVITE_FILE_BYTES} bytes",
+        )
     try:
         invite = strict_parse(raw)
     except CanonicalizationError as exc:
@@ -840,8 +850,13 @@ def _commit_txn(
             "acceptance answers a different invite; invite burned",
         )
 
+    # Hoisted: the verified-fingerprint binding below needs the card before
+    # the liveness/signature checks that follow it.
+    acceptor_card = acceptance["acceptor_card"]
     vrow = conn.execute(
-        "SELECT human_approved FROM pairing_verifications WHERE invite_id=?",
+        "SELECT human_approved, inviter_card_fingerprint,"
+        " acceptor_card_fingerprint FROM pairing_verifications"
+        " WHERE invite_id=?",
         (invite_id,),
     ).fetchone()
     if vrow is None or not vrow["human_approved"]:
@@ -850,8 +865,23 @@ def _commit_txn(
             "commit requires a human-approved verification record; "
             "run the eight-word check first",
         )
+    # Bind the commit to the EXACT cards the human verified: the acceptance
+    # dict passed to commit is caller-supplied, so without this check a
+    # swapped acceptor card (different identity, valid signature) would
+    # pair the human's approval to an identity they never verified.
+    if card_fingerprint(acceptor_card) != vrow["acceptor_card_fingerprint"]:
+        raise _burn(
+            "acceptor_card_changed",
+            "acceptor card does not match the human-verified fingerprint; "
+            "invite burned",
+        )
+    if card_fingerprint(invite["inviter_card"]) != vrow["inviter_card_fingerprint"]:
+        raise _burn(
+            "inviter_card_changed",
+            "inviter card does not match the human-verified fingerprint; "
+            "invite burned",
+        )
 
-    acceptor_card = acceptance["acceptor_card"]
     _require_live_card(acceptor_card, now, "acceptor_card")
     _verify_signature(
         acceptor_card["identity_id"],
