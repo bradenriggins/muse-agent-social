@@ -29,6 +29,7 @@ import hmac
 import json
 import os
 import stat
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -45,6 +46,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from .canonical import restricted_jcs
+from ._keyfiles import KeyFileError, atomic_write_file, atomic_write_no_overwrite
 from .crypto.identity import (
     agreement_key_multibase_from_pubkey,
     b64url_decode,
@@ -70,6 +72,7 @@ from .compatibility.v01 import (
     vault_store,
     verify_v01,
     LegacyError,
+    VaultError,
 )
 from .store.db import open_db, utcnow
 from .store.migrations import SCHEMA_VERSION, migrate as migrate_schema
@@ -92,6 +95,8 @@ __all__ = [
     "rehearse",
     "mstate_get",
     "mstate_set",
+    "drain_open",
+    "v01_sends_allowed",
     "DRAIN_WINDOW",
 ]
 
@@ -272,7 +277,16 @@ STEPS: tuple[MigrationStep, ...] = (
 @dataclass
 class MigrationHooks:
     """Injected two-party and remote actions. None means the step raises
-    AwaitingPeer (live runs) unless the step has a local default."""
+    AwaitingPeer (live runs) unless the step has a local default.
+
+    ``set_v01_sends`` is REQUIRED wiring, not optional: it is the kill
+    switch that disables the operator's real v0.1 sender at cutover (G3).
+    The in-repo ``migration.v01_sends_allowed`` flag is advisory only, no
+    production v0.1 sender consults it. Without this hook, commit does not
+    stop legacy traffic. Wire it to whatever actually transmits v0.1
+    messages in the operator's v0.1 stack, or gate that sender on
+    ``v01_sends_allowed(state_dir)``.
+    """
 
     record_relay_head: Callable[[], str] | None = None
     drain_legacy_incoming: Callable[[], list[str]] | None = None
@@ -299,6 +313,13 @@ class MigrationContext:
     role: str = "initiator"  # or "peer"
     hooks: MigrationHooks = field(default_factory=MigrationHooks)
     legacy_snapshot: dict = field(default_factory=dict)  # config snapshot
+    legacy_backlog_max_age_days: float | None = None
+    # Max age, in days, for legacy backlog messages adapted during
+    # migration (rehearsal, stage verification). None means unlimited: the
+    # backlog is frozen history, not live traffic, so the normal v0.1
+    # 7-day live-drain age window does not apply to it (G4). The 7-day
+    # window still applies to the live drain adapter (_receive_v01), which
+    # always uses the default LegacyPolicy.
     identity_priv: Any = None  # optional Ed25519 migration identity key;
     # when None it is loaded from (or generated into) the keys directory,
     # so separate CLI invocations share one ceremony identity.
@@ -341,6 +362,53 @@ def _record_step(conn: Any, n: int, status: str, detail: Any = None) -> None:
     )
 
 
+def drain_open(conn: Any, now: datetime | None = None) -> bool:
+    """Derive whether v0.1 reads are currently allowed (G1).
+
+    The v0.1 read adapter gates on ``migration.legacy_read_open`` and, once
+    cutover has set one, on the ``migration.drain_until`` clock. Phases are
+    not consulted here: the two pieces of migration state are the single
+    source of truth, so the adapter honors the real phase names (staged,
+    verified, committed) instead of fictional ones, and never derives the
+    drain from the phase alone.
+    """
+    if not mstate_get(conn, "migration.legacy_read_open", False):
+        return False
+    drain_until = mstate_get(conn, "migration.drain_until")
+    if not drain_until:
+        return True
+    try:
+        until = datetime.strptime(
+            drain_until, "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    now = now or _v01_now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now < until
+
+
+def v01_sends_allowed(state_dir: str | Path) -> bool:
+    """Read the migration DB's v0.1 send kill switch (G3).
+
+    This is the DB-backed read of ``migration.v01_sends_allowed`` that any
+    v0.1 sender wrapper should consult before transmitting legacy traffic.
+    The in-repo flag is advisory on its own: the operator MUST also wire
+    ``MigrationHooks.set_v01_sends`` (or this helper) to their v0.1 sender,
+    otherwise a legacy sender can keep sending after commit with no one
+    stopping it. See docs/migration-v01.md.
+    with open_db(...) does NOT close the connection (sqlite3.Connection's
+    context manager only commits/rolls back), so this uses an explicit
+    try/finally.
+    """
+    conn = open_db(state_dir)
+    try:
+        return bool(mstate_get(conn, "migration.v01_sends_allowed", True))
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Migration ceremony keys and signed messages
 #
@@ -371,6 +439,25 @@ def _check_key_mode(path: Path) -> None:
             "key-file-mode",
             f"key file has wrong mode {oct(mode)}: {path}",
         )
+
+
+def _read_race_winner(path: Path) -> bytes | None:
+    """Read the winner's key file after losing a concurrent create race.
+
+    Mode-checks the winner's file before trusting it (a concurrent writer
+    that left a wrong-mode file is a hard error, not a silent adoption).
+    Returns None when the winner's file vanished between the failed
+    create and the read, so the caller retries the create instead of
+    crashing on a bare FileNotFoundError.
+    """
+    try:
+        _check_key_mode(path)
+    except FileNotFoundError:
+        return None
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
 
 
 def _migration_identity_priv(
@@ -407,18 +494,36 @@ def _migration_identity_priv(
             "identity-key-missing",
             f"no migration identity key at {path}; stage must run first",
         )
-    priv = Ed25519PrivateKey.generate()
-    raw = priv.private_bytes(
-        serialization.Encoding.Raw,
-        serialization.PrivateFormat.Raw,
-        serialization.NoEncryption(),
+    for _attempt in range(2):
+        priv = Ed25519PrivateKey.generate()
+        raw = priv.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+        try:
+            atomic_write_no_overwrite(path, raw, 0o600)
+        except FileExistsError:
+            # Lost the race with a concurrent `mas migrate stage`: adopt
+            # the winner's key instead of disagreeing about which key is
+            # on disk. The winner's file is mode-checked before trusting
+            # it; a vanished winner is retried once below.
+            raw = _read_race_winner(path)
+            if raw is None:
+                continue
+            if len(raw) != 32:
+                raise MigrationError(
+                    "identity-key-corrupt",
+                    f"identity key file has wrong length: {path}",
+                )
+            return Ed25519PrivateKey.from_private_bytes(raw)
+        except KeyFileError as exc:
+            raise MigrationError("identity-key-store", str(exc)) from exc
+        return priv
+    raise MigrationError(
+        "identity-key-store",
+        f"concurrent writers kept removing the key file: {path}",
     )
-    tmp = path.with_suffix(".tmp")
-    tmp.write_bytes(raw)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
-    os.chmod(path, 0o600)
-    return priv
 
 
 def _migration_identity_id(ctx: MigrationContext, create: bool = True) -> str:
@@ -504,13 +609,31 @@ def _relationship_priv(ctx: MigrationContext) -> X25519PrivateKey:
                 f"relationship key file has wrong length: {path}",
             )
         return X25519PrivateKey.from_private_bytes(raw)
-    priv = X25519PrivateKey.generate()
-    tmp = path.with_suffix(".tmp")
-    tmp.write_bytes(priv.private_bytes_raw())
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
-    os.chmod(path, 0o600)
-    return priv
+    for _attempt in range(2):
+        priv = X25519PrivateKey.generate()
+        try:
+            atomic_write_no_overwrite(path, priv.private_bytes_raw(), 0o600)
+        except FileExistsError:
+            # Lost the race with a concurrent `mas migrate stage`: adopt
+            # the winner's key instead of disagreeing about which key is
+            # on disk. The winner's file is mode-checked before trusting
+            # it; a vanished winner is retried once below.
+            raw = _read_race_winner(path)
+            if raw is None:
+                continue
+            if len(raw) != 32:
+                raise MigrationError(
+                    "relationship-key-corrupt",
+                    f"relationship key file has wrong length: {path}",
+                )
+            return X25519PrivateKey.from_private_bytes(raw)
+        except KeyFileError as exc:
+            raise MigrationError("relationship-key-store", str(exc)) from exc
+        return priv
+    raise MigrationError(
+        "relationship-key-store",
+        f"concurrent writers kept removing the key file: {path}",
+    )
 
 
 def _deploy_keypair(ctx: MigrationContext) -> str:
@@ -781,8 +904,7 @@ def create_rollback_bundle(ctx: MigrationContext, contents: dict) -> Path:
     os.chmod(backup_dir, 0o700)
     name = f"rollback-{utcnow().replace(':', '').replace('-', '')}.bin"
     path = backup_dir / name
-    path.write_bytes(blob)
-    os.chmod(path, 0o600)
+    atomic_write_file(path, blob, 0o600)
     _write_bundle_key(ctx, dek)
     return path
 
@@ -961,8 +1083,20 @@ def _default_drain_legacy(ctx: MigrationContext) -> list[str]:
 
 
 def _set_v01_sends(ctx: MigrationContext, allowed: bool) -> None:
+    # The DB flag is advisory on its own: without a wired set_v01_sends
+    # hook, no production v0.1 sender consults it, so commit would not
+    # actually stop legacy traffic (G3). Warn loudly so the operator
+    # notices the missing wiring before relying on the kill switch.
     if ctx.hooks.set_v01_sends is not None:
         ctx.hooks.set_v01_sends(allowed)
+    else:
+        print(
+            "WARNING: MigrationHooks.set_v01_sends is not wired to the "
+            "operator's v0.1 sender; the v0.1 send kill switch is advisory "
+            "only. Legacy sends will NOT be disabled at commit. See "
+            "docs/migration-v01.md.",
+            file=sys.stderr,
+        )
     # The flag is always recorded in migration state as the source of truth
     # for this side's cutover gating.
     conn = open_db(ctx.state_dir)
@@ -1039,7 +1173,18 @@ def stage(ctx: MigrationContext) -> dict:
             )
         except KeyError as exc:
             raise MigrationError("vault-missing", str(exc))
+        except (ValueError, VaultError) as exc:
+            # G17: a corrupt vault file (bad JSON, bad base64, wrong mode,
+            # tampered entry) must not escape as a raw exception.
+            raise MigrationError("vault-corrupt", str(exc)) from exc
         vault_store(ctx.vault_dir, ctx.pair_id, legacy_key.hex(), enc_key=vault_key)
+        # G17: stage() is retryable, but create_rollback_bundle names each
+        # bundle by timestamp and overwrites the bundle DEK entry. Destroy
+        # the previous bundle first, or the old file stays on disk forever
+        # undecryptable (its DEK is gone).
+        old_bundle = mstate_get(conn, "migration.bundle_path")
+        if old_bundle:
+            destroy_rollback_bundle(old_bundle)
         bundle_contents = {
             "pair_id": ctx.pair_id,
             "legacy_key_hex": legacy_key.hex(),
@@ -1216,6 +1361,10 @@ def verify(ctx: MigrationContext) -> dict:
             "migration.dual_read",
             {"v01_read": True, "v02_write": True, "at": utcnow()},
         )
+        # G1: dual-read means the v0.1 read adapter is open from here until
+        # observe() closes it after the drain expires. The adapter derives
+        # this from drain_open(), never from the phase name.
+        mstate_set(conn, "migration.legacy_read_open", True)
         mstate_set(conn, "migration.ready.my", my_ready)
         mstate_set(conn, "migration.ready.peer", peer_ready)
         _record_step(conn, 7, "ok", {"v02_write": True})
@@ -1391,18 +1540,34 @@ def _fmt_ts(dt: datetime) -> str:
 
 
 def _queue_depths(conn: Any) -> dict[str, int]:
+    # G2: scheduler_queue keeps historical released/canceled rows, so only
+    # rows still in 'scheduled' state count as pending. projection_queue
+    # rows are acknowledged (deleted) on successful projection (G15), so any
+    # remaining row is unprojected work. receipt_queue and surface_queue are
+    # production outputs: reported for information, never gated on.
     depths = {}
-    for table in (
-        "projection_queue",
-        "receipt_queue",
-        "surface_queue",
-        "scheduler_queue",
-    ):
+    for table in ("projection_queue", "scheduler_queue"):
+        where = "" if table == "projection_queue" else " WHERE state='scheduled'"
         try:
-            depths[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            depths[table] = conn.execute(
+                f"SELECT COUNT(*) FROM {table}" + where
+            ).fetchone()[0]
         except Exception:  # noqa: BLE001
             depths[table] = -1
+    for table in ("receipt_queue", "surface_queue"):
+        try:
+            depths[table + "_total"] = conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+        except Exception:  # noqa: BLE001
+            depths[table + "_total"] = -1
     return depths
+
+
+def _pending_depths(conn: Any) -> dict[str, int]:
+    """Depths that gate observe() completion: pending work only."""
+    depths = _queue_depths(conn)
+    return {t: depths[t] for t in ("projection_queue", "scheduler_queue")}
 
 
 def observe(ctx: MigrationContext) -> dict:
@@ -1450,22 +1615,26 @@ def observe(ctx: MigrationContext) -> dict:
             return report
 
         # Drain expired: completion gates. Refuse to mark complete while any
-        # retry queue is non-empty or its depth cannot be verified.
-        unknown = [t for t, d in depths.items() if d < 0]
+        # pending work remains or its depth cannot be verified. The
+        # receipt_queue/surface_queue totals in depths are report-only
+        # (production outputs, not retry queues).
+        pending = _pending_depths(conn)
+        unknown = [t for t, d in pending.items() if d < 0]
         if unknown:
             report["gate"] = "queues-unverifiable"
             mstate_set(conn, "migration.observe_report", report)
             raise MigrationError(
                 "observe-queues-unverifiable",
-                "could not read retry queue depths: " + ",".join(sorted(unknown)),
+                "could not read pending work depths: "
+                + ",".join(sorted(unknown)),
             )
-        nonempty = {t: d for t, d in depths.items() if d != 0}
+        nonempty = {t: d for t, d in pending.items() if d != 0}
         if nonempty:
             report["gate"] = "queues-nonempty"
             mstate_set(conn, "migration.observe_report", report)
             raise MigrationError(
                 "observe-queues-nonempty",
-                "retry queues are not empty: "
+                "pending work remains: "
                 + ", ".join(f"{t}={d}" for t, d in sorted(nonempty.items())),
             )
 
@@ -1606,6 +1775,7 @@ def _rehearsal_hooks(
     v01_sends_flag: dict,
     conn_factory: Callable[[], Any],
     relationship_id: str,
+    backlog_max_age_days: float | None = None,
 ) -> MigrationHooks:
     """In-memory two-party fakes: both sides are simulated in-process.
 
@@ -1708,6 +1878,15 @@ def _rehearsal_hooks(
                 expected_sender=sender,
                 my_agent_id=recipient,
                 replay_store=MemoryReplayStore(),
+                # G4: the backlog is frozen history, not live traffic, so
+                # the 7-day live-drain window does not apply here. None
+                # (the MigrationContext default) means no age limit; an
+                # operator may tighten it with legacy_backlog_max_age_days.
+                max_age_days=(
+                    float("inf")
+                    if backlog_max_age_days is None
+                    else backlog_max_age_days
+                ),
             )
             assigner = SeqAssigner()
             adapted = 0
@@ -1825,7 +2004,9 @@ def rehearse(work_root: str | Path) -> dict:
             "backlog": backlog,
         }
 
-    def make_ctx(p: dict, v01_sends_flag: dict) -> MigrationContext:
+    def make_ctx(
+        p: dict, v01_sends_flag: dict, backlog_max_age_days: float | None = None
+    ) -> MigrationContext:
         def conn_factory() -> Any:
             conn = open_db(p["state_dir"])
             migrate_schema(conn)
@@ -1840,6 +2021,7 @@ def rehearse(work_root: str | Path) -> dict:
             v01_sends_flag,
             conn_factory,
             "rel-" + p["pair_id"],
+            backlog_max_age_days=backlog_max_age_days,
         )
         return MigrationContext(
             state_dir=p["state_dir"],
@@ -1851,6 +2033,7 @@ def rehearse(work_root: str | Path) -> dict:
             role="initiator",
             hooks=hooks,
             legacy_snapshot={"relay_repo": "rehearsal-relay"},
+            legacy_backlog_max_age_days=backlog_max_age_days,
         )
 
     # --- Scenario A: rollback before commit ---

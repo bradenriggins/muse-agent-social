@@ -66,6 +66,15 @@ class CliTest(unittest.TestCase):
         code, out, err = run_cli(self.a, "pair", "invite", "--out", str(invite))
         self.assertEqual(code, 0, err)
         accept = self.root / "accept.json"
+        # Accept is a two-run sticky flow: run 1 displays the verification
+        # phrase and records it; run 2 confirms the human compared it.
+        code, out, err = run_cli(
+            self.b, "pair", "accept",
+            "--invite-file", str(invite),
+            "--out", str(accept),
+        )
+        self.assertEqual(code, 1, err)
+        self.assertIn("phrase_confirmation_required", err)
         code, out, err = run_cli(
             self.b, "pair", "accept",
             "--invite-file", str(invite),
@@ -74,6 +83,17 @@ class CliTest(unittest.TestCase):
         )
         self.assertEqual(code, 0, err)
         commit = self.root / "commit.json"
+        # Commit has the same two-run sticky phrase flow.
+        code, out, err = run_cli(
+            self.a, "pair", "commit",
+            "--acceptance-file", str(accept),
+            "--relay", "https://example.com/relay",
+            "--transport", "local",
+            "--local-relay-dir", str(self.relay),
+            "--out", str(commit),
+        )
+        self.assertEqual(code, 1, err)
+        self.assertIn("phrase_confirmation_required", err)
         code, out, err = run_cli(
             self.a, "pair", "commit",
             "--acceptance-file", str(accept),

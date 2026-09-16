@@ -293,3 +293,142 @@ def test_connect_refuses_non_wal_mode(tmp_path, monkeypatch):
     with pytest.raises(dbmod.DbError) as excinfo:
         dbmod.connect(tmp_path / "no-wal.db")
     assert "WAL" in str(excinfo.value)
+
+
+def test_synchronous_is_full_not_normal(tmp_path):
+    """V8: PRAGMA synchronous must be FULL. With NORMAL, a power loss can
+    roll back recently committed transactions while the fsynced key files
+    and watcher state survive, silently un-committing accepted events."""
+    conn = db.connect(tmp_path / "sync.db")
+    try:
+        mode = conn.execute("PRAGMA synchronous").fetchone()[0]
+        assert mode == 2, f"expected FULL (2), got {mode}"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for finding D11 (labeled database-open failures).
+# ---------------------------------------------------------------------------
+
+
+def _no_wal_proxy(monkeypatch):
+    """Simulate a filesystem where WAL cannot be engaged."""
+    from muse_agent_social.store import db as dbmod
+
+    real_connect = sqlite3.connect
+
+    class _ConnProxy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            if isinstance(sql, str) and sql.strip().lower().startswith(
+                "pragma journal_mode"
+            ):
+                return self._conn.execute("PRAGMA journal_mode=DELETE;")
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def close(self):
+            return self._conn.close()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def _fake_connect(*args, **kwargs):
+        return _ConnProxy(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", _fake_connect)
+    return dbmod
+
+
+def test_connect_no_wal_fallback_warns_loudly(tmp_path, monkeypatch, capsys):
+    """D11: MAS_ALLOW_NO_WAL=1 lets connect() proceed without WAL, but a
+    loud stderr warning is emitted (never a silent fallback)."""
+    dbmod = _no_wal_proxy(monkeypatch)
+    monkeypatch.setenv("MAS_ALLOW_NO_WAL", "1")
+    conn = dbmod.connect(tmp_path / "no-wal.db")
+    try:
+        err = capsys.readouterr().err
+        assert "MAS_ALLOW_NO_WAL" in err
+        assert "WARNING" in err
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert mode.lower() != "wal"
+    finally:
+        conn.close()
+
+
+def test_connect_no_wal_env_var_values(tmp_path, monkeypatch, capsys):
+    """D11: the no-WAL override accepts 1/true/yes (case-insensitive)."""
+    for value in ("1", "true", "yes", "True", "YES"):
+        dbmod = _no_wal_proxy(monkeypatch)
+        monkeypatch.setenv("MAS_ALLOW_NO_WAL", value)
+        conn = dbmod.connect(tmp_path / f"no-wal-{value}.db")
+        conn.close()
+        assert "MAS_ALLOW_NO_WAL" in capsys.readouterr().err
+
+
+def test_connect_corrupt_db_raises_labeled_error(tmp_path):
+    """D11: a corrupt database file raises CorruptDatabaseError with
+    recovery guidance, not a raw sqlite3.DatabaseError."""
+    from muse_agent_social.store import db as dbmod
+
+    path = tmp_path / "corrupt.db"
+    conn = dbmod.connect(path)
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    for i in range(50):
+        conn.execute("INSERT INTO t VALUES (?, ?)", (i, "x" * 200))
+    conn.commit()
+    conn.close()
+    # Corrupt data pages in the middle of the file.
+    data = bytearray(path.read_bytes())
+    assert len(data) > 8192
+    for i in range(4096, 8192):
+        data[i] = (i * 7) % 256
+    path.write_bytes(bytes(data))
+    with pytest.raises(dbmod.CorruptDatabaseError) as excinfo:
+        dbmod.connect(path)
+    assert "database-corrupt" in str(excinfo.value)
+    assert "backup" in str(excinfo.value)
+
+
+def test_connect_closes_connection_on_setup_failure(tmp_path, monkeypatch):
+    """D11: when a setup PRAGMA fails, the half-open connection is closed,
+    never leaked."""
+    from muse_agent_social.store import db as dbmod
+
+    real_connect = sqlite3.connect
+    closed = []
+
+    class _ConnProxy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            if isinstance(sql, str) and "foreign_keys" in sql:
+                raise sqlite3.DatabaseError("simulated PRAGMA failure")
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def close(self):
+            closed.append(True)
+            return self._conn.close()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def _fake_connect(*args, **kwargs):
+        return _ConnProxy(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", _fake_connect)
+    with pytest.raises(dbmod.CorruptDatabaseError):
+        dbmod.connect(tmp_path / "setup-fail.db")
+    assert closed, "half-open connection was not closed"
+
+
+def test_corrupt_database_error_is_db_error():
+    """D11: the labeled errors are DbErrors so existing handlers catch
+    them."""
+    from muse_agent_social.store import db as dbmod
+
+    assert issubclass(dbmod.CorruptDatabaseError, dbmod.DbError)
+    assert issubclass(dbmod.SchemaTooNewError, dbmod.DbError)

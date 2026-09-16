@@ -52,7 +52,11 @@ CAPS = ["events/0.2", "threads/1"]
 
 
 def make_db():
-    conn = sqlite3.connect(":memory:")
+    # Production-like autocommit: store.db.connect uses
+    # sqlite3.connect(..., isolation_level=None). The legacy default ("")
+    # leaves implicit transactions open after seed INSERTs, which breaks
+    # BEGIN IMMEDIATE in ways production never sees.
+    conn = sqlite3.connect(":memory:", isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON;")
     migrate(conn)
@@ -205,6 +209,7 @@ def test_full_rotation_round_trip(tmp_path):
     # 5. Commit: the peer stops writing old wraps.
     commit = ma.build_commit_payload(rid, now=T0)
     assert commit == {"epoch": 2}
+    ma.mark_committed(rid, now=T0)
     assert keyrow(ctx["conn_a"], rid, 2)["state"] == "active"
     mi.on_commit(rid, commit, now=T0)
     assert rotation_row(ctx["conn_i"], rid, 2)["phase"] == "committed"
@@ -336,6 +341,7 @@ def _run_to_commit(ctx, mi, ma, now=T0):
     confirm = mi.confirm_rotation(rid, now=now)
     ma.on_confirm(rid, confirm, now=now)
     commit = ma.build_commit_payload(rid, now=now)
+    ma.mark_committed(rid, now=now)
     mi.on_commit(rid, commit, now=now)
     return begun["prepare"], ack, confirm, commit
 
@@ -375,6 +381,7 @@ def test_conflicting_prepares_quarantine_and_resolve(tmp_path):
     confirm = ma.confirm_rotation(rid, now=T0)
     mi.on_confirm(rid, confirm, now=T0)
     commit = mi.build_commit_payload(rid, now=T0)
+    mi.mark_committed(rid, now=T0)
     ma.on_commit(rid, commit, now=T0)
     assert rotation_row(ctx["conn_a"], rid, 2)["phase"] == "committed"
     assert rotation_row(ctx["conn_i"], rid, 2)["phase"] == "committed"
@@ -554,3 +561,43 @@ def test_identity_rotation_rejects_key_mismatch():
             card, other_ident.ed25519_private, Ed25519PrivateKey.generate(), T0
         )
     assert excinfo.value.code == "key_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Regression test for finding D6 (quarantine survives failed resolution).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_theirs_failed_prepare_keeps_quarantine_retryable(tmp_path):
+    """D6: when on_prepare fails AFTER the candidate discard (human chose
+    "theirs"), the quarantine row is not deleted: the payload stays
+    retryable and a later resolve succeeds."""
+    ctx, mi, ma = fresh_keys(tmp_path)
+    rid = ctx["rid"]
+    event_a = str(uuid.uuid4())
+    event_b = str(uuid.uuid4())
+    begun_a = mi.begin_rotation(rid, now=T0, prepare_event_id=event_a)
+    begun_b = ma.begin_rotation(rid, now=T0, prepare_event_id=event_b)
+    # A's prepare arrives at B: conflict, quarantined.
+    with pytest.raises(RotationError) as excinfo:
+        ma.on_prepare(rid, begun_a["prepare"], event_a, now=T0)
+    assert excinfo.value.code == "conflicting_prepare"
+    assert len(ma.list_quarantine(rid)) == 1
+
+    # The human picks A's key, but the resolution runs after A's prepare
+    # deadline: the candidate is discarded first, then on_prepare fails.
+    late = T0 + timedelta(hours=25)
+    with pytest.raises(RotationError) as excinfo:
+        ma.resolve_quarantine(rid, 0, "theirs", now=late)
+    assert excinfo.value.code == "prepare_expired"
+    # The human's discard stands...
+    assert rotation_row(ctx["conn_a"], rid, 2)["phase"] == "discarded"
+    assert keyrow(ctx["conn_a"], rid, 2) is None
+    # ...but the quarantine row survives for retry.
+    assert len(ma.list_quarantine(rid)) == 1
+
+    # Retry within the deadline: the ack succeeds and the row is removed.
+    ack = ma.resolve_quarantine(rid, 0, "theirs", now=T0)
+    assert ack["epoch"] == 2
+    assert len(ma.list_quarantine(rid)) == 0
+    assert keyrow(ctx["conn_a"], rid, 2)["private_key_ref"] == "peer"

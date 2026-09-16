@@ -186,7 +186,10 @@ def test_crash_between_event_and_projection_queue_leaves_no_partial_state(
     assert _count(conn, "events", "WHERE event_type = 'message.created'") == 1
     assert _count(conn, "events", "WHERE event_type = 'receipt.accepted'") == 1
     assert _count(conn, "messages") == 1
-    assert _count(conn, "projection_queue") == 2
+    # G15: the message's queue row is acknowledged (deleted) in the same
+    # transaction as its successful inline projection; the receipt's row
+    # stays queued for the projection worker.
+    assert _count(conn, "projection_queue") == 1
     assert _count(conn, "surface_queue") == 1
 
     # A second redelivery is byte-identical dedup, not a second surface.

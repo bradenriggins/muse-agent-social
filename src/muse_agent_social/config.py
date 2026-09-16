@@ -93,6 +93,12 @@ def save_config(path: str | os.PathLike[str], obj: dict[str, Any]) -> None:
 
     Raises ValueError when obj contains a forbidden secret-bearing key or
     a value type the restricted YAML writer cannot represent.
+
+    The parent directory is created with a best-effort 0700 mode, but
+    config.yaml holds no secrets (references only), so on filesystems
+    without POSIX permission semantics the mode requirement degrades to a
+    loud stderr warning instead of a hard error. Key material always keeps
+    the hard error (see _keyfiles._secure_parent_dir strict mode).
     """
     if not isinstance(obj, dict):
         raise ValueError("config must be a mapping")
@@ -102,9 +108,11 @@ def save_config(path: str | os.PathLike[str], obj: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Write atomically with owner-only permissions: config lives next to
     # key material and must never be left world-readable or half-written.
+    # strict=False: warn loudly instead of raising where the filesystem
+    # cannot express the 0700 parent-dir mode.
     from ._keyfiles import atomic_write_file
 
-    atomic_write_file(path, text.encode("utf-8"), 0o600)
+    atomic_write_file(path, text.encode("utf-8"), 0o600, strict=False)
 
 
 def _validate_config(obj: dict[str, Any]) -> None:
@@ -124,13 +132,16 @@ def _assert_no_secrets(obj: Any, trail: str = "") -> None:
         for key, value in obj.items():
             name = str(key).lower()
             location = f"{trail}.{key}" if trail else str(key)
-            if name.endswith(("_ref", "_path")):
-                continue
-            if name in _SECRET_KEY_DENYLIST or name.endswith(_SECRET_KEY_SUFFIXES):
-                raise ValueError(
-                    f"config must not contain secret values inline "
-                    f"(offending key: {location}); store a reference or path instead"
-                )
+            # G11: _ref/_path keys hold scalar references/paths, so the
+            # key-name check is skipped for them, but nested values are
+            # ALWAYS still scanned. The old code `continue`d past the
+            # recursion too, so {"token_ref": {"token": "..."}} passed.
+            if not name.endswith(("_ref", "_path")):
+                if name in _SECRET_KEY_DENYLIST or name.endswith(_SECRET_KEY_SUFFIXES):
+                    raise ValueError(
+                        f"config must not contain secret values inline "
+                        f"(offending key: {location}); store a reference or path instead"
+                    )
             _assert_no_secrets(value, location)
     elif isinstance(obj, list):
         for index, value in enumerate(obj):

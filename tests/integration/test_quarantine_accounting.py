@@ -64,21 +64,29 @@ def ctx(tmp_path):
     return types.SimpleNamespace(
         conn=conn, state_dir=state_dir, keys_dir=state_dir / "keys",
         alice=alice, bob=bob, rid=rid, conv=conv,
+        identity_id=bob["identity_id"],
     )
 
 
 def _forged_epoch_envelope(ctx, key_epoch: int, seq: int) -> bytes:
-    """A schema-valid, correctly signed envelope whose only lie is the
-    unknown key_epoch (plus fresh ids so each forgery is distinct)."""
-    envelope, _ = make_sealed(
+    """A schema-valid, correctly signed AND correctly sealed envelope whose
+    only lie is the unknown key_epoch (plus fresh ids so each forgery is
+    distinct).
+
+    The epoch lie must be sealed in at build time: the seal binds the
+    protected headers, so mutating key_epoch after sealing breaks the
+    seal's integrity (tampered_wrap) instead of exercising the epoch
+    gate. A real hostile peer seals self-consistently and lies in the
+    epoch claim, which is what reaches the gate.
+    """
+    envelope, raw = make_sealed(
         ctx.alice, ctx.bob, ctx.rid, ctx.conv,
         "message.created", {"body": "forged epoch", "format": "plain"},
-        seq=seq,
+        seq=seq, key_epoch=key_epoch,
+        event_id=str(uuid.uuid4()),
+        replay_nonce=b64url_encode(os.urandom(16)),
     )
-    envelope["protected"]["key_epoch"] = key_epoch
-    envelope["protected"]["event_id"] = str(uuid.uuid4())
-    envelope["protected"]["replay_nonce"] = b64url_encode(os.urandom(16))
-    return _resign(envelope, ctx.alice["ed_priv"])
+    return raw
 
 
 def test_forged_epoch_flood_keeps_quarantine_bounded(ctx):

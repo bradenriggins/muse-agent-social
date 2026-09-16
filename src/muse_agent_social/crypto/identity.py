@@ -105,13 +105,18 @@ def derive_identity_hierarchy(master_seed: bytes) -> "IdentityHierarchy":
             f"master seed must be exactly {_MASTER_SEED_LEN} bytes, got {len(seed)}"
         )
 
-    prk = _hkdf_extract(_DOMAIN, seed)
+    # G10: prk lives in a mutable bytearray from creation so the finally
+    # block wipes the actual buffer. (The old code stored immutable bytes
+    # and zeroed a throwaway bytearray(prk) copy, leaving the real PRK in
+    # memory.) bytes(prk) is passed to HKDF-Expand; the buffer itself is
+    # never copied elsewhere.
+    prk = bytearray(_hkdf_extract(_DOMAIN, seed))
     # Intermediate derivation outputs live in mutable bytearrays and are
     # zeroed as soon as the key objects are constructed: raw key material is
     # never retained on the process-lifetime hierarchy object.
-    ed25519_seed = bytearray(_hkdf_expand(prk, _INFO_ID_SIGNING))
-    x25519_bootstrap = bytearray(_hkdf_expand(prk, _INFO_KEY_AGREEMENT))
-    local_store_key = _hkdf_expand(prk, _INFO_LOCAL_STORE)
+    ed25519_seed = bytearray(_hkdf_expand(bytes(prk), _INFO_ID_SIGNING))
+    x25519_bootstrap = bytearray(_hkdf_expand(bytes(prk), _INFO_KEY_AGREEMENT))
+    local_store_key = _hkdf_expand(bytes(prk), _INFO_LOCAL_STORE)
 
     try:
         ed25519_private = Ed25519PrivateKey.from_private_bytes(bytes(ed25519_seed))
@@ -119,7 +124,7 @@ def derive_identity_hierarchy(master_seed: bytes) -> "IdentityHierarchy":
     finally:
         _zero(ed25519_seed)
         _zero(x25519_bootstrap)
-        _zero(bytearray(prk))
+        _zero(prk)
 
     ed25519_public_bytes = ed25519_private.public_key().public_bytes_raw()
     x25519_public_bytes = x25519_private.public_key().public_bytes_raw()

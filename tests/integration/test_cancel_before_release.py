@@ -77,12 +77,27 @@ class CancelBeforeReleaseTest(unittest.TestCase):
         code, out, err = run_cli(self.a, "pair", "invite", "--out", str(invite))
         self.assertEqual(code, 0, err)
         accept = self.root / "accept.json"
+        # G6 two-run phrase flow: run 1 displays the phrase and refuses.
+        code, out, err = run_cli(
+            self.b, "pair", "accept", "--invite-file", str(invite),
+            "--out", str(accept),
+        )
+        self.assertNotEqual(code, 0, err)
+        self.assertEqual(len(out.split()), 8)
         code, out, err = run_cli(
             self.b, "pair", "accept", "--invite-file", str(invite),
             "--i-compared-phrase", "--out", str(accept),
         )
         self.assertEqual(code, 0, err)
         commit = self.root / "commit.json"
+        code, out, err = run_cli(
+            self.a, "pair", "commit", "--acceptance-file", str(accept),
+            "--relay", "https://example.com/relay", "--transport", "local",
+            "--local-relay-dir", str(self.relay),
+            "--out", str(commit),
+        )
+        self.assertNotEqual(code, 0, err)
+        self.assertEqual(len(out.split()), 8)
         code, out, err = run_cli(
             self.a, "pair", "commit", "--acceptance-file", str(accept),
             "--relay", "https://example.com/relay", "--transport", "local",

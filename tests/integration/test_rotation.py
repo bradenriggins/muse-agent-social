@@ -74,6 +74,7 @@ def _full_handshake(two_sides):
     confirm = mgr_b.confirm_rotation(rid, now=t0)
     mgr_a.on_confirm(rid, confirm, now=t0)
     commit = mgr_a.build_commit_payload(rid, now=t0)
+    mgr_a.mark_committed(rid, now=t0)
     mgr_b.on_commit(rid, commit, now=t0)
     return begun
 

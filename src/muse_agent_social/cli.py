@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import errno
 import hashlib
 import json
 import os
@@ -39,7 +40,7 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -54,7 +55,14 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 
 from . import __version__
-from ._keyfiles import store_private_key
+from ._keyfiles import (
+    KeyFileError,
+    atomic_write_file,
+    atomic_write_pair,
+    delete_private_key,
+    recover_pending_pair,
+    store_private_key,
+)
 from .canonical import CanonicalizationError, restricted_jcs, strict_parse
 from .compatibility.v01 import (
     LegacyError,
@@ -79,6 +87,7 @@ from .crypto.identity import (
     store_master_seed,
 )
 from .crypto.rotation import (
+    OLD_KEY_RETENTION,
     ConfirmRejected,
     IdentityRotationError,
     NoAckTimeout,
@@ -92,6 +101,7 @@ from .migrate import (
     MigrationError,
     ceremony_vault_key,
     cutover,
+    drain_open,
     mstate_get,
     mstate_set,
     observe,
@@ -115,8 +125,10 @@ from .model.events import (
     validate_reply,
 )
 from .model.invites import (
+    MAX_INVITE_FILE_BYTES,
     PairingError,
     commit_pairing,
+    confirm_verification,
     create_acceptance,
     create_invite,
     generate_deploy_keypair,
@@ -124,12 +136,14 @@ from .model.invites import (
     get_relationship,
     ingest_commit,
     invite_uri,
+    load_or_generate_deploy_keypair,
     mark_active,
     pairing_phrase,
+    parse_invite_json,
     parse_invite_uri,
-    read_invite_file,
+    preview_invite,
+    record_displayed_phrase,
     record_verification,
-    validate_invite,
 )
 from .policy.delivery import (
     DELIVERY_MODES,
@@ -147,11 +161,27 @@ from .policy.delivery import (
 from .policy.limits import (
     ACCEPT_WINDOW_DAYS,
     FUTURE_TOLERANCE_SECONDS,
+    INGRESS_MAX_EVENTS_PER_DAY,
+    MAX_CONSECUTIVE_RECEIVE_FAILURES,
     MAX_ENVELOPE_BYTES,
+    MAX_SEQ_GAP,
+    MAX_UNKNOWN_EPOCH_SIGHTINGS,
+    PRIOR_IDENTITY_GRACE_SECONDS,
+    RECEIVE_QUARANTINE_MAX_PER_RELATIONSHIP,
+    RECEIVE_QUARANTINE_TTL_DAYS,
     add_seconds,
+    parse_canonical_utc,
 )
 from .transports.base import OBJECT_MAX_BYTES
-from .store.db import open_db, transaction, utcnow
+from .store.db import (
+    CorruptDatabaseError,
+    SchemaTooNewError,
+    DbError,
+    default_db_path,
+    open_db,
+    transaction,
+    utcnow,
+)
 from .store.migrations import migrate
 from .store.projections import (
     ProjectionError,
@@ -243,6 +273,11 @@ def _new_uuid() -> str:
 _CONFIG_NAME = "config.yaml"
 _CARD_NAME = "agent-card.json"
 _MASTER_SEED_NAME = "master.seed"
+# Journal for the atomic seed+card pair publish in _rotate_identity. When a
+# crash interrupts the pair, the next Ctx load re-drives it (see
+# _keyfiles.recover_pending_pair) so the identity converges instead of
+# staying torn.
+_PENDING_IDENTITY_PAIR = ".pending-identity-pair.json"
 
 _CLI_DDL = """
 CREATE TABLE IF NOT EXISTS relay_config (
@@ -267,6 +302,21 @@ CREATE TABLE IF NOT EXISTS sent_objects (
     scheduled_id  TEXT PRIMARY KEY,
     object_name   TEXT NOT NULL,
     queued_at     TEXT NOT NULL
+);
+-- Per-object retryable-failure accounting for the receive path. A
+-- retry_pending outcome is not free: each re-sighting of the same object
+-- for the same reason is counted here, so storms (unknown future epochs)
+-- and sick storage (transient errors) terminate in a quarantine instead
+-- of draining availability forever. Rows are cleared when the object
+-- reaches a terminal outcome.
+CREATE TABLE IF NOT EXISTS receive_retry_state (
+    relationship_id TEXT NOT NULL,
+    object_name     TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    sightings       INTEGER NOT NULL DEFAULT 0,
+    first_seen_at   TEXT NOT NULL,
+    last_seen_at    TEXT NOT NULL,
+    PRIMARY KEY (relationship_id, object_name, reason)
 );
 """
 
@@ -311,6 +361,17 @@ class Ctx:
             self.config = load_config(config_path)
         except Exception as exc:
             raise CliError("config_error", f"cannot load config: {exc}")
+        # Finish an identity seed/card pair publish interrupted by a crash.
+        # This must run before the seed and card are read: it converges a
+        # torn pair instead of letting the consistency check below fail.
+        try:
+            if recover_pending_pair(state_dir / _PENDING_IDENTITY_PAIR):
+                print(
+                    "recovered an interrupted identity seed/card publish",
+                    file=sys.stderr,
+                )
+        except KeyFileError as exc:
+            raise CliError("identity_error", str(exc)) from exc
         identity_ref = self.config.get("identity_ref") or {}
         seed_rel = identity_ref.get("master_seed_path") or f"keys/{_MASTER_SEED_NAME}"
         card_rel = identity_ref.get("card_path") or _CARD_NAME
@@ -334,19 +395,64 @@ class Ctx:
             raise CliError("config_error", f"cannot load agent card: {exc}")
         _check_card(self.card, "local agent")
         self.identity_id = self.hierarchy.identity_id
-        self.conn = open_db(state_dir)
-        migrate(self.conn)
-        migrate_projections(self.conn)
-        from .transports.github import ensure_transport_tables
+        # Fail closed on a torn identity: the card must describe the same
+        # identity the master seed derives. Without this, a crash between
+        # the seed and card writes (or manual tampering) would silently run
+        # the agent as the wrong identity.
+        card_identity_id = self.card.get("identity_id")
+        if card_identity_id != self.hierarchy.identity_id:
+            raise CliError(
+                "identity_mismatch",
+                f"agent card identity_id {card_identity_id!r} does not match "
+                f"the identity derived from the master seed "
+                f"({self.hierarchy.identity_id!r}); refusing to run with a "
+                "torn identity (after an interrupted rotation, restore the "
+                ".backup-* seed and card, or re-run the rotation)",
+            )
+        db_path = default_db_path(state_dir)
+        if not db_path.exists() or db_path.stat().st_size == 0:
+            raise CliError(
+                "state_error",
+                f"installation at {state_dir} has config but no database "
+                f"({db_path}); refusing to silently start with an empty "
+                "database and lose all relationship state (restore the "
+                "database from backup, or remove the installation and "
+                "re-run 'mas init')",
+            )
+        try:
+            self.conn = open_db(state_dir)
+        except CorruptDatabaseError as exc:
+            raise CliError("corrupt_database", str(exc)) from exc
+        except (DbError, sqlite3.DatabaseError) as exc:
+            raise CliError(
+                "db_error", f"cannot open database at {db_path}: {exc}"
+            ) from exc
+        try:
+            migrate(self.conn)
+            migrate_projections(self.conn)
+            from .transports.github import ensure_transport_tables
 
-        ensure_transport_tables(self.conn)
-        from .model.invites import _ensure_pairing_tables
+            ensure_transport_tables(self.conn)
+            from .model.invites import _ensure_pairing_tables
 
-        _ensure_pairing_tables(self.conn)
-        from .crypto.rotation import _ensure_tables as _ensure_rotation_tables
+            _ensure_pairing_tables(self.conn)
+            from .crypto.rotation import (
+                _ensure_tables as _ensure_rotation_tables,
+            )
 
-        _ensure_rotation_tables(self.conn)
-        _ensure_cli_tables(self.conn)
+            _ensure_rotation_tables(self.conn)
+            _ensure_cli_tables(self.conn)
+        except SchemaTooNewError as exc:
+            self.conn.close()
+            raise CliError(
+                "schema_too_new",
+                f"{exc}; upgrade mas to open this database",
+            ) from exc
+        except (DbError, sqlite3.DatabaseError) as exc:
+            self.conn.close()
+            raise CliError(
+                "db_error", f"database setup failed: {exc}"
+            ) from exc
 
     def close(self) -> None:
         try:
@@ -383,12 +489,12 @@ class Ctx:
         return prow
 
 
-def _write_file_private(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+# NOTE: the legacy helpers _write_file_private / _atomic_write_bytes were
+# removed here. They did temp+rename with a predictable tmp name, no fsync,
+# and a chmod window. All private-key/seed writes MUST go through
+# muse_agent_social._keyfiles (atomic_write_no_overwrite / store_private_key
+# for keys, atomic_write_file for replaceable files); do not reintroduce a
+# local writer.
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +653,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         expires_at=add_seconds(now, 365 * 24 * 3600),
     )
     card_path = state_dir / _CARD_NAME
-    _write_file_private(card_path, (_canon_text(card) + "\n").encode("utf-8"))
+    atomic_write_file(
+        card_path, (_canon_text(card) + "\n").encode("utf-8"), 0o600
+    )
     save_config(
         state_dir / _CONFIG_NAME,
         {
@@ -576,12 +684,30 @@ def cmd_init(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _read_text_capped(path, cap: int, what: str) -> str:
+    """Read a text file with a hard byte cap (G9).
+
+    Never buffers an unbounded file into memory; oversized input is
+    rejected before parsing. Returns the decoded text.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(cap + 1)
+    except OSError as exc:
+        raise CliError("bad_args", f"cannot read {what} file: {exc}")
+    if len(raw) > cap:
+        raise CliError("bad_args", f"{what} file exceeds {cap} bytes")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CliError("bad_args", f"{what} file is not valid UTF-8: {exc}")
+
+
 def _load_invite_text(args: argparse.Namespace) -> str:
     if args.invite_file:
-        try:
-            return Path(args.invite_file).read_text(encoding="utf-8")
-        except OSError as exc:
-            raise CliError("bad_args", f"cannot read invite file: {exc}")
+        # G9: one bounded read path; the text is parsed once by the caller,
+        # never re-read from disk.
+        return _read_text_capped(args.invite_file, MAX_INVITE_FILE_BYTES, "invite")
     text = args.invite_text or ""
     if not text.strip():
         raise CliError("bad_args", "provide --invite-text or --invite-file")
@@ -632,7 +758,7 @@ def cmd_pair_invite(args: argparse.Namespace) -> int:
             policy,
         )
         eph_path = ctx.keys_dir / "invites" / invite["invite_id"] / "ephemeral.key"
-        _write_file_private(
+        store_private_key(
             eph_path,
             ephemeral.private_bytes(
                 serialization.Encoding.Raw,
@@ -668,10 +794,11 @@ def cmd_pair_accept(args: argparse.Namespace) -> int:
             stripped = text.strip()
             if stripped.startswith("muse-agent-social://"):
                 invite = parse_invite_uri(stripped)
-            elif args.invite_file:
-                invite = read_invite_file(args.invite_file)
             else:
-                invite = parse_invite_uri(stripped)
+                # G9: the text was already read once by _load_invite_text
+                # (bounded); parse it in memory instead of re-reading the
+                # file from disk.
+                invite = parse_invite_json(stripped)
         except (SchemaError, CanonicalizationError, ValueError, PairingError) as exc:
             raise CliError("pairing_error", f"cannot parse invite: {exc}")
         _preview_invite(invite, ctx)
@@ -768,9 +895,11 @@ def cmd_pair_accept(args: argparse.Namespace) -> int:
 
 
 def _read_json_file(path: str, what: str) -> dict:
+    # G9: bounded read; acceptance/commit files are untrusted input.
+    text = _read_text_capped(path, MAX_INVITE_FILE_BYTES, what)
     try:
-        obj = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        obj = json.loads(text)
+    except ValueError as exc:
         raise CliError("bad_args", f"cannot read {what} file: {exc}")
     if not isinstance(obj, dict):
         raise CliError("bad_args", f"{what} file must contain a JSON object")
@@ -896,6 +1025,12 @@ def _reset_invite_for_retry(conn, invite_id: str) -> None:
     single-use invite is still unspent and the human can retry.
     Burned (``canceled``), expired, or committed invites are never
     touched: those states are terminal decisions, not retryable errors.
+
+    NOTE (G8): this is only safe when the caller, not a concurrent actor,
+    owns the claim. The CLI commit path now claims atomically inside
+    ``commit_pairing(claim_invite=True)``, so it never calls this. It is
+    retained for the legacy ``validate_invite`` + ``commit_pairing()``
+    sequence, where the accepted-but-uncommitted window still exists.
     """
     from muse_agent_social.store.db import transaction
 
@@ -931,6 +1066,14 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
         acceptor_fp = card_fingerprint(acceptance["acceptor_card"])
         phrase = pairing_phrase(invite["inviter_card"], acceptance["acceptor_card"])
         if not args.i_compared_phrase:
+            # G6 run 1: record the displayed fingerprints WITHOUT approving.
+            # Run 2 must present the same fingerprints before approval flips.
+            try:
+                record_displayed_phrase(
+                    ctx.conn, invite_id, (inviter_fp, acceptor_fp)
+                )
+            except PairingError as exc:
+                raise CliError("pairing_error", f"{exc.code}: {exc}")
             print(" ".join(phrase), flush=True)
             print(
                 "compare all eight words with the acceptor out-of-band, then "
@@ -941,14 +1084,19 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
                 "phrase_confirmation_required",
                 "re-run with --i-compared-phrase after comparing the phrase",
             )
+        # G5: non-consuming prevalidation BEFORE any remote mutation, so an
+        # expired/canceled/tampered invite fails before a deploy key is
+        # registered. The invite is claimed atomically inside commit_pairing
+        # below (claim_invite=True), leaving no accepted-but-uncommitted
+        # window.
         try:
-            # Record the human-approved phrase comparison. The invite's
-            # one-use consumption (validate_invite) happens AFTER
-            # provisioning below: a provisioning failure must leave the
-            # invite in 'issued' so the human can retry without reissuing.
-            record_verification(
-                ctx.conn, invite_id, (inviter_fp, acceptor_fp), human_approved=True
-            )
+            preview_invite(ctx.conn, invite)
+        except PairingError as exc:
+            raise CliError("pairing_error", f"{exc.code}: {exc}")
+        # G6 run 2: the fingerprints must match the displayed record before
+        # approval flips to true.
+        try:
+            confirm_verification(ctx.conn, invite_id, (inviter_fp, acceptor_fp))
         except PairingError as exc:
             raise CliError("pairing_error", f"{exc.code}: {exc}")
         requested = invite.get("requested_capabilities") or []
@@ -987,6 +1135,23 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
         repo = None
         token = None
         registered: list = []
+
+        # G5: defined BEFORE the provisioning block that calls it: the
+        # except-ProvisioningError handler below invokes this on failure,
+        # so the def must have executed already or the call raises
+        # NameError instead of cleaning up.
+        def _delete_registered_keys() -> list:
+            orphans = []
+            if provider == "github":
+                for key_id in registered:
+                    if key_id:
+                        try:
+                            _github_delete_deploy_key(repo, key_id, token)
+                        except ProvisioningError as exc:
+                            # G5: never swallow; report the orphaned key id.
+                            orphans.append(f"{key_id} ({exc.code})")
+            return orphans
+
         if provider == "github":
             repo = _parse_github_repo(relay_url)
             token = _github_token(args)
@@ -994,12 +1159,13 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
             key_title = deploy_key_title(relationship_id)
             # The inviter also needs git access: generate our own deploy
             # keypair, register the public half, keep the private half.
-            from muse_agent_social.model.invites import generate_deploy_keypair
-
+            # On retry the existing same-invite keypair is reused (the
+            # public key is derived from the stored private key), so a
+            # crashed first attempt never provisions a duplicate.
             inviter_key_path = (
                 ctx.keys_dir / "pairing" / invite_id / "deploy-inviter"
             )
-            inviter_pub = generate_deploy_keypair(str(inviter_key_path))
+            inviter_pub = load_or_generate_deploy_keypair(str(inviter_key_path))
             peer_pub = acceptance["deploy_public_key"]
             try:
                 # Register the acceptor's (peer) public deploy key.
@@ -1012,37 +1178,38 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
                 )
                 registered.append(reg_self.get("id"))
             except ProvisioningError as exc:
-                for key_id in registered:
-                    if key_id:
-                        try:
-                            _github_delete_deploy_key(repo, key_id, token)
-                        except ProvisioningError:
-                            pass
-                try:
-                    inviter_key_path.unlink()
-                except OSError:
-                    pass
+                orphans = _delete_registered_keys()
+                if not delete_private_key(inviter_key_path):
+                    orphans.append(
+                        f"inviter deploy key file {inviter_key_path} "
+                        "(secure deletion failed)"
+                    )
+                if orphans:
+                    # G5: cleanup failure is LOUD, naming the repo and the
+                    # orphaned key ids so the operator can delete them.
+                    raise CliError(
+                        "provisioning_cleanup_failed",
+                        f"provisioning failed ({exc.code}: {exc}); rollback of "
+                        f"provisioned keys on {repo} also failed; orphaned key "
+                        f"id(s): {', '.join(orphans)}; delete them manually",
+                    )
                 raise CliError("provisioning_error", f"{exc.code}: {exc}")
-        def _cleanup_provisioned() -> None:
-            if provider != "github":
-                return
-            for key_id in registered:
-                if key_id:
-                    try:
-                        _github_delete_deploy_key(repo, key_id, token)
-                    except ProvisioningError:
-                        pass
+        def _cleanup_provisioned() -> list:
+            orphans = _delete_registered_keys()
             if inviter_key_path is not None:
-                try:
-                    inviter_key_path.unlink()
-                except OSError:
-                    pass
+                if not delete_private_key(inviter_key_path):
+                    orphans.append(
+                        f"inviter deploy key file {inviter_key_path} "
+                        "(secure deletion failed)"
+                    )
+            return orphans
 
         try:
-            # Consume the invite's one-use status only after provisioning
-            # succeeded: anything above that raised left the invite in
-            # 'issued', so the human can retry cleanly.
-            validate_invite(ctx.conn, invite)
+            # G8: claim (issued -> accepted) and commit happen in ONE
+            # transaction inside commit_pairing. On any failure the claim
+            # rolls back with the commit, so the invite stays 'issued' and
+            # no reset is needed (there is no accepted-but-uncommitted
+            # window to race in).
             commit = commit_pairing(
                 ctx.conn,
                 acceptance,
@@ -1052,16 +1219,30 @@ def cmd_pair_commit(args: argparse.Namespace) -> int:
                 negotiated,
                 keys_dir=ctx.keys_dir,
                 relationship_id=relationship_id,
+                claim_invite=True,
             )
         except PairingError as exc:
-            _cleanup_provisioned()
-            _reset_invite_for_retry(ctx.conn, invite_id)
+            orphans = _cleanup_provisioned()
+            if orphans:
+                raise CliError(
+                    "provisioning_cleanup_failed",
+                    f"commit failed ({exc.code}: {exc}); cleanup of provisioned "
+                    f"keys on {repo} also failed; orphaned key id(s): "
+                    f"{', '.join(orphans)}; delete them manually",
+                )
             raise CliError("pairing_error", f"{exc.code}: {exc}")
         except Exception as exc:
             # commit_pairing can also fail outside PairingError (storage
-            # I/O, key-file errors). Same cleanup and retry semantics.
-            _cleanup_provisioned()
-            _reset_invite_for_retry(ctx.conn, invite_id)
+            # I/O, key-file errors). Same cleanup semantics.
+            orphans = _cleanup_provisioned()
+            if orphans:
+                raise CliError(
+                    "provisioning_cleanup_failed",
+                    f"commit failed (commit_failed: {type(exc).__name__}: {exc}); "
+                    f"cleanup of provisioned keys on {repo} also failed; "
+                    f"orphaned key id(s): {', '.join(orphans)}; "
+                    "delete them manually",
+                )
             raise CliError(
                 "pairing_error", f"commit_failed: {type(exc).__name__}: {exc}"
             )
@@ -1619,6 +1800,27 @@ def _release_fn(ctx: Ctx):
         if row is None:
             return None
         rid = row["relationship_id"]
+        # S1: honor revocation inside the release transaction. Teardown
+        # marks consent_state='revoked' in step 1 but deletes scheduler
+        # rows in step 4; a concurrent run_due in between must not
+        # transmit. Refusing here rolls the scheduled -> released claim
+        # back, so the row stays scheduled (teardown deletes it).
+        consent = conn.execute(
+            "SELECT consent_state FROM relationships WHERE relationship_id = ?",
+            (rid,),
+        ).fetchone()
+        if consent is None or consent["consent_state"] == "revoked":
+            raise scheduler.RevokedRelationshipError(scheduled_id)
+        # S2: honor the acking-side rotation deadline pause. _send_event
+        # gates immediate sends on may_send(); the release path must too,
+        # or a pre-deadline-persisted message transmits post-deadline. The
+        # pause is transient, so it never counts toward dead-lettering.
+        try:
+            RotationManager(ctx.conn, ctx.keys_dir).may_send(rid)
+        except RotationError as exc:
+            raise scheduler.SendPausedError(
+                scheduled_id, f"{exc.code}: {exc}"
+            ) from exc
         seen = conn.execute(
             "SELECT object_name FROM sent_objects WHERE scheduled_id = ?",
             (scheduled_id,),
@@ -1707,6 +1909,25 @@ def _warn_overdue_scheduled(ctx: Ctx) -> None:
         )
 
 
+def _warn_expired_by_run_due(due: dict) -> None:
+    """Warn about rows run_due just marked expired (S11).
+
+    A clock jump (or a long-idle install) can push deliver_at rows past
+    expires_at: run_due transitions them scheduled -> expired, so the
+    pre-release overdue warning never sees them. The operator must know
+    these events will never deliver.
+    """
+    expired = due.get("expired", [])
+    if expired:
+        shown = ", ".join(expired[:5])
+        more = ", ..." if len(expired) > 5 else ""
+        print(
+            f"warning: {len(expired)} scheduled event(s) expired without "
+            f"delivery ({shown}{more}); they will never be sent",
+            file=sys.stderr,
+        )
+
+
 def _sweep_rotations(ctx: Ctx) -> None:
     """Run rotation maintenance: discard ack-less candidates past their
     deadline and retire old private keys after the 24h/100-event bound.
@@ -1727,6 +1948,148 @@ def _sweep_rotations(ctx: Ctx) -> None:
             "candidate discarded, a new rotation may now begin",
             file=sys.stderr,
         )
+
+
+def _validate_delivery_window(
+    deliver_at: Optional[str],
+    expires_at: Optional[str],
+    *,
+    now: str,
+) -> None:
+    """Schedule-time delivery-window validation (S3/S4/S5). Loud failures.
+
+    S3: deliver_at beyond the old-key retention horizon (24h) is refused.
+        Sealed bytes are bound to the current key epoch; the recipient
+        deletes the old private key 24h after a rotation commit (or after
+        100 accepted events), after which a later-released capsule is
+        undecryptable while the sender sees success. (The 100-event bound
+        cannot be scheduled around; it is a documented residual risk.)
+    S4: deliver_at beyond the receiver accept window (7 days) is refused.
+        created_at is the schedule time and the receiver quarantines
+        created_at older than the window, so a far-future capsule would
+        release on time and then be quarantined.
+    S5: expires_at must be after the effective deliver_at (deliver_at, or
+        now for immediate sends); otherwise the row is stillborn: the
+        first run_due marks it expired and it never releases.
+
+    Raises:
+        CliError: on any violation, or on a malformed timestamp.
+    """
+    try:
+        now_dt = parse_canonical_utc(now)
+        if deliver_at is not None:
+            deliver_dt = parse_canonical_utc(deliver_at)
+            # S3/S4: the effective horizon is the earlier of the old-key
+            # retention bound and the receiver accept window. Whichever
+            # binds, a schedule past it is refused loudly instead of
+            # silently queued for a doomed delivery.
+            horizons = (
+                (
+                    now_dt + OLD_KEY_RETENTION,
+                    "deliver_at_beyond_retention_horizon",
+                    "sealed bytes are bound to the current key epoch and "
+                    "the recipient deletes the old private key "
+                    f"{int(OLD_KEY_RETENTION.total_seconds() // 3600)}h "
+                    "after a rotation commit (or after 100 accepted "
+                    "events), which would make the released capsule "
+                    "undecryptable",
+                ),
+                (
+                    now_dt + timedelta(days=ACCEPT_WINDOW_DAYS),
+                    "deliver_at_beyond_accept_window",
+                    "the receiver quarantines events older than the "
+                    f"{ACCEPT_WINDOW_DAYS}d accept window",
+                ),
+            )
+            horizon_dt, code, reason = min(horizons, key=lambda h: h[0])
+            if deliver_dt > horizon_dt:
+                raise CliError(
+                    code,
+                    f"deliver_at={deliver_at} is beyond the delivery "
+                    f"horizon: {reason}",
+                )
+        if expires_at is not None:
+            effective_deliver = deliver_at if deliver_at is not None else now
+            if parse_canonical_utc(expires_at) <= parse_canonical_utc(
+                effective_deliver
+            ):
+                raise CliError(
+                    "expires_not_after_deliver_at",
+                    f"expires_at={expires_at} is not after deliver_at="
+                    f"{effective_deliver}; the row would expire before "
+                    "release",
+                )
+    except CliError:
+        raise
+    except (ValueError, TypeError) as exc:
+        raise CliError(
+            "bad_args", f"bad delivery timestamp: {exc}"
+        ) from exc
+
+
+def _semantic_dry_run(
+    ctx: Ctx,
+    protected: dict,
+    event_type: str,
+    payload: dict,
+    reply_to: Optional[str],
+) -> None:
+    """Dry-run the local projection inside a rolled-back SAVEPOINT (S9).
+
+    Runs record_projection_input + apply_event for the about-to-persist
+    event and always rolls the SAVEPOINT back, so a semantically invalid
+    event (poll_unknown_choice, poll_closed, retract_not_sender, ...) is
+    rejected BEFORE anything is persisted or any human approval is
+    consumed. The real projection after persist is authoritative; this is
+    the pre-claim gate that keeps a failed projection from burning an
+    approval and inviting a duplicate retry.
+
+    Raises:
+        CliError: when the event would fail semantic projection.
+    """
+    conn = ctx.conn
+    conn.execute("SAVEPOINT send_semantic_dry_run")
+    # The staged payload row references the not-yet-persisted events row,
+    # so FK enforcement must be deferred inside the dry run. The savepoint
+    # always rolls back, so the deferred checks never fire; without this,
+    # every dry run fails with a spurious FOREIGN KEY constraint error.
+    defer_before = conn.execute("PRAGMA defer_foreign_keys;").fetchone()[0]
+    conn.execute("PRAGMA defer_foreign_keys=ON;")
+    try:
+        record_projection_input(
+            conn,
+            event_id=protected["event_id"],
+            event_type=event_type,
+            payload=payload,
+            reply_to=reply_to,
+        )
+        dry_row = {
+            "event_id": protected["event_id"],
+            "relationship_id": protected["relationship_id"],
+            "conversation_id": protected["conversation_id"],
+            "thread_id": protected.get("thread_id"),
+            "sender": protected["sender"],
+            "sender_seq": 0,
+            "created_at": protected["created_at"],
+            "key_epoch": protected.get("key_epoch"),
+            "event_type": event_type,
+            "payload": payload,
+            "reply_to": reply_to,
+        }
+        apply_event(conn, dry_row)
+    except Exception as exc:
+        code = getattr(exc, "code", "semantic_rejected")
+        raise CliError(
+            "send_error",
+            f"semantic validation failed before persist ({code}): {exc}; "
+            "nothing was persisted and no approval was consumed",
+        ) from exc
+    finally:
+        # Always roll back: the dry run must leave no trace. The real
+        # projection runs after persist.
+        conn.execute("ROLLBACK TO SAVEPOINT send_semantic_dry_run")
+        conn.execute("RELEASE send_semantic_dry_run")
+        conn.execute(f"PRAGMA defer_foreign_keys={int(defer_before)};")
 
 
 def _send_event(
@@ -1754,6 +2117,10 @@ def _send_event(
         manager.may_send(rid)
     except RotationError as exc:
         raise CliError("send_error", f"{exc.code}: {exc}")
+    # S3/S4/S5: schedule-time delivery-window validation, loud. A
+    # stillborn or undecryptable schedule is refused here, before the
+    # event is built, never silently queued.
+    _validate_delivery_window(deliver_at, expires_at, now=utcnow())
     cid = conversation_id or rid
     if reply_to and thread_id is None:
         target = ctx.conn.execute(
@@ -1797,6 +2164,11 @@ def _send_event(
             "dry_run": True,
             "payload": payload,
         }
+    # S9: semantic dry-run BEFORE claiming the approval. A semantically
+    # invalid event is rejected here, before anything is persisted or any
+    # approval consumed, so the operator never retries with a fresh
+    # approval and duplicates the response.
+    _semantic_dry_run(ctx, protected, event_type, payload, reply_to)
     try:
         # The human-approval claim is atomic with event persistence: the
         # record ID travels in the payload for the approval-gated types,
@@ -1818,20 +2190,18 @@ def _send_event(
         )
     except Exception as exc:
         raise CliError("send_error", f"persist failed: {exc}")
-    # Project the sender's own event locally so both sides' projections
-    # converge. assign_and_persist_outgoing already queued the projection;
-    # the sender needs no surface decision for their own event.
-    try:
-        with ctx.conn:
-            record_projection_input(
-                ctx.conn,
-                event_id=protected["event_id"],
-                event_type=event_type,
-                payload=payload,
-                reply_to=reply_to,
-            )
-    except (ProjectionError, SchemaError, sqlite3.IntegrityError) as exc:
-        raise CliError("send_error", f"projection staging failed: {exc}")
+    # The projection input was staged atomically with persistence inside
+    # persist_outgoing_in_txn, so rebuild_projections never sees a staged
+    # event without its payload. Project the sender's own event locally so
+    # both sides' projections converge; the sender needs no surface
+    # decision for their own event.
+    #
+    # S9: the semantic dry-run above already passed, so an apply_event
+    # failure here means a race (state changed between dry-run and
+    # persist) or an infrastructure failure. The event IS persisted and
+    # queued for release and the approval IS consumed, so the failure is
+    # reported with a distinct code and an explicit do-not-resend warning:
+    # a blind retry with a fresh approval would duplicate the event.
     try:
         event_row = dict(
             ctx.conn.execute(
@@ -1842,11 +2212,23 @@ def _send_event(
         event_row["reply_to"] = reply_to
         # Atomic per-event projection: a crash mid-apply must roll back the
         # whole event, never leave half-applied markers that redelivery
-        # would then treat as "already done".
+        # would then treat as "already done". G15: the projection_queue
+        # row is acknowledged (deleted) in the same transaction, so a
+        # successful projection never leaves a row behind.
         with transaction(ctx.conn):
             apply_event(ctx.conn, event_row)
+            ctx.conn.execute(
+                "DELETE FROM projection_queue WHERE event_id = ?;",
+                (protected["event_id"],),
+            )
     except ProjectionError as exc:
-        raise CliError("send_error", f"projection failed: {exc.code}: {exc}")
+        raise CliError(
+            "send_projection_failed",
+            f"projection failed AFTER persist ({exc.code}: {exc}); event "
+            f"{protected['event_id']} is persisted and queued for release "
+            "and the approval was consumed: do NOT re-send (that would "
+            "duplicate the event); inspect and repair local projections",
+        )
     released: list[str] = []
     cancel_outcome: Optional[str] = None
     if event_type == "delivery.canceled":
@@ -1859,10 +2241,68 @@ def _send_event(
             scheduler.cancel(ctx.conn, payload["scheduled_event_id"])
             cancel_outcome = "canceled"
         except scheduler.SchedulerError as exc:
-            # already_released -> the delivery.canceled event now travels
-            # as a signed retraction request; unknown ids are reported
-            # honestly but do not fail the send.
+            # already_released -> a signed retraction request is emitted
+            # below (S10); unknown ids are reported honestly but do not
+            # fail the send.
             cancel_outcome = exc.code
+    if cancel_outcome == "already_released":
+        # S10: the cancel arrived too late, but the sender asked for the
+        # message back. Emit a real signed message.retracted event. The
+        # retraction targets the INNER message (the capsule payload the
+        # peer already holds), not the delivery.scheduled announcement:
+        # retracting the announcement would be a receiver-side noop
+        # (retract_target_not_message). The inner id lives in the
+        # announcement's staged payload.
+        sched_row = ctx.conn.execute(
+            "SELECT thread_id FROM events WHERE event_id = ?",
+            (payload["scheduled_event_id"],),
+        ).fetchone()
+        inner_id = payload["scheduled_event_id"]
+        staged = ctx.conn.execute(
+            "SELECT payload FROM event_payloads WHERE event_id = ?",
+            (payload["scheduled_event_id"],),
+        ).fetchone()
+        if staged is not None:
+            try:
+                inner_id = json.loads(staged["payload"]).get(
+                    "inner_event_id", inner_id
+                )
+            except (ValueError, AttributeError):
+                pass
+        # The retraction reads best in the inner message's own thread.
+        inner_row = ctx.conn.execute(
+            "SELECT thread_id FROM events WHERE event_id = ?",
+            (inner_id,),
+        ).fetchone()
+        retraction_thread = (
+            inner_row["thread_id"]
+            if inner_row and inner_row["thread_id"]
+            else (sched_row["thread_id"] if sched_row else thread_id)
+        )
+        try:
+            _send_event(
+                ctx,
+                rel,
+                "message.retracted",
+                {
+                    "target_event_id": inner_id,
+                    "reason": "cancel after release",
+                },
+                conversation_id=cid,
+                thread_id=retraction_thread,
+                clock_skew_seconds=clock_skew_seconds,
+            )
+            cancel_outcome = "already_released_retracted"
+        except CliError as exc:
+            # Honest failure: the operator must know the retraction never
+            # went out. The outer send still succeeds (the delivery.canceled
+            # intent is queued); only the retraction is reported failed.
+            print(
+                f"warning: retraction send failed ({exc.code}): "
+                f"{exc.message}; the released event was NOT retracted",
+                file=sys.stderr,
+            )
+            cancel_outcome = "already_released_retraction_failed"
     try:
         due = scheduler.run_due(
             ctx.conn, utcnow(), _release_fn(ctx),
@@ -1870,6 +2310,7 @@ def _send_event(
         )
     except Exception as exc:
         raise CliError("send_error", f"scheduler release failed: {exc}")
+    _warn_expired_by_run_due(due)
     released.extend(due.get("released", []))
     # Push GitHub send-direction mutations now; anything left queued is
     # flushed by the next receive run.
@@ -1970,6 +2411,20 @@ def cmd_send(args: argparse.Namespace) -> int:
             print(
                 f"canceled {args.scheduled_event_id}; delivery.canceled "
                 f"event {result['event_id']} sent"
+            )
+        elif result.get("cancel_outcome") == "already_released_retracted":
+            print(
+                f"sent {result['event_id']} seq {result['sender_seq']} "
+                f"epoch {result['key_epoch']} (scheduled event "
+                f"{args.scheduled_event_id} already released; emitted a "
+                "signed message.retracted request)"
+            )
+        elif result.get("cancel_outcome") == "already_released_retraction_failed":
+            print(
+                f"sent {result['event_id']} seq {result['sender_seq']} "
+                f"epoch {result['key_epoch']} (scheduled event "
+                f"{args.scheduled_event_id} already released; the signed "
+                "retraction request FAILED to send, see warning above)"
             )
         elif result.get("cancel_outcome") == "already_released":
             print(
@@ -2187,11 +2642,27 @@ def cmd_human_poll_respond(args: argparse.Namespace) -> int:
 def _record_quarantine(
     ctx: Ctx, rid: str, object_name: str, reason: str, detail: str = ""
 ) -> None:
+    now = utcnow()
     ctx.conn.execute(
         "INSERT OR REPLACE INTO receive_quarantine "
         "(relationship_id, object_name, reason, detail, quarantined_at) "
         "VALUES (?, ?, ?, ?, ?)",
-        (rid, object_name, reason, detail[:500], utcnow()),
+        (rid, object_name, reason, detail[:500], now),
+    )
+    # G15: bound the quarantine table. Expire rows older than the TTL,
+    # then enforce the per-relationship cap (oldest dropped first).
+    # Quarantine is operator-visible evidence, not an unbounded log.
+    cutoff = add_seconds(now, -RECEIVE_QUARANTINE_TTL_DAYS * 24 * 3600)
+    ctx.conn.execute(
+        "DELETE FROM receive_quarantine WHERE quarantined_at <= ?;",
+        (cutoff,),
+    )
+    ctx.conn.execute(
+        "DELETE FROM receive_quarantine WHERE (relationship_id, object_name)"
+        " IN (SELECT relationship_id, object_name FROM receive_quarantine"
+        " WHERE relationship_id = ? ORDER BY quarantined_at DESC,"
+        " object_name DESC LIMIT -1 OFFSET ?);",
+        (rid, RECEIVE_QUARANTINE_MAX_PER_RELATIONSHIP),
     )
     ctx.conn.commit()
 
@@ -2207,8 +2678,14 @@ def _receive_v01(
     ctx: Ctx, rid: str, object_name: str, data: bytes, rel: dict
 ) -> dict:
     """Bounded v0.1 adapter path honoring the migration drain rules."""
+    # G1: gate on the real migration phase names and derive the drain from
+    # migration state (legacy_read_open + drain_until), never from the
+    # phase alone. The fictional phases ("dual_read", "observing") never
+    # existed in migrate.py, so the old gate closed legacy reads during
+    # dual-read and opened them during "observing" (a phase where reads
+    # must be shut).
     phase = mstate_get(ctx.conn, "migration.phase")
-    if phase not in ("dual_read", "observing", "committed"):
+    if phase not in ("staged", "verified", "committed"):
         return _quarantine_outcome(ctx, rid, object_name, "v01_not_accepted")
     pair_id = mstate_get(ctx.conn, "migration.pair_id")
     vault_dir = ctx.state_dir / "migration-vault"
@@ -2232,7 +2709,9 @@ def _receive_v01(
             pair_key = vault_load(vault_dir, pair_id)
     except (LegacyError, VaultError, KeyError) as exc:
         return _quarantine_outcome(ctx, rid, object_name, "v01_no_vault", str(exc))
-    drain_open = phase in ("dual_read", "observing")
+    # G1: the drain is migration state (legacy_read_open + drain_until),
+    # not a phase lookup.
+    read_open = drain_open(ctx.conn)
     policy = LegacyPolicy(
         pair_id=pair_id,
         expected_sender=mstate_get(ctx.conn, "migration.peer_legacy_id") or "*",
@@ -2242,19 +2721,24 @@ def _receive_v01(
         # never rejected. The v0.2 replay_guard table is shared and
         # survives across objects and restarts.
         replay_store=StoreReplayGuard(ctx.conn),
-        legacy_read_open=drain_open,
+        legacy_read_open=read_open,
         legacy_sends_allowed=False,
     )
     try:
         verified = verify_v01(data, pair_key, policy=policy)
     except LegacyError as exc:
         return _quarantine_outcome(ctx, rid, object_name, "v01_verify_failed", str(exc))
-    # Durable sequence assignment: the caller owns SeqAssigner persistence.
+    # The v0.1 persist block is ONE real transaction: the seq-assigner
+    # state, the event row, the staged projection input, the projection
+    # queue row, and the legacy replay record all commit or roll back
+    # together. ``with ctx.conn:`` is a no-op on this autocommit
+    # connection, and the old code committed the seq-assigner state before
+    # the event insert: a crash between the INSERTs left the event stored
+    # but never projected, and redelivery then hit an IntegrityError on
+    # the deterministic event_id (silent loss plus a bogus quarantine).
     seq_state = mstate_get(ctx.conn, "migration.seq_assigner") or {}
     assigner = SeqAssigner.from_dict({k: int(v) for k, v in seq_state.items()})
     adapted = adapt_v01(verified, pair_id, assigner)
-    mstate_set(ctx.conn, "migration.seq_assigner", assigner.to_dict())
-    ctx.conn.commit()
     payload = {
         "body": (
             f"{adapted['payload']['legacy_title']}\n\n{adapted['payload']['body']}"
@@ -2268,65 +2752,103 @@ def _receive_v01(
     # migration drain in migrate.py.
     conversation_id = rid
     thread_id = rid + ":t"
-    with ctx.conn:
-        ctx.conn.execute(
-            "INSERT OR IGNORE INTO conversations (conversation_id) VALUES (?)",
-            (conversation_id,),
+    try:
+        with transaction(ctx.conn):
+            # Durable sequence assignment inside the same transaction: a
+            # crash never burns a sender_seq without persisting its event.
+            mstate_set(ctx.conn, "migration.seq_assigner", assigner.to_dict())
+            ctx.conn.execute(
+                "INSERT OR IGNORE INTO conversations (conversation_id) VALUES (?)",
+                (conversation_id,),
+            )
+            ctx.conn.execute(
+                "INSERT OR IGNORE INTO threads (thread_id, conversation_id) "
+                "VALUES (?, ?)",
+                (thread_id, conversation_id),
+            )
+            ctx.conn.execute(
+                "INSERT INTO events (event_id, relationship_id, conversation_id, "
+                "thread_id, sender, sender_seq, created_at, key_epoch, event_type, "
+                "replay_nonce, sealed_envelope) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'message.created', ?, ?)",
+                (
+                    adapted["event_id"],
+                    rid,
+                    conversation_id,
+                    thread_id,
+                    adapted["sender"],
+                    adapted["sender_seq"],
+                    adapted["created_at"],
+                    "v01:" + verified.envelope["nonce"],
+                    data,
+                ),
+            )
+            record_projection_input(
+                ctx.conn,
+                event_id=adapted["event_id"],
+                event_type="message.created",
+                payload=payload,
+                reply_to=None,
+            )
+            ctx.conn.execute(
+                "INSERT INTO projection_queue (event_id, queued_at) VALUES (?, ?)",
+                (adapted["event_id"], utcnow()),
+            )
+            # Record the verified nonce/id in the persistent replay store
+            # so a replayed v0.1 object is rejected on the next object.
+            record_legacy_replay(policy, verified)
+    except sqlite3.IntegrityError as exc:
+        return _quarantine_outcome(
+            ctx, rid, object_name, "v01_storage_conflict", str(exc)[:500]
         )
-        ctx.conn.execute(
-            "INSERT OR IGNORE INTO threads (thread_id, conversation_id) "
-            "VALUES (?, ?)",
-            (thread_id, conversation_id),
-        )
-        ctx.conn.execute(
-            "INSERT INTO events (event_id, relationship_id, conversation_id, "
-            "thread_id, sender, sender_seq, created_at, key_epoch, event_type, "
-            "replay_nonce, sealed_envelope) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'message.created', ?, ?)",
-            (
-                adapted["event_id"],
-                rid,
-                conversation_id,
-                thread_id,
-                adapted["sender"],
-                adapted["sender_seq"],
-                adapted["created_at"],
-                "v01:" + verified.envelope["nonce"],
-                data,
-            ),
-        )
-        record_projection_input(
-            ctx.conn,
-            event_id=adapted["event_id"],
-            event_type="message.created",
-            payload=payload,
-            reply_to=None,
-        )
-        ctx.conn.execute(
-            "INSERT INTO projection_queue (event_id, queued_at) VALUES (?, ?)",
-            (adapted["event_id"], utcnow()),
-        )
-    # Record the verified nonce/id in the persistent replay store so a
-    # replayed v0.1 object is rejected on the next object.
-    record_legacy_replay(policy, verified)
-    ctx.conn.commit()
     return {"outcome": "accepted", "surfaces": 1, "receipts_queued": 0}
 
 
 def _try_unseal(ctx: Ctx, rid: str, envelope: dict) -> tuple[dict, dict]:
-    """Unseal trying the epoch's own key first, then every own key."""
+    """Unseal trying the relationship's own current epoch first.
+
+    The first key tried is the locally tracked current epoch
+    (``relationships.key_epoch``), not the sender-declared envelope
+    ``key_epoch``: a sender must not steer which of our keys is tried
+    first. The fallback is bounded to the retained dual-wrap window: the
+    seal side wraps the CEK to at most the recipient's current and
+    immediately-previous agreement epochs (see the recipients schema),
+    so unseal tries at most those two epochs and never walks the whole
+    key history.
+    """
+    rel = ctx.conn.execute(
+        "SELECT key_epoch FROM relationships WHERE relationship_id = ?;",
+        (rid,),
+    ).fetchone()
+    current = int(rel["key_epoch"]) if rel is not None else None
     rows = ctx.conn.execute(
         "SELECT epoch, private_key_ref FROM key_epochs "
         "WHERE relationship_id = ? AND private_key_ref != 'peer' "
-        "ORDER BY epoch",
+        "ORDER BY epoch DESC",
         (rid,),
     ).fetchall()
     if not rows:
         raise SealingError("unknown_recipient", "no local agreement keys")
-    want = int(envelope["protected"]["key_epoch"])
-    ordered = sorted(rows, key=lambda r: 0 if int(r["epoch"]) == want else 1)
+    by_epoch = {int(r["epoch"]): r for r in rows}
+    if current is not None and current in by_epoch:
+        # Local truth first: the relationship's current epoch when it is
+        # one of our own keys (we rotated last), then the newest older
+        # own key. The seal side dual-wraps to at most our current and
+        # previous keys, so two attempts bound the fallback; epochs are
+        # relationship-global and rotations interleave, so "previous" is
+        # the newest own epoch below current, not necessarily current-1.
+        candidates = [by_epoch[current]]
+        lower = [e for e in sorted(by_epoch, reverse=True) if e < current]
+        if lower:
+            candidates.append(by_epoch[lower[0]])
+    else:
+        # No authoritative current epoch, or the last rotation was the
+        # peer's (relationships.key_epoch is then the peer's epoch, not
+        # one of our keys): try at most the two newest retained own keys,
+        # which is the same dual-wrap window.
+        candidates = [by_epoch[e] for e in sorted(by_epoch, reverse=True)[:2]]
     last: Optional[SealingError] = None
-    for row in ordered:
+    for row in candidates:
         try:
             raw = Path(row["private_key_ref"]).read_bytes()
             priv = X25519PrivateKey.from_private_bytes(raw)
@@ -2395,6 +2917,189 @@ def _queue_accepted_receipt(
         raise CliError("integrity_conflict", f"storage conflict: {exc}")
 
 
+def _bump_retry_sighting(
+    conn: sqlite3.Connection, relationship_id: str, object_name: str, reason: str
+) -> int:
+    """Count another retryable sighting of one object; return the total.
+
+    The table is created idempotently so this is safe on any code path
+    that did not run _ensure_cli_tables first.
+    """
+    now = utcnow()
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS receive_retry_state ("
+        " relationship_id TEXT NOT NULL,"
+        " object_name TEXT NOT NULL,"
+        " reason TEXT NOT NULL,"
+        " sightings INTEGER NOT NULL DEFAULT 0,"
+        " first_seen_at TEXT NOT NULL,"
+        " last_seen_at TEXT NOT NULL,"
+        " PRIMARY KEY (relationship_id, object_name, reason))"
+    )
+    conn.execute(
+        "INSERT INTO receive_retry_state(relationship_id, object_name, reason,"
+        " sightings, first_seen_at, last_seen_at)"
+        " VALUES (?, ?, ?, 1, ?, ?)"
+        " ON CONFLICT(relationship_id, object_name, reason) DO UPDATE SET"
+        " sightings = receive_retry_state.sightings + 1,"
+        " last_seen_at = excluded.last_seen_at",
+        (relationship_id, object_name, reason, now, now),
+    )
+    row = conn.execute(
+        "SELECT sightings FROM receive_retry_state"
+        " WHERE relationship_id = ? AND object_name = ? AND reason = ?",
+        (relationship_id, object_name, reason),
+    ).fetchone()
+    return int(row["sightings"])
+
+
+def _clear_retry_state(
+    conn: sqlite3.Connection, relationship_id: str, object_name: str
+) -> None:
+    """Drop retry accounting for an object that reached a terminal outcome."""
+    conn.execute(
+        "DELETE FROM receive_retry_state"
+        " WHERE relationship_id = ? AND object_name = ?",
+        (relationship_id, object_name),
+    )
+
+
+def _clear_retry_state_quiet(
+    conn: sqlite3.Connection, relationship_id: str, object_name: str
+) -> None:
+    """Best-effort _clear_retry_state: cleanup must never raise."""
+    try:
+        _clear_retry_state(conn, relationship_id, object_name)
+    except Exception:
+        pass
+
+
+# sqlite3.OperationalError subclasses that a later poll could plausibly
+# heal: lock contention (the 30s busy timeout usually absorbs these, but a
+# racing writer can still surface one), I/O hiccups, a full disk. Anything
+# else (no such table, a malformed database, a missing column) is
+# deterministic and is quarantined with a reason instead of retried.
+_TRANSIENT_SQLITE_MARKERS = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+    "database is busy",
+    "disk i/o error",
+    "database or disk is full",
+    "interrupted",
+)
+
+# OSError errnos that a later poll could plausibly heal, plus message
+# markers for the errno-less synthetic raises the transport layer makes.
+_TRANSIENT_OS_ERRNOS = frozenset(
+    {errno.EAGAIN, errno.EINTR, errno.EBUSY, errno.ENOSPC, errno.EDQUOT, errno.EIO}
+)
+_TRANSIENT_OS_MARKERS = (
+    "i/o error",
+    "no space",
+    "quota exceeded",
+    "temporarily unavailable",
+    "resource busy",
+)
+
+
+def _is_transient_storage_error(exc: BaseException) -> bool:
+    """True only for storage failures a later poll could plausibly heal."""
+    if isinstance(exc, sqlite3.OperationalError):
+        message = str(exc).lower()
+        return any(marker in message for marker in _TRANSIENT_SQLITE_MARKERS)
+    if isinstance(exc, OSError):
+        if exc.errno in _TRANSIENT_OS_ERRNOS:
+            return True
+        message = str(exc).lower()
+        return any(marker in message for marker in _TRANSIENT_OS_MARKERS)
+    return False
+
+
+def _storage_failure_outcome(
+    ctx: Ctx, rid: str, object_name: str, exc: BaseException
+) -> dict:
+    """Classify a storage-layer failure during receive.
+
+    Transient failures stay retry_pending so the object is left on the
+    relay, but a consecutive-failure ceiling stops an infinite silent loop:
+    after MAX_CONSECUTIVE_RECEIVE_FAILURES the object is quarantined and
+    the operator is warned on stderr. Deterministic failures can never
+    heal, so they are quarantined immediately with the reason recorded.
+    """
+    label = f"{type(exc).__name__}: {exc}"
+    if not _is_transient_storage_error(exc):
+        return _quarantine_outcome(
+            ctx, rid, object_name, "storage_error", label[:500]
+        )
+    sightings = _bump_retry_sighting(
+        ctx.conn, rid, object_name, "transient_storage"
+    )
+    if sightings >= MAX_CONSECUTIVE_RECEIVE_FAILURES:
+        print(
+            f"warning: receive of {object_name} failed {sightings} times in a"
+            f" row ({label}); quarantining as retry_ceiling_exceeded",
+            file=sys.stderr,
+        )
+        return _quarantine_outcome(
+            ctx,
+            rid,
+            object_name,
+            "retry_ceiling_exceeded",
+            f"{sightings} consecutive storage failures; last: {label}"[:500],
+        )
+    return {"outcome": "retry_pending", "surfaces": 0, "receipts_queued": 0}
+
+
+# Process-local count of consecutive receives where even the failure
+# bookkeeping could not touch the database (the DB file is gone, the
+# disk died mid-write, ...). There is nothing durable to record, so the
+# escalation is counting plus loud stderr reporting; the object stays on
+# the relay rather than being silently dropped or spun on forever.
+_UNWRITABLE_BOOKKEEPING_COUNT: dict[tuple[str, str], int] = {}
+
+
+def _bookkeeping_failed_outcome(
+    ctx: Ctx, rid: str, object_name: str, exc: BaseException
+) -> dict:
+    """Last resort when failure bookkeeping itself cannot write.
+
+    Best-effort attempts the quarantine write once the process-local
+    ceiling is hit (it may succeed when only the retry-state table was
+    broken); otherwise the object is left on the relay with a loud
+    warning instead of spinning silently.
+    """
+    key = (rid, object_name)
+    count = _UNWRITABLE_BOOKKEEPING_COUNT.get(key, 0) + 1
+    _UNWRITABLE_BOOKKEEPING_COUNT[key] = count
+    label = f"{type(exc).__name__}: {exc}"
+    print(
+        f"warning: receive of {object_name} failed and failure bookkeeping"
+        f" is unwritable ({label}); consecutive unwritable failures: {count}",
+        file=sys.stderr,
+    )
+    if count >= MAX_CONSECUTIVE_RECEIVE_FAILURES:
+        try:
+            outcome = _quarantine_outcome(
+                ctx,
+                rid,
+                object_name,
+                "storage_error",
+                f"unwritable failure bookkeeping after {count} attempts;"
+                f" last: {label}"[:500],
+            )
+            _UNWRITABLE_BOOKKEEPING_COUNT.pop(key, None)
+            return outcome
+        except Exception as quarantine_exc:
+            print(
+                f"warning: cannot quarantine {object_name} either"
+                f" ({type(quarantine_exc).__name__}: {quarantine_exc});"
+                " leaving the object on the relay",
+                file=sys.stderr,
+            )
+    return {"outcome": "retry_pending", "surfaces": 0, "receipts_queued": 0}
+
+
 def _receive_object(
     ctx: Ctx, rid: str, object_name: str, data: bytes, acc: dict
 ) -> dict:
@@ -2406,19 +3111,33 @@ def _receive_object(
     disk I/O errors, full disk) mean the event was never stored. Those
     return ``retry_pending`` so the watcher leaves the object on the relay
     for a later poll instead of deleting a peer's event we never saved.
+    Deterministic storage failures (missing tables, a malformed database)
+    are quarantined with a reason: retrying them forever heals nothing.
     """
     try:
-        return _receive_object_inner(ctx, rid, object_name, data, acc)
+        outcome = _receive_object_inner(ctx, rid, object_name, data, acc)
     except CliError as exc:
+        _clear_retry_state_quiet(ctx.conn, rid, object_name)
         return _quarantine_outcome(ctx, rid, object_name, exc.code, exc.message)
-    except (sqlite3.OperationalError, OSError) as exc:
-        # Never raised by validation: only the storage layer raises these.
-        # Redelivery is safe (duplicate resume path / _redrain_projection).
-        return {"outcome": "retry_pending", "surfaces": 0, "receipts_queued": 0}
+    except (sqlite3.DatabaseError, OSError) as exc:
+        try:
+            return _storage_failure_outcome(ctx, rid, object_name, exc)
+        except Exception as bookkeeping_exc:
+            # Even the failure bookkeeping failed; escalate with
+            # process-local counting and loud reporting rather than a
+            # silent infinite retry loop.
+            return _bookkeeping_failed_outcome(
+                ctx, rid, object_name, bookkeeping_exc
+            )
     except Exception as exc:  # never let the watcher see a traceback
+        _clear_retry_state_quiet(ctx.conn, rid, object_name)
         return _quarantine_outcome(
             ctx, rid, object_name, "receive_error", f"{type(exc).__name__}: {exc}"
         )
+    if outcome.get("outcome") != "retry_pending":
+        _clear_retry_state_quiet(ctx.conn, rid, object_name)
+        _UNWRITABLE_BOOKKEEPING_COUNT.pop((rid, object_name), None)
+    return outcome
 
 
 def _redrain_projection(ctx: Ctx, rid: str, event_id: str) -> None:
@@ -2431,9 +3150,9 @@ def _redrain_projection(ctx: Ctx, rid: str, event_id: str) -> None:
     report accepted while the message stays unprojected (silent loss).
 
     apply_event is idempotent (already-projected events are a noop), so
-    running it here is safe on every redelivery. The queue row is left
-    in place, matching the normal path which never deletes it on
-    success.
+    running it here is safe on every redelivery. G15: a successful
+    re-projection acknowledges (deletes) the queue row, matching the
+    normal receive and send paths.
     """
     queued = ctx.conn.execute(
         "SELECT 1 FROM projection_queue WHERE event_id = ?", (event_id,)
@@ -2460,6 +3179,9 @@ def _redrain_projection(ctx: Ctx, rid: str, event_id: str) -> None:
         # the whole event instead of hitting a half-written marker.
         with transaction(ctx.conn):
             apply_event(ctx.conn, event_row)
+            ctx.conn.execute(
+                "DELETE FROM projection_queue WHERE event_id = ?;", (event_id,)
+            )
     except ProjectionError as exc:
         with transaction(ctx.conn):
             quarantine_event(
@@ -2563,12 +3285,16 @@ def _apply_identity_rotation(
             "stale_announcement",
             "peer identity changed since this announcement was issued",
         )
+    # Retired-key traffic stays acceptable for a bounded grace window so
+    # delayed pre-rotation events land; after it, the old key is dead.
+    grace_until = add_seconds(utcnow(), PRIOR_IDENTITY_GRACE_SECONDS)
     with transaction(ctx.conn):
         ctx.conn.execute(
             "UPDATE relationships SET peer_identity_id = ?, "
-            "prior_peer_identity_id = ?, peer_display_name = ? "
+            "prior_peer_identity_id = ?, prior_identity_grace_until = ?, "
+            "peer_display_name = ? "
             "WHERE relationship_id = ?",
-            (new_id, old_peer_id, new_card.get("display_name"), rid),
+            (new_id, old_peer_id, grace_until, new_card.get("display_name"), rid),
         )
     return True
 
@@ -2596,6 +3322,71 @@ def _maybe_apply_pending_identity_rotation(
     _apply_identity_rotation(ctx, rid, json.loads(payload_row["payload"]), sender_id)
 
 
+def _converge_rotation_hooks(ctx: Ctx, rid: str, event_id: str) -> None:
+    """Re-drive rotation hooks for a redelivered event when unmarked.
+
+    Called on the byte-identical resume path: if the first attempt died
+    after the receive commit but before (or during) the rotation hooks,
+    the hooks never ran. Already-marked events are skipped; the hooks
+    are idempotent, so re-driving converges.
+    """
+    marked = ctx.conn.execute(
+        "SELECT 1 FROM rotation_processed_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    if marked is not None:
+        return
+    row = ctx.conn.execute(
+        "SELECT e.event_type, e.key_epoch, p.payload FROM events e "
+        "JOIN event_payloads p ON p.event_id = e.event_id "
+        "WHERE e.event_id = ?",
+        (event_id,),
+    ).fetchone()
+    if row is None or row["event_type"] not in _ROTATION_EVENT_TYPES:
+        return
+    try:
+        payload = json.loads(row["payload"])
+    except ValueError:
+        return
+    manager = RotationManager(ctx.conn, ctx.keys_dir)
+    _run_rotation_hooks(
+        ctx, rid, manager, row["event_type"], payload, event_id,
+        int(row["key_epoch"]),
+    )
+
+
+def _check_ingress_quota(
+    ctx: Ctx, rid: str, now: str
+) -> Optional[dict]:
+    """Enforce the per-relationship ingress quota (G15).
+
+    Returns a ``retry_pending`` outcome dict when the relationship has
+    already accepted ``INGRESS_MAX_EVENTS_PER_DAY`` events in the trailing
+    24 hours; the object stays on the relay and is admitted as the window
+    slides. Returns None when the object may proceed.
+
+    The count uses the durable receiver acceptance time
+    (``event_payloads.received_at``, G13), never sender-controlled
+    ``created_at``: a sender must not be able to dodge the quota by
+    backdating, nor burn it by postdating.
+    """
+    cutoff = add_seconds(now, -24 * 3600)
+    count = ctx.conn.execute(
+        "SELECT COUNT(*) FROM event_payloads p"
+        " JOIN events e ON e.event_id = p.event_id"
+        " WHERE e.relationship_id = ? AND p.received_at >= ?;",
+        (rid, cutoff),
+    ).fetchone()[0]
+    if int(count) >= INGRESS_MAX_EVENTS_PER_DAY:
+        return {
+            "outcome": "retry_pending",
+            "surfaces": 0,
+            "receipts_queued": 0,
+            "retry_reason": "ingress_quota_exceeded",
+        }
+    return None
+
+
 def _receive_object_inner(
     ctx: Ctx, rid: str, object_name: str, data: bytes, acc: dict
 ) -> dict:
@@ -2620,10 +3411,26 @@ def _receive_object_inner(
     protected = envelope["protected"]
     if protected["relationship_id"] != rid:
         raise CliError("relationship_mismatch", "object is for another relationship")
-    if protected["sender"] != peer_id and protected["sender"] != rel.get(
+    # The authenticated sender is protected["sender"], not the relationship's
+    # current peer_identity_id: after a rotation, delayed pre-rotation
+    # events are signed by the retired identity. Storing them under the new
+    # identity would relabel retired-key traffic and collide same-sender_seq
+    # events from both keys into false fork quarantines.
+    sender_identity = protected["sender"]
+    if sender_identity != peer_id and sender_identity != rel.get(
         "prior_peer_identity_id"
     ):
-        raise CliError("unknown_sender", f"unexpected sender {protected['sender']}")
+        raise CliError("unknown_sender", f"unexpected sender {sender_identity}")
+    now = utcnow()
+    if sender_identity != peer_id:
+        # Retired-key traffic is only honored inside the post-rotation
+        # grace window, so a compromised old key cannot sign forever.
+        grace_until = rel.get("prior_identity_grace_until")
+        if not grace_until or now > grace_until:
+            raise CliError(
+                "prior_identity_expired",
+                "event signed by the retired peer identity after the grace window",
+            )
     event_id = protected["event_id"]
     existing = ctx.conn.execute(
         "SELECT sealed_envelope FROM events WHERE event_id = ?", (event_id,)
@@ -2643,30 +3450,74 @@ def _receive_object_inner(
             _maybe_apply_pending_identity_rotation(
                 ctx, rid, event_id, protected["sender"]
             )
+            # Same crash gap for rotation hooks: the commit may have
+            # succeeded while the process died before (or during) the
+            # post-commit rotation hooks, or between the hooks and the
+            # processed marker. Re-drive them when unmarked; every hook is
+            # idempotent, so this converges instead of duplicating.
+            _converge_rotation_hooks(ctx, rid, event_id)
             return {"outcome": "accepted", "surfaces": 0, "receipts_queued": 0}
         raise CliError("event_id_conflict", "event id reused with different bytes")
-    if ctx.conn.execute(
-        "SELECT 1 FROM replay_guard WHERE replay_nonce = ?",
+    manager = RotationManager(ctx.conn, ctx.keys_dir)
+    try:
+        # Authenticate first: unseal verifies the sender's Ed25519
+        # signature. The epoch gate below mutates rotation state, so it
+        # must never run on an unauthenticated envelope.
+        _protected, payload = _try_unseal(ctx, rid, envelope)
+    except SealingError as exc:
+        raise CliError(f"unseal_{exc.code}", f"{exc}")
+    try:
+        manager.on_data_event_epoch(rid, int(protected["key_epoch"]))
+    except RotationError as exc:
+        if exc.code == "unknown_future_epoch":
+            sightings = _bump_retry_sighting(
+                ctx.conn, rid, object_name, "unknown_future_epoch"
+            )
+            if sightings > MAX_UNKNOWN_EPOCH_SIGHTINGS:
+                raise CliError(
+                    "epoch_rejected",
+                    f"epoch {protected['key_epoch']} still unknown after"
+                    f" {sightings} sightings; giving up",
+                ) from exc
+            return {"outcome": "retry_pending", "surfaces": 0, "receipts_queued": 0}
+        raise CliError("epoch_rejected", f"{exc}")
+    # Replay records are bound to (event_id, envelope digest): a nonce hit
+    # is only an idempotent accept when the bytes are byte-identical.
+    # Nonce reuse with different bytes is quarantined loudly instead of
+    # being swallowed with a success report. Rows written before the
+    # binding columns existed carry no digest to compare against; they
+    # quarantine too, because exact redeliveries never reach this check
+    # (the existing-event byte comparison above accepts them) and
+    # anything else reusing a legacy nonce is unverifiable.
+    nonce_row = ctx.conn.execute(
+        "SELECT event_id, envelope_digest FROM replay_guard WHERE replay_nonce = ?",
         (protected["replay_nonce"],),
-    ).fetchone():
-        return {"outcome": "accepted", "surfaces": 0, "receipts_queued": 0}
-    now = utcnow()
+    ).fetchone()
+    if nonce_row is not None:
+        digest = hashlib.sha256(data).hexdigest()
+        if (
+            nonce_row["envelope_digest"] is not None
+            and nonce_row["event_id"] == event_id
+            and nonce_row["envelope_digest"] == digest
+        ):
+            # Byte-identical redelivery of the bound envelope.
+            return {"outcome": "accepted", "surfaces": 0, "receipts_queued": 0}
+        raise CliError(
+            "nonce_reuse", "replay nonce reused with different event bytes"
+        )
     created = protected["created_at"]
     if created > add_seconds(now, FUTURE_TOLERANCE_SECONDS):
         raise CliError("clock_future", "event created_at is too far in the future")
     if created < add_seconds(now, -ACCEPT_WINDOW_DAYS * 24 * 3600):
         raise CliError("expired_window", "event is older than the 7-day window")
-    manager = RotationManager(ctx.conn, ctx.keys_dir)
-    try:
-        manager.on_data_event_epoch(rid, int(protected["key_epoch"]))
-    except RotationError as exc:
-        if exc.code == "unknown_future_epoch":
-            return {"outcome": "retry_pending", "surfaces": 0, "receipts_queued": 0}
-        raise CliError("epoch_rejected", f"{exc}")
-    try:
-        _protected, payload = _try_unseal(ctx, rid, envelope)
-    except SealingError as exc:
-        raise CliError(f"unseal_{exc.code}", f"{exc}")
+    # G15: per-relationship ingress quota, checked after authentication
+    # and window validation but before the receive commit. Over-quota
+    # objects stay on the relay (retry_pending), not in quarantine: the
+    # rolling window admits them later, and quarantining a flood would
+    # both hide the evidence and burn the quarantine table.
+    quota_hold = _check_ingress_quota(ctx, rid, now)
+    if quota_hold is not None:
+        return quota_hold
     event_type = protected["event_type"]
     if event_type == "identity.rotated":
         # Verify the rotation announcement against the sender's pinned
@@ -2692,6 +3543,21 @@ def _receive_object_inner(
     # opened with isolation_level=None (autocommit), so the context manager
     # commits nothing and a crash between statements used to leave the
     # event stored but never projected or surfaced (silent loss).
+    new_seq = int(protected["sender_seq"])
+    # Bound the forward jump BEFORE committing: one signed envelope with
+    # sender_seq near the schema max would otherwise make the projection's
+    # gap-fill loop insert ~9e15 sequence_gaps rows in this transaction.
+    last_row = ctx.conn.execute(
+        "SELECT last_seq FROM sender_sequence WHERE relationship_id = ? AND sender = ?",
+        (rid, sender_identity),
+    ).fetchone()
+    last_seq = int(last_row["last_seq"]) if last_row else 0
+    if new_seq - last_seq > MAX_SEQ_GAP:
+        raise CliError(
+            "seq_gap_too_large",
+            f"sender_seq {new_seq} jumps {new_seq - last_seq} past last_seq"
+            f" {last_seq}; max forward jump is {MAX_SEQ_GAP}",
+        )
     try:
         with transaction(ctx.conn):
             ctx.conn.execute(
@@ -2706,14 +3572,15 @@ def _receive_object_inner(
                     protected["conversation_id"],
                 ),
             )
-            new_seq = int(protected["sender_seq"])
             # Fork: same (sender, seq) already holds a different event.
             # Out-of-order (new event, seq <= last_seq) is accepted; the
-            # relay does not guarantee upload order.
+            # relay does not guarantee upload order. The sender column is
+            # the authenticated protected["sender"], never the current
+            # peer identity, so old-key and new-key traffic cannot collide.
             clash = ctx.conn.execute(
                 "SELECT event_id FROM events WHERE relationship_id = ? "
                 "AND sender = ? AND sender_seq = ? AND event_id != ?",
-                (rid, peer_id, new_seq, event_id),
+                (rid, sender_identity, new_seq, event_id),
             ).fetchone()
             if clash is not None:
                 raise CliError(
@@ -2724,7 +3591,7 @@ def _receive_object_inner(
                 "INSERT INTO sender_sequence (relationship_id, sender, last_seq) "
                 "VALUES (?, ?, ?) ON CONFLICT(relationship_id, sender) "
                 "DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)",
-                (rid, peer_id, new_seq),
+                (rid, sender_identity, new_seq),
             )
             ctx.conn.execute(
                 "INSERT INTO events (event_id, relationship_id, conversation_id, "
@@ -2736,7 +3603,7 @@ def _receive_object_inner(
                     rid,
                     protected["conversation_id"],
                     protected["thread_id"],
-                    peer_id,
+                    sender_identity,
                     new_seq,
                     created,
                     int(protected["key_epoch"]),
@@ -2746,8 +3613,14 @@ def _receive_object_inner(
                 ),
             )
             ctx.conn.execute(
-                "INSERT INTO replay_guard (replay_nonce, expires_at) VALUES (?, ?)",
-                (protected["replay_nonce"], expires_at),
+                "INSERT INTO replay_guard (replay_nonce, event_id,"
+                " envelope_digest, expires_at) VALUES (?, ?, ?, ?)",
+                (
+                    protected["replay_nonce"],
+                    event_id,
+                    hashlib.sha256(data).hexdigest(),
+                    expires_at,
+                ),
             )
             record_projection_input(
                 ctx.conn,
@@ -2755,6 +3628,11 @@ def _receive_object_inner(
                 event_type=event_type,
                 payload=payload,
                 reply_to=protected.get("reply_to"),
+                # G13: the receiver acceptance time is the single `now`
+                # computed at the top of this receive, not a second
+                # utcnow() call. Poll closure, responded_at, the ingress
+                # quota, and rebuilds all key off this one timestamp.
+                received_at=now,
             )
             ctx.conn.execute(
                 "INSERT INTO projection_queue (event_id, queued_at) VALUES (?, ?)",
@@ -2797,12 +3675,23 @@ def _receive_object_inner(
         event_row["reply_to"] = protected.get("reply_to")
         with transaction(ctx.conn):
             apply_event(ctx.conn, event_row)
+            # G15: acknowledge the projection_queue row in the same
+            # transaction as the successful projection.
+            ctx.conn.execute(
+                "DELETE FROM projection_queue WHERE event_id = ?;",
+                (event_id,),
+            )
     except ProjectionError as exc:
         # Quarantine insert and projection-queue delete must be atomic for
         # the same autocommit reason as the receive commit above.
         with transaction(ctx.conn):
             quarantine_event(
-                ctx.conn, rid, peer_id, new_seq, event_id, f"projection_{exc.code}"
+                ctx.conn,
+                rid,
+                sender_identity,
+                new_seq,
+                event_id,
+                f"projection_{exc.code}",
             )
             ctx.conn.execute(
                 "DELETE FROM projection_queue WHERE event_id = ?", (event_id,)
@@ -2820,13 +3709,20 @@ def _receive_object_inner(
             return _quarantine_outcome(
                 ctx, rid, object_name, "identity_rotation_rejected", str(exc)
             )
-    # Rotation hooks and relationship.ready activation.
-    try:
-        _post_receive_hooks(
+    # Rotation hooks and relationship.ready activation. Rotation events go
+    # through the marking wrapper so a post-commit crash converges via the
+    # per-poll reconciler instead of losing the side effects.
+    if event_type in _ROTATION_EVENT_TYPES:
+        _run_rotation_hooks(
             ctx, rid, manager, event_type, payload, event_id, int(protected["key_epoch"])
         )
-    except Exception as exc:
-        print(f"warning: post-receive hook failed: {exc}", file=sys.stderr)
+    else:
+        try:
+            _post_receive_hooks(
+                ctx, rid, manager, event_type, payload, event_id, int(protected["key_epoch"])
+            )
+        except Exception as exc:
+            print(f"warning: post-receive hook failed: {exc}", file=sys.stderr)
     return {"outcome": "accepted", "surfaces": surfaces, "receipts_queued": receipts_queued}
 
 
@@ -2849,7 +3745,13 @@ def _post_receive_hooks(
     rel = get_relationship(ctx.conn, rid)
     if event_type == "security.key.prepare":
         ack = manager.on_prepare(rid, payload, event_id)
-        _send_event(ctx, rel, "security.key.ack", ack)
+        # Idempotent re-drive (crash between the ack send and the processed
+        # marker, or a redelivered prepare) must not emit a duplicate ack:
+        # the peer's on_ack is idempotent, but the extra event is noise.
+        # The check reads the durable outbox, so a crash before the send
+        # persisted still re-sends on re-drive.
+        if not _ack_already_sent(ctx, rid, event_id):
+            _send_event(ctx, rel, "security.key.ack", ack)
     elif event_type == "security.key.ack":
         manager.on_ack(rid, payload)
     elif event_type == "security.key.confirm":
@@ -2864,9 +3766,161 @@ def _post_receive_hooks(
         except Exception:
             pass
         try:
+            # R10: count toward the relationship's current epoch only;
+            # delayed old-epoch traffic must not bump a historical row.
             manager.note_accepted_event(rid)
         except Exception:
             pass
+
+
+_ROTATION_EVENT_TYPES = (
+    "security.key.prepare",
+    "security.key.ack",
+    "security.key.confirm",
+    "security.key.commit",
+)
+
+
+def _mark_rotation_processed(
+    conn, event_id: str, rid: str, event_type: str
+) -> None:
+    """Record that a rotation event's post-receive hooks completed.
+
+    INSERT OR IGNORE: the marker is idempotent, so a crash between the
+    hooks and this insert simply re-drives the (idempotent) hooks.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO rotation_processed_events "
+        "(event_id, relationship_id, event_type, processed_at) "
+        "VALUES (?, ?, ?, ?)",
+        (event_id, rid, event_type, utcnow()),
+    )
+
+
+def _ack_already_sent(ctx: Ctx, rid: str, prepare_event_id: str) -> bool:
+    """True when an ack for this prepare is already durably enqueued.
+
+    The receive hook re-drives after a crash between the ack send and the
+    processed marker; without this check every re-drive would emit a
+    duplicate ack event. Reads the events table (what _send_event
+    persisted), so a crash before the send completed still re-sends.
+    """
+    row = ctx.conn.execute(
+        "SELECT 1 FROM events e JOIN event_payloads p "
+        "ON p.event_id = e.event_id "
+        "WHERE e.relationship_id = ? AND e.event_type = 'security.key.ack' "
+        "AND e.sender = ? "
+        "AND json_extract(p.payload, '$.prepare_event_id') = ? LIMIT 1",
+        (rid, ctx.identity_id, prepare_event_id),
+    ).fetchone()
+    return row is not None
+
+
+def _run_rotation_hooks(
+    ctx: Ctx,
+    rid: str,
+    manager: RotationManager,
+    event_type: str,
+    payload: dict,
+    event_id: str,
+    key_epoch: int,
+) -> None:
+    """Run rotation post-receive hooks and record the outcome.
+
+    Marks ``rotation_processed_events`` when the hooks complete (side
+    effects, including the ack send, are done) or when the rotation state
+    machine deterministically rejects the event (its answer is final: the
+    conflict is quarantined, or the event was never valid). Transient
+    failures stay unmarked so the per-poll reconciler retries them.
+    """
+    try:
+        _post_receive_hooks(
+            ctx, rid, manager, event_type, payload, event_id, key_epoch
+        )
+    except (RotationError, ConfirmRejected) as exc:
+        # Deterministic rejection: re-driving would give the same answer
+        # (and for conflicting prepares, would duplicate the quarantine
+        # row), so mark it processed instead of retrying forever.
+        print(
+            f"warning: rotation hook rejected {event_type} {event_id} "
+            f"({getattr(exc, 'code', 'rejected')}): {exc}",
+            file=sys.stderr,
+        )
+    except Exception as exc:
+        print(
+            f"warning: rotation hook failed for {event_type} {event_id}: "
+            f"{exc}; will retry on a later poll",
+            file=sys.stderr,
+        )
+        return
+    _mark_rotation_processed(ctx.conn, event_id, rid, event_type)
+
+
+def _reconcile_rotation_events(ctx: Ctx, limit: int = 50) -> int:
+    """Re-drive hooks for accepted rotation events that missed them.
+
+    Crash gap: the receive commit is atomic, but the process can die
+    between the commit and the post-receive hooks (or between the hooks
+    and the processed marker). Such events are accepted but their
+    rotation side effects, including the ack send, never ran. This scans
+    for accepted incoming security.key.* events without a processed
+    marker and re-runs their hooks; every hook is idempotent, so a
+    partially applied event converges instead of duplicating.
+    Returns the number of events re-driven. Bounded per poll.
+    """
+    rows = ctx.conn.execute(
+        "SELECT e.event_id, e.relationship_id, e.event_type, e.key_epoch, "
+        "p.payload FROM events e "
+        "JOIN event_payloads p ON p.event_id = e.event_id "
+        "LEFT JOIN rotation_processed_events r ON r.event_id = e.event_id "
+        "WHERE e.event_type IN ('security.key.prepare', 'security.key.ack', "
+        "'security.key.confirm', 'security.key.commit') "
+        "AND e.sender != ? AND r.event_id IS NULL "
+        "ORDER BY e.rowid LIMIT ?",
+        (ctx.identity_id, limit),
+    ).fetchall()
+    if not rows:
+        return 0
+    manager = RotationManager(ctx.conn, ctx.keys_dir)
+    redriven = 0
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+        except ValueError:
+            continue
+        _run_rotation_hooks(
+            ctx,
+            row["relationship_id"],
+            manager,
+            row["event_type"],
+            payload,
+            row["event_id"],
+            int(row["key_epoch"]),
+        )
+        redriven += 1
+    return redriven
+
+
+def _rotation_maintenance(ctx: Ctx) -> None:
+    """Per-poll rotation housekeeping: sweep plus hook reconciliation.
+
+    Sweep discards lost-ack candidates and retires old keys; the
+    reconciler re-drives post-receive hooks for accepted rotation events
+    that a post-commit crash left unprocessed. Neither ever fails the
+    poll: both report loudly and continue.
+    """
+    _sweep_rotations(ctx)
+    try:
+        redriven = _reconcile_rotation_events(ctx)
+    except Exception as exc:
+        print(f"warning: rotation reconciliation failed: {exc}", file=sys.stderr)
+    else:
+        if redriven:
+            print(
+                f"rotation reconciliation: re-drove hooks for "
+                f"{redriven} event(s)",
+                file=sys.stderr,
+            )
 
 
 def prune_replay_entries(ctx: Ctx) -> int:
@@ -2904,8 +3958,10 @@ def _receive_relationship(
         time_budget=time_budget,
         policy_callback=policy_callback,
         # Rotation housekeeping on every watcher poll cycle: sweep
-        # discards lost-ack candidates and retires old keys.
-        maintenance_callback=lambda: _sweep_rotations(ctx),
+        # discards lost-ack candidates and retires old keys, and the
+        # reconciler re-drives post-receive hooks for accepted rotation
+        # events that a post-commit crash left unprocessed.
+        maintenance_callback=lambda: _rotation_maintenance(ctx),
     )
     receipts_sent = 0
     if code in (EXIT_OK, EXIT_RETRYABLE, EXIT_PARTIAL_TIMEOUT):
@@ -2917,6 +3973,7 @@ def _receive_relationship(
                 clock_skew_seconds=clock_skew_seconds,
             )
             receipts_sent = len(due.get("released", []))
+            _warn_expired_by_run_due(due)
         except Exception as exc:
             print(f"warning: release failed: {exc}", file=sys.stderr)
         _flush_send_transports(ctx, [rid])
@@ -3005,13 +4062,8 @@ def cmd_receive(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _atomic_write_bytes(path: Path, data: bytes, mode: int) -> None:
-    """Write *data* to *path* atomically (temp file + rename)."""
-    tmp = path.with_name(f".{path.name}.tmp")
-    with open(tmp, "wb") as fh:
-        fh.write(data)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+# (legacy _atomic_write_bytes removed; see the tombstone note above.
+# Rotation persists via muse_agent_social._keyfiles.atomic_write_file.)
 
 
 def _rotate_identity(ctx: Ctx, args: argparse.Namespace) -> int:
@@ -3084,23 +4136,65 @@ def _rotate_identity(ctx: Ctx, args: argparse.Namespace) -> int:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     # Back up the old seed and card first; losing the old seed would brick
-    # anything sealed to the old identity.
+    # anything sealed to the old identity. All persistence below goes through
+    # the hardened _keyfiles writers (tmp + fsync + atomic publish, 0600 for
+    # key material, no 0644 window).
     backup_seed = seed_path.with_name(f"{seed_path.name}.backup-{stamp}")
     backup_card = card_path.with_name(f"{card_path.name}.backup-{stamp}")
-    shutil.copy2(seed_path, backup_seed)
-    os.chmod(backup_seed, 0o600)
-    shutil.copy2(card_path, backup_card)
-
-    _atomic_write_bytes(seed_path, new_seed, 0o600)
-    _atomic_write_bytes(
-        card_path,
-        (_canon_text(announcement["new_card"]) + "\n").encode("utf-8"),
-        0o644,
-    )
+    try:
+        old_seed_bytes = seed_path.read_bytes()
+    except OSError as exc:
+        raise CliError(
+            "identity_rotation_backup_failed",
+            f"cannot read the old master seed for backup: {exc}",
+        ) from exc
+    try:
+        store_private_key(backup_seed, old_seed_bytes)
+        if card_path.is_file():
+            atomic_write_file(backup_card, card_path.read_bytes(), 0o644)
+        # The new seed and card publish as one atomic pair: both temp
+        # files are fully durable before either becomes visible, and a
+        # journal makes an interrupted publish re-drivable at startup
+        # (see recover_pending_pair), so a crash can never leave the
+        # seed and card describing different identities.
+        atomic_write_pair(
+            seed_path,
+            new_seed,
+            0o600,
+            card_path,
+            (_canon_text(announcement["new_card"]) + "\n").encode("utf-8"),
+            0o644,
+            journal_path=ctx.state_dir / _PENDING_IDENTITY_PAIR,
+        )
+    except (FileExistsError, KeyFileError, OSError) as exc:
+        # After the pair-publish journal commit point the new identity is
+        # committed (recover_pending_pair completes it at startup), so
+        # claiming the old identity is still in place would be a lie.
+        pending = (ctx.state_dir / _PENDING_IDENTITY_PAIR).exists()
+        hint = (
+            "the rotation was committed before the interruption; restart "
+            "to complete the pending publish"
+            if pending
+            else "the old identity is still in place"
+        )
+        raise CliError(
+            "identity_rotation_failed",
+            f"could not persist the rotation to disk: {exc}; {hint}",
+        ) from exc
     rot_dir = ctx.state_dir / "identity-rotations"
     rot_dir.mkdir(parents=True, exist_ok=True)
     ann_path = rot_dir / f"{new_hierarchy.identity_id}.json"
-    ann_path.write_text(_canon_text(announcement) + "\n", encoding="utf-8")
+    try:
+        atomic_write_file(
+            ann_path,
+            (_canon_text(announcement) + "\n").encode("utf-8"),
+            0o644,
+        )
+    except (FileExistsError, KeyFileError, OSError) as exc:
+        raise CliError(
+            "identity_rotation_failed",
+            f"could not save the rotation announcement: {exc}",
+        ) from exc
 
     print(
         "peers notified over the relay: "
@@ -3174,23 +4268,48 @@ def cmd_rotate(args: argparse.Namespace) -> int:
                 )
             except (RotationError, ConfirmRejected) as exc:
                 raise CliError("rotate_error", f"{getattr(exc, 'code', 'rotate_error')}: {exc}")
+            if _ack_already_sent(ctx, rid, row["event_id"]):
+                print(f"rotation already acknowledged for prepare {row['event_id']}")
+                return 0
             sent = _send_event(ctx, rel, "security.key.ack", ack)
             print(f"rotation acknowledged: event {sent['event_id']}")
             return 0
         if action == "confirm":
+            # Build first, send, then mark: a failed send leaves the
+            # rotation 'acknowledged' (retryable) instead of wedging it in
+            # 'confirmed' with no confirm on the wire.
             try:
-                confirm = manager.confirm_rotation(rid)
+                confirm = manager.build_confirm_payload(rid)
             except (RotationError, ConfirmRejected) as exc:
                 raise CliError("rotate_error", f"{getattr(exc, 'code', 'rotate_error')}: {exc}")
             sent = _send_event(ctx, rel, "security.key.confirm", confirm)
+            try:
+                manager.mark_confirmed(rid)
+            except (RotationError, ConfirmRejected) as exc:
+                raise CliError(
+                    "rotate_error",
+                    f"confirm sent as {sent['event_id']} but marking failed "
+                    f"({getattr(exc, 'code', 'rotate_error')}): {exc}",
+                )
             print(f"rotation confirmed: event {sent['event_id']}")
             return 0
         if action == "commit":
+            # Build first, send, then mark: a failed send leaves the
+            # rotation 'confirmed' (retryable) instead of wedging it in
+            # 'committed' with no commit on the wire.
             try:
                 commit = manager.build_commit_payload(rid)
             except (RotationError, ConfirmRejected) as exc:
                 raise CliError("rotate_error", f"{getattr(exc, 'code', 'rotate_error')}: {exc}")
             sent = _send_event(ctx, rel, "security.key.commit", commit)
+            try:
+                manager.mark_committed(rid)
+            except (RotationError, ConfirmRejected) as exc:
+                raise CliError(
+                    "rotate_error",
+                    f"commit sent as {sent['event_id']} but marking failed "
+                    f"({getattr(exc, 'code', 'rotate_error')}): {exc}",
+                )
             print(f"rotation committed: event {sent['event_id']}")
             return 0
         epochs = ctx.conn.execute(
@@ -3430,20 +4549,13 @@ def cmd_revoke(args: argparse.Namespace) -> int:
                 )
         token = args.token or os.environ.get("MAS_GITHUB_TOKEN")
         hooks = _RevokeHooks(ctx.state_dir, token, bool(args.delete_remote))
-        # The release teardown does not know about event_payloads (written by
-        # the receive/send projection staging); clear them first so the
-        # events DELETE does not hit the foreign key. relay_config is
-        # deleted before teardown too: the postcheck scans for the raw
-        # relationship id, and this row carries it.
-        with ctx.conn:
-            ctx.conn.execute(
-                "DELETE FROM event_payloads WHERE event_id IN "
-                "(SELECT event_id FROM events WHERE relationship_id = ?)",
-                (rid,),
-            )
-            ctx.conn.execute(
-                "DELETE FROM relay_config WHERE relationship_id = ?", (rid,)
-            )
+        # D10: no pre-cleanup here. teardown_relationship discovers relay
+        # refs from relay_config BEFORE its own deletes, so deleting
+        # relay_config first would blind relay-repo discovery (repos
+        # claimed only by this relationship would look unclaimed and be
+        # kept). teardown deletes event_payloads before events inside its
+        # own transaction, and relay_config with the other
+        # relationship-scoped rows.
         try:
             report = teardown_relationship(
                 ctx.conn,
@@ -3533,6 +4645,56 @@ def cmd_inspect_conversation(args: argparse.Namespace) -> int:
             out.append(md)
         if args.json or True:
             print(_canon_text(out))
+        return 0
+    finally:
+        ctx.close()
+
+
+def ack_surface_notification(conn: sqlite3.Connection, event_id: str) -> bool:
+    """Acknowledge (delete) one surface_queue notification (G15).
+
+    Returns True when a pending notification was acknowledged, False when
+    no row matched (already acked or unknown id).
+    """
+    cur = conn.execute(
+        "DELETE FROM surface_queue WHERE event_id = ?;", (event_id,)
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def cmd_surface_list(args: argparse.Namespace) -> int:
+    """List unacknowledged operator notifications (G15)."""
+    ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
+    try:
+        rows = ctx.conn.execute(
+            "SELECT event_id, policy_snapshot, queued_at FROM surface_queue"
+            " ORDER BY queued_at ASC, id ASC;"
+        ).fetchall()
+        out = [
+            {
+                "event_id": r["event_id"],
+                "queued_at": r["queued_at"],
+                "notification": json.loads(r["policy_snapshot"]),
+            }
+            for r in rows
+        ]
+        print(_canon_text({"notifications": out}))
+        return 0
+    finally:
+        ctx.close()
+
+
+def cmd_surface_ack(args: argparse.Namespace) -> int:
+    """Acknowledge one operator notification (G15)."""
+    ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
+    try:
+        if not ack_surface_notification(ctx.conn, args.event_id):
+            raise CliError(
+                "unknown_notification",
+                f"no pending notification for {args.event_id}",
+            )
+        print(f"acknowledged {args.event_id}")
         return 0
     finally:
         ctx.close()
@@ -3903,6 +5065,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common(p_receive)
     p_receive.set_defaults(func=cmd_receive)
+
+    # G15: the surface_queue is the operator notification queue; it needs
+    # a real acknowledgement path, not just a depth counter.
+    p_surface = subs.add_parser(
+        "surface", help="operator notifications (surface_queue)")
+    surf_subs = p_surface.add_subparsers(dest="surface_cmd", required=True)
+    p_slist = surf_subs.add_parser(
+        "list", help="list unacknowledged operator notifications")
+    _add_common(p_slist)
+    p_slist.set_defaults(func=cmd_surface_list)
+    p_sack = surf_subs.add_parser(
+        "ack", help="acknowledge (dismiss) one operator notification")
+    p_sack.add_argument(
+        "event_id", help="event_id (or scheduled_id) of the notification")
+    _add_common(p_sack)
+    p_sack.set_defaults(func=cmd_surface_ack)
 
     p_policy = subs.add_parser(
         "policy", help="get or set per-relationship delivery policy")

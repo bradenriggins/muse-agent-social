@@ -83,7 +83,6 @@ def test_rejected_acceptance_leaves_no_key_files(two_agents, tmp_path):
     rc, out, err = run_cli(
         b, "pair", "accept",
         "--invite-file", str(bad),
-        "--i-compared-phrase",
         "--out", str(tmp_path / "accept.json"),
     )
     assert rc != 0
@@ -106,11 +105,18 @@ def test_retry_after_rejection_succeeds_cleanly(two_agents, tmp_path):
     assert run_cli(
         b, "pair", "accept",
         "--invite-file", str(bad),
-        "--i-compared-phrase",
         "--out", str(tmp_path / "accept-bad.json"),
     )[0] != 0
 
     accept_json = tmp_path / "accept.json"
+    # G6 two-run phrase flow: run 1 displays the phrase and refuses.
+    rc, out, err = run_cli(
+        b, "pair", "accept",
+        "--invite-file", str(invite_txt),
+        "--out", str(accept_json),
+    )
+    assert rc != 0, err
+    assert len(out.split()) == 8
     rc, out, err = run_cli(
         b, "pair", "accept",
         "--invite-file", str(invite_txt),

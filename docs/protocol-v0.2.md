@@ -212,6 +212,13 @@ Rotation changes keys without splitting the relationship:
    candidate, and sends `security.key.ack`.
 3. **Dual-wrap:** after acknowledgment, the peer wraps each outgoing CEK to both
    epoch N and epoch N+1 keys. The envelope key epoch is N+1.
+   The envelope `recipients` array is bounded: at most two wraps
+   (`maxItems: 2`, `uniqueItems: true` in the envelope schema), one per
+   agreement epoch, sorted by recipient then agreement key. A sender never
+   wraps to older epochs, and a receiver unseals by trying its own
+   locally tracked current epoch first, then the retained previous epoch;
+   it never walks older key history, and it never lets the
+   sender-declared envelope epoch choose which key is tried first.
 4. **Confirm:** the recipient decrypts at least one N+1 wrap and sends
    `security.key.confirm`.
 5. **Commit:** the peer sends `security.key.commit`, then stops writing old
@@ -277,11 +284,13 @@ Time-capsule semantics: the sender stores the to-be-sealed event locally and
 does not upload it before the delivery time. Cancellation before enqueue is
 final. After enqueue, cancellation becomes a signed retraction request and
 cannot guarantee unread delivery. If offline at release, send on the next
-scheduler run while now is before the expiry time, and mark late_by_seconds in
-the payload. The default late window is 24 hours; the sender sets an earlier
-expiry if lateness would make the message harmful or useless. The scheduler
-uses the same transactional outgoing queue as immediate sends, so restarts
-cannot duplicate a release.
+scheduler run while now is before the expiry time; the release reports
+late_by_seconds in the scheduler run summary (and the receiver records it in
+its deliveries projection), never inside the sealed payload, which is
+immutable once sealed. The default late window is 24 hours; the sender sets an
+earlier expiry if lateness would make the message harmful or useless. The
+scheduler uses the same transactional outgoing queue as immediate sends, so
+restarts cannot duplicate a release.
 
 ## Receiver policy
 
@@ -327,6 +336,29 @@ reason code. A process kill at any point between fetch and surface leaves
 either no committed event or one committed event with retryable follow-up
 work; it cannot create two projected messages.
 
+### Queue acknowledgement and ingress bounds
+
+Queue rows are work, not history: they are deleted when the work is done.
+
+- `projection_queue`: one row per accepted event, deleted in the same
+  transaction as the successful projection (receive path, send path, and
+  the crash-recovery re-drain). A row that survives means the projection
+  never ran or failed; failed projections move the event to `quarantine`
+  and delete the queue row.
+- `surface_queue`: operator notifications. The operator acknowledges them
+  with `mas surface ack <event_id>` (`mas surface list` shows pending
+  ones); acknowledgement deletes the row. Unacknowledged rows persist
+  across restarts until the operator dismisses them.
+- `receive_quarantine`: bounded evidence, not an unbounded log. Rows
+  older than 30 days expire on every quarantine write, and each
+  relationship keeps at most 100 quarantine rows (oldest dropped first).
+- Per-relationship ingress quota: at most 10,000 events accepted per
+  relationship per rolling 24 hours, counted by the durable receiver
+  acceptance time, never by sender-controlled `created_at`. Objects
+  arriving over quota stay on the relay (`retry_pending`) and are
+  admitted as the window slides; they are not quarantined, so a flood
+  neither hides evidence nor burns the quarantine table.
+
 ## Transport controls
 
 One process lock (flock on the per-relationship lock file) covers every fetch,
@@ -362,6 +394,24 @@ keys. Muted or silent relationships still receive and validate; only surface
 queue behavior changes.
 
 ## Retention and teardown
+
+Rotation retention (compacted by the per-poll rotation sweep):
+
+- Committed `key_rotations` rows older than 30 days are deleted, always
+  keeping the newest committed row per relationship and role, so commit
+  redelivery fallbacks keep working. The 7-day accept window means no
+  legitimate commit redelivery can arrive after the retention age.
+- Peer agreement keys (`key_epochs` rows with `private_key_ref = 'peer'`)
+  are kept to the two newest epochs per relationship: the seal side wraps
+  to at most the peer's current and previous epoch (dual-wrap bound), and
+  the 7-day accept window means no legitimate send needs an older peer
+  public key. This never touches own private keys: their 24-hour /
+  100-event replay-acceptance retention is what lets delayed pre-rotation
+  events still unseal, and shortening it would break replay acceptance.
+- The projected `security_key_events` ceremony index is compacted past
+  90 days by receiver acceptance time (never sender `created_at`). The
+  ceremony events themselves stay immutable in the event log; a rebuild
+  re-derives the full history, so this bounds steady-state growth only.
 
 Teardown order: mark the relationship revoked locally (new sends and acceptance
 stop immediately); revoke both GitHub deploy keys, then delete the relay

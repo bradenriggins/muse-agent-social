@@ -23,6 +23,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import math
 import os
 import stat
 import uuid
@@ -271,6 +272,12 @@ class LegacyPolicy:
     # Lifecycle gates, driven by the migration state machine:
     legacy_read_open: bool = True  # False after the 24h drain closes
     legacy_sends_allowed: bool = True  # False after cutover commit
+    # Max message age in days. None means the default 7-day live-drain
+    # window. The migration backlog adapt path may pass a larger value or
+    # float("inf") (no age limit) because the backlog is frozen history,
+    # not live traffic (G4). The live drain adapter always uses the
+    # default.
+    max_age_days: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -386,8 +393,8 @@ def verify_v01(
     if not isinstance(nonce, str) or not nonce:
         raise LegacyError("V01_MISSING_NONCE", "nonce is empty")
 
-    # 8. Age window (v0.1's own window, not v0.2's tolerance).
-    _check_age(envelope)
+    # 8. Age window (v0.1's own window, or the migration backlog override).
+    _check_age(envelope, policy)
 
     # 9. Replay.
     _check_replay(envelope, policy)
@@ -487,7 +494,7 @@ def _decrypt_wrapper(outer: dict, pair_key: bytes) -> dict:
     return inner
 
 
-def _check_age(envelope: dict) -> datetime:
+def _check_age(envelope: dict, policy: LegacyPolicy) -> datetime:
     text = envelope["created_at"]
     try:
         created = datetime.strptime(text, V01_TIMESTAMP_FORMAT).replace(
@@ -498,8 +505,22 @@ def _check_age(envelope: dict) -> datetime:
     now = _now()
     if created - now > V01_FUTURE_TOLERANCE:
         raise LegacyError("V01_FUTURE", "created_at is too far in the future")
-    if now - created > timedelta(days=V01_AGE_WINDOW_DAYS):
-        raise LegacyError("V01_STALE", "created_at is older than 7 days")
+    # G4: the migration backlog adapt path can override the age window via
+    # policy.max_age_days; the live drain always uses the 7-day default.
+    # An infinite override means "no age limit" (frozen backlog history):
+    # timedelta() overflows on inf, so skip the stale comparison entirely.
+    max_age_days = (
+        V01_AGE_WINDOW_DAYS if policy.max_age_days is None
+        else policy.max_age_days
+    )
+    if (
+        not math.isinf(max_age_days)
+        and now - created > timedelta(days=max_age_days)
+    ):
+        raise LegacyError(
+            "V01_STALE",
+            f"created_at is older than {max_age_days} days",
+        )
     return created
 
 

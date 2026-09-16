@@ -73,6 +73,34 @@ def _fake_urlopen_factory(script, calls):
     return _fake
 
 
+def _run_pair_accept(b, invite_txt, accept_json):
+    """Two-run G6 phrase flow: run 1 displays the phrase and refuses,
+    run 2 (with --i-compared-phrase) completes."""
+    rc, out, err = run_cli(
+        b, "pair", "accept",
+        "--invite-file", str(invite_txt),
+        "--out", str(accept_json),
+    )
+    assert rc != 0, err
+    assert len(out.split()) == 8, out
+    assert run_cli(
+        b, "pair", "accept",
+        "--invite-file", str(invite_txt),
+        "--i-compared-phrase",
+        "--out", str(accept_json),
+    )[0] == 0
+
+
+def _commit_two_runs(args):
+    """Run 1 displays the verification phrase (raises
+    phrase_confirmation_required); run 2 confirms and proceeds."""
+    run1 = argparse.Namespace(**{**vars(args), "i_compared_phrase": False})
+    with pytest.raises(CliError) as exc_info:
+        cmd_pair_commit(run1)
+    assert exc_info.value.code == "phrase_confirmation_required"
+    return cmd_pair_commit(args)
+
+
 def _setup(tmp_path, monkeypatch):
     """Two inited agents; acceptor has accepted. Returns (a, b, accept_json,
     commit_json path, acceptor deploy pub)."""
@@ -85,12 +113,7 @@ def _setup(tmp_path, monkeypatch):
     invite_txt = tmp_path / "invite.txt"
     assert run_cli(a, "pair", "invite", "--out", str(invite_txt))[0] == 0
     accept_json = tmp_path / "accept.json"
-    assert run_cli(
-        b, "pair", "accept",
-        "--invite-file", str(invite_txt),
-        "--i-compared-phrase",
-        "--out", str(accept_json),
-    )[0] == 0
+    _run_pair_accept(b, invite_txt, accept_json)
     # Real commit against the (mocked) GitHub API.
     calls = []
     script = [
@@ -102,7 +125,7 @@ def _setup(tmp_path, monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen",
                         _fake_urlopen_factory(script, calls))
     commit_json = tmp_path / "commit.json"
-    rc = cmd_pair_commit(argparse.Namespace(
+    rc = _commit_two_runs(argparse.Namespace(
         state_dir=str(a),
         acceptance_file=str(accept_json),
         relay="https://github.com/owner/pair-relay.git",

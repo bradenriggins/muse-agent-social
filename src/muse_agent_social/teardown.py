@@ -56,17 +56,18 @@ import hashlib
 import json
 import os
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from ._keyfiles import (
     PEER_KEY_REF,
     KeyFileError,
+    atomic_write_file,
     default_keys_dir,
     delete_private_key,
 )
-from .store.db import utcnow
+from .store.db import transaction, utcnow
 from .transports.provisioning import DEPLOY_KEY_TITLE_PREFIX
 
 __all__ = [
@@ -317,13 +318,20 @@ def _secure_wipe_subtree(
     the keyfiles helper (symlinks are unlinked, never wiped through);
     emptied directories are then removed bottom-up. The target's parent
     (e.g. the shared keys dir) is never removed.
+
+    D5: a failed key wipe is a hard TeardownError, never silently
+    ignored, so teardown can never attest erasure it did not achieve.
     """
     if not target.exists() and not target.is_symlink():
         return
     if dry_run:
         return
     if target.is_symlink() or target.is_file():
-        delete_private_key(str(target))
+        if not delete_private_key(str(target)):
+            raise TeardownError(
+                "key-destruction-failed",
+                f"secure wipe failed for {target}; refusing to attest erasure",
+            )
         report.files_deleted += 1
         return
     if not target.is_dir():
@@ -331,7 +339,12 @@ def _secure_wipe_subtree(
     for dirpath, _dirnames, filenames in os.walk(target):
         for name in filenames:
             # Scoping: only files under this relationship's subtree.
-            delete_private_key(str(Path(dirpath) / name))
+            fp = Path(dirpath) / name
+            if not delete_private_key(str(fp)):
+                raise TeardownError(
+                    "key-destruction-failed",
+                    f"secure wipe failed for {fp}; refusing to attest erasure",
+                )
             report.files_deleted += 1
     for dirpath, _dirnames, _filenames in os.walk(target, topdown=False):
         try:
@@ -579,6 +592,235 @@ def _prune_relay_json(
         log("delete-relay-json: no entries remain")
 
 
+def _chunks(items: list, size: int = 500):
+    """Yield successive chunks of *items* (D8).
+
+    SQLite builds have a limit on bound variables per statement (999 on
+    older builds); chunking every IN (...) list keeps teardown correct on
+    arbitrarily large histories.
+    """
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+#: Durable completion log for remote teardown hooks (D3). A hook that
+#: completed is recorded here in its own transaction, before the main
+#: teardown transaction runs, so an interrupted run never repeats a
+#: completed remote action. Rows are deleted with the rest of the
+#: relationship's state when the main transaction commits. A hook that
+#: completed remotely but crashed before its record was written repeats
+#: once on resume: the hooks (deploy-key revocation, relay-repo deletion)
+#: are idempotent remote operations, so one repeat is safe.
+_TEARDOWN_HOOK_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS teardown_hook_log (
+    relationship_id TEXT NOT NULL,
+    hook TEXT NOT NULL,
+    target TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    PRIMARY KEY (relationship_id, hook, target)
+);
+""".strip()
+
+
+def _ensure_teardown_tables(conn: Any) -> None:
+    conn.execute(_TEARDOWN_HOOK_LOG_DDL)
+
+
+def _hook_completed(
+    conn: Any, relationship_id: str, hook: str, target: str
+) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM teardown_hook_log"
+        " WHERE relationship_id = ? AND hook = ? AND target = ?",
+        (relationship_id, hook, target),
+    ).fetchone()
+    return row is not None
+
+
+def _record_hook_completed(
+    conn: Any, relationship_id: str, hook: str, target: str
+) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO teardown_hook_log"
+        " (relationship_id, hook, target, completed_at) VALUES (?, ?, ?, ?)",
+        (relationship_id, hook, target, utcnow()),
+    )
+    # Durable immediately: this record must survive a crash that lands
+    # after the remote call but before the main teardown transaction.
+    # On an autocommit connection this is a no-op; when the caller owns an
+    # explicit transaction the record joins it (teardown callers are
+    # expected to pass an autocommit connection).
+    if conn.in_transaction:
+        return
+    conn.commit()
+
+
+def _write_tombstone(
+    state_dir: Path,
+    digest: str,
+    revoked_at: str,
+    reason_code: str,
+) -> Path:
+    """Write the consent tombstone durably BEFORE the relationship row is
+    deleted (D9): a crash between the row delete and the tombstone write
+    would otherwise leave cleanup unresumable. The tombstone keeps the
+    minimal spec contract only (relationship id hash, revoked time, reason
+    code): resume state (invite ids, relay refs) lives in the transient
+    teardown journal, which is deleted on success. Atomic write with
+    fsync; file mode 0600. Carries only the relationship id hash, never
+    the raw relationship id or peer label.
+    """
+    tombstone = state_dir / "tombstones" / f"{digest}.json"
+    payload = {
+        "relationship_id_sha256": digest,
+        "revoked_at": revoked_at,
+        "reason_code": reason_code,
+    }
+    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    atomic_write_file(tombstone, data, mode=0o600, strict=False)
+    return tombstone
+
+
+def _teardown_journal_path(state_dir: Path, relationship_id: str) -> Path:
+    digest = hashlib.sha256(relationship_id.encode("utf-8")).hexdigest()
+    return state_dir / "teardown-journal" / f"{digest}.json"
+
+
+def _write_teardown_journal(
+    state_dir: Path,
+    relationship_id: str,
+    invite_ids: list[str],
+    refs: _RelayRefs,
+) -> Path:
+    """Write the transient teardown resume journal (D9).
+
+    Written right after the consent tombstone and before the main DB
+    transaction. It preserves the invite ids (for pairing ephemeral key
+    cleanup) and the discovered relay refs (for relay.json pruning) so a
+    crash after the DB commit, when relay_config rows are already gone,
+    can still resume the file cleanup with the original ownership
+    picture. Deleted on successful completion; the tombstone remains.
+    """
+    journal = _teardown_journal_path(state_dir, relationship_id)
+    payload = {
+        "v": 1,
+        "invite_ids": sorted(set(invite_ids)),
+        "keys_to_revoke": [asdict(dk) for dk in refs.keys_to_revoke],
+        "repos_to_delete": [asdict(r) for r in refs.repos_to_delete],
+        "keep_deploy_keys": refs.keep_deploy_keys,
+        "keep_repos": refs.keep_repos,
+        "relay_json_present": refs.relay_json_present,
+        "relay_json_parseable": refs.relay_json_parseable,
+    }
+    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    atomic_write_file(journal, data, mode=0o600, strict=False)
+    return journal
+
+
+def _read_teardown_journal(
+    state_dir: Path, relationship_id: str
+) -> dict[str, Any]:
+    """Read the teardown resume journal; empty dict when absent/unparseable."""
+    try:
+        return json.loads(
+            _teardown_journal_path(state_dir, relationship_id).read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, ValueError):
+        return {}
+
+
+def _delete_teardown_journal(state_dir: Path, relationship_id: str) -> None:
+    try:
+        _teardown_journal_path(state_dir, relationship_id).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _refs_from_journal(journal: dict[str, Any]) -> _RelayRefs:
+    """Rebuild the relationship-filtered relay refs from the journal."""
+    refs = _RelayRefs()
+    refs.keys_to_revoke = [
+        DeployKeyRef(**dk)
+        for dk in journal.get("keys_to_revoke", [])
+        if isinstance(dk, dict)
+    ]
+    refs.repos_to_delete = [
+        RelayRef(**r)
+        for r in journal.get("repos_to_delete", [])
+        if isinstance(r, dict)
+    ]
+    refs.keep_deploy_keys = journal.get("keep_deploy_keys", []) or []
+    refs.keep_repos = journal.get("keep_repos", []) or []
+    refs.relay_json_present = bool(journal.get("relay_json_present"))
+    refs.relay_json_parseable = bool(journal.get("relay_json_parseable"))
+    return refs
+
+
+def _wipe_relationship_files(
+    conn: Any,
+    state_dir: Path,
+    relationship_id: str,
+    invite_ids: list[str],
+    refs: _RelayRefs,
+    report: TeardownReport,
+    dry_run: bool,
+    log: Callable[[str], None],
+) -> None:
+    """Filesystem phase of teardown: wipe every relationship-owned file.
+
+    Idempotent: every operation tolerates already-deleted inputs, so a
+    resumed run (row gone, tombstone present) can re-drive it safely.
+    """
+    # Relationship-scoped prune of each shared operational directory.
+    for dirname in _OPERATIONAL_DIRS:
+        _wipe_operational_dir(
+            state_dir / dirname, relationship_id, report, dry_run
+        )
+    # Authoritative per-relationship paths (mirrors, locks, watcher).
+    for target in _relationship_fs_paths(state_dir, relationship_id):
+        _wipe_tree(target, report, dry_run)
+    # Stray files that mention the relationship id anywhere under the
+    # state dir.
+    for dirpath, _dirnames, filenames in os.walk(state_dir):
+        for name in filenames:
+            fp = Path(dirpath) / name
+            if _file_mentions_rid(fp, relationship_id):
+                if not dry_run:
+                    secure_unlink(fp)
+                    report.files_deleted += 1
+                log(f"stray-file:{name}")
+    # Per-relationship key subtrees: <keys_dir>/<rid> and the pairing
+    # ephemeral dirs for this relationship's invites. Invite ids are
+    # path-validated: a malicious value must never escape the subtree.
+    for keys_dir in _keys_dir_candidates(conn, state_dir):
+        _secure_wipe_subtree(keys_dir / relationship_id, report, dry_run)
+        for sub in ("invites", "pairing"):
+            for iid in invite_ids:
+                if (
+                    not iid
+                    or "/" in iid
+                    or "\\" in iid
+                    or iid in (".", "..")
+                ):
+                    continue
+                _secure_wipe_subtree(keys_dir / sub / iid, report, dry_run)
+    # Shared relay.json: prune only this relationship's entries.
+    _prune_relay_json(state_dir, refs, report, dry_run, log)
+    # Relay YAML material for this relationship, if any.
+    relay_yaml = state_dir / "relay.yaml"
+    if relationship_id in relay_yaml.name or (
+        relay_yaml.is_file() and _file_mentions_rid(relay_yaml, relationship_id)
+    ):
+        if not dry_run:
+            secure_unlink(relay_yaml)
+            report.files_deleted += 1
+        log("delete-relay-yaml")
+
+
 def postcheck_scan(
     state_dir: str | Path,
     relationship_id: str,
@@ -640,13 +882,26 @@ def teardown_relationship(
 ) -> TeardownReport:
     """Tear down one relationship in exact plan order. Returns a report.
 
-    conn: open connection on the v0.2 database (WAL, FK enforced).
+    conn: open connection on the v0.2 database (WAL, FK enforced). The
+    connection must be in autocommit mode (no open transaction): teardown
+    manages its own transactions for crash safety.
+
+    Crash safety (D1/D3/D9): the append-only trigger drops, all
+    relationship-scoped DB deletes, and the trigger recreation run inside
+    ONE explicit SQLite transaction (VACUUM stays outside it, where SQLite
+    requires it). Remote hooks record durable completion before that
+    transaction, so an interrupted run never repeats a completed remote
+    action. The consent tombstone is written before the relationship row
+    is deleted, and a run that finds no row but a tombstone re-drives the
+    (idempotent) file wipe before its postcheck, so a dirty postcheck can
+    never wedge future runs.
 
     Every destructive step is scoped to relationship_id: relay metadata
     reads are filtered to this relationship's entries, filesystem
     deletions touch only this relationship's subtrees and entries, and
     database deletions are keyed by this relationship's ids. Re-running
-    for an already-torn-down relationship is a no-op returning a report.
+    for an already-torn-down relationship re-drives the file wipe and
+    returns a report instead of raising.
     """
     hooks = hooks or TeardownHooks()
     state_dir = Path(state_dir)
@@ -670,47 +925,102 @@ def teardown_relationship(
     def log(step: str) -> None:
         report.step_log.append(step)
 
+    tombstone = _tombstone_path(state_dir, relationship_id)
     row = conn.execute(
         "SELECT consent_state FROM relationships WHERE relationship_id = ?",
         (relationship_id,),
     ).fetchone()
-    tombstone = _tombstone_path(state_dir, relationship_id)
     if row is None:
-        if tombstone.is_file():
-            # Idempotency: a previous run completed and left its tombstone.
-            # Re-verify the postcheck is still clean, then no-op.
-            report.already_torn_down = True
-            report.tombstone_path = str(tombstone)
-            log("already-torn-down")
-            scan = postcheck_scan(state_dir, relationship_id, peer_label)
-            report.postcheck_scanned = scan["scanned"]
-            report.postcheck_hits = scan["hits"]
-            if scan["hits"] and not dry_run:
-                raise TeardownError(
-                    "postcheck-dirty",
-                    f"residual traces remain: {scan['hits'][:5]}",
-                )
-            return report
-        raise TeardownError("unknown-relationship", relationship_id)
+        if not tombstone.is_file():
+            raise TeardownError("unknown-relationship", relationship_id)
+        # Resume path (D3): a previous run finished the database work and
+        # wrote the tombstone, but files may remain: a crash between the
+        # DB commit and the file wipe, strays created after the wipe, or a
+        # wipe that never ran. The file wipe is idempotent, so re-drive it
+        # before the postcheck; only a postcheck that is STILL dirty after
+        # a fresh wipe raises. Without this, one dirty postcheck would
+        # wedge every future run on the tombstone path.
+        report.already_torn_down = True
+        report.tombstone_path = str(tombstone)
+        log("already-torn-down")
+        if not dry_run:
+            # Resume state comes from the transient teardown journal, not
+            # the tombstone (which keeps the minimal spec contract). The
+            # journal preserves the invite ids and the relay ownership
+            # picture from before the DB commit; re-discovering now would
+            # see the relationship row gone and misclassify its relay
+            # entries as unclaimed.
+            journal = _read_teardown_journal(state_dir, relationship_id)
+            raw_iids = journal.get("invite_ids") or []
+            resume_invite_ids = [
+                str(i) for i in raw_iids if isinstance(i, str)
+            ]
+            refs = (
+                _refs_from_journal(journal)
+                if journal
+                else _discover_relay_refs(conn, state_dir, relationship_id)
+            )
+            _wipe_relationship_files(
+                conn,
+                state_dir,
+                relationship_id,
+                resume_invite_ids,
+                refs,
+                report,
+                dry_run,
+                log,
+            )
+        scan = postcheck_scan(state_dir, relationship_id, peer_label)
+        report.postcheck_scanned = scan["scanned"]
+        report.postcheck_hits = scan["hits"]
+        if scan["hits"] and not dry_run:
+            raise TeardownError(
+                "postcheck-dirty",
+                f"residual traces remain after re-wipe: {scan['hits'][:5]}",
+            )
+        return report
 
     # Relationship-filtered relay metadata: only entries belonging to this
-    # relationship_id may be revoked or deleted in step 2.
+    # relationship_id may be revoked or deleted in step 2. Discovered
+    # before any mutation: cmd_revoke must not delete relay_config first
+    # (D10), and teardown itself reads relay_config here, before its own
+    # deletes.
     refs = _discover_relay_refs(conn, state_dir, relationship_id)
     # Invite ids linked to this relationship (for pairing-table and
-    # ephemeral key-material cleanup); resolved before step 4 deletes the
-    # migration_state refs that carry the linkage.
+    # ephemeral key-material cleanup); resolved before the main
+    # transaction deletes the migration_state refs that carry the linkage,
+    # and persisted in the teardown journal so a resumed run can re-wipe
+    # the pairing key dirs.
     invite_ids = _relationship_invite_ids(conn, relationship_id)
+    if not dry_run:
+        _ensure_teardown_tables(conn)
 
     # Pre-validate remote hooks before any mutation, so a missing hook
     # fails fast instead of leaving a half-torn-down relationship.
-    # Scoping: hooks are required only for this relationship's entries;
+    # Scoping: hooks are required only for this relationship's PENDING
+    # entries (a resumed run skips hooks already recorded complete);
     # other relationships' entries never force a hook requirement here.
     if not dry_run:
-        if refs.keys_to_revoke and hooks.revoke_deploy_key is None:
+        pending_keys = [
+            dk
+            for dk in refs.keys_to_revoke
+            if not _hook_completed(
+                conn, relationship_id, "revoke_deploy_key",
+                f"{dk.repo}:{dk.label}",
+            )
+        ]
+        pending_repos = [
+            repo
+            for repo in refs.repos_to_delete
+            if not _hook_completed(
+                conn, relationship_id, "delete_relay_repo", repo.repo
+            )
+        ]
+        if pending_keys and hooks.revoke_deploy_key is None:
             raise TeardownError(
                 "hook-required", "revoke_deploy_key hook is missing"
             )
-        if refs.repos_to_delete and hooks.delete_relay_repo is None:
+        if pending_repos and hooks.delete_relay_repo is None:
             raise TeardownError(
                 "hook-required", "delete_relay_repo hook is missing"
             )
@@ -728,18 +1038,37 @@ def teardown_relationship(
     # Step 2: revoke deploy keys, then delete the relay repository.
     # Scoping: refs.keys_to_revoke / refs.repos_to_delete were filtered to
     # this relationship_id at discovery; other relationships' keys and
-    # repos are never passed to the hooks.
+    # repos are never passed to the hooks. Each completed hook is recorded
+    # durably before the main transaction (D3), so an interrupted run
+    # never repeats a completed remote action.
     for dk in refs.keys_to_revoke:
+        target = f"{dk.repo}:{dk.label}"
         if not dry_run:
-            hooks.revoke_deploy_key(dk)
+            if not _hook_completed(
+                conn, relationship_id, "revoke_deploy_key", target
+            ):
+                hooks.revoke_deploy_key(dk)
+                _record_hook_completed(
+                    conn, relationship_id, "revoke_deploy_key", target
+                )
+            else:
+                log(f"hook-already-done:revoke-deploy-key:{dk.label}")
         else:
             log(f"would-revoke-deploy-key:{dk.label}")
             continue
-        report.deploy_keys_revoked.append(f"{dk.repo}:{dk.label}")
+        report.deploy_keys_revoked.append(target)
         log(f"revoke-deploy-key:{dk.label}")
     for repo in refs.repos_to_delete:
         if not dry_run:
-            hooks.delete_relay_repo(repo)
+            if not _hook_completed(
+                conn, relationship_id, "delete_relay_repo", repo.repo
+            ):
+                hooks.delete_relay_repo(repo)
+                _record_hook_completed(
+                    conn, relationship_id, "delete_relay_repo", repo.repo
+                )
+            else:
+                log(f"hook-already-done:delete-relay-repo:{repo.repo}")
         else:
             log(f"would-delete-relay-repo:{repo.repo}")
             continue
@@ -747,7 +1076,10 @@ def teardown_relationship(
         log(f"delete-relay-repo:{repo.repo}")
 
     # Step 3: crypto-erasure boundary. Destroy private key material FIRST,
-    # before any other state deletion in step 4.
+    # before any other state deletion. D5: a failed wipe is a hard
+    # TeardownError, never silently ignored, and keys_destroyed is
+    # appended only after a successful wipe, so teardown can never attest
+    # erasure it did not achieve.
     # Scoping: only key_epochs rows for this relationship_id.
     key_rows = conn.execute(
         "SELECT private_key_ref FROM key_epochs WHERE relationship_id = ?",
@@ -768,197 +1100,307 @@ def teardown_relationship(
         if not dry_run:
             # Random overwrite, fsync, unlink; O_NOFOLLOW so a symlinked
             # ref is never wiped through.
-            delete_private_key(ref)
+            if not delete_private_key(ref):
+                raise TeardownError(
+                    "key-destruction-failed",
+                    f"secure wipe failed for {ref}; "
+                    "refusing to attest erasure",
+                )
             report.keys_destroyed.append(ref)
     log("destroy-private-keys")
     # The material is gone before bulk deletion starts; the rows are
-    # removed in step 4 after dependent event rows.
+    # removed in the main transaction after dependent event rows.
     report.crypto_erasure_before_bulk = not dry_run
 
-    # Step 4: delete operational state.
+    # D9: write the consent tombstone BEFORE the relationship row is
+    # deleted. A crash between the row delete and the tombstone write
+    # would otherwise leave cleanup unresumable; with the tombstone
+    # first, the resume path above always has what it needs. The
+    # transient teardown journal goes right after: it preserves the
+    # invite ids and relay ownership picture for a resume after the DB
+    # commit, when relay_config rows are already gone.
     if not dry_run:
-        # Lift the append-only triggers for this relationship's rows only
-        # in effect (they are restored immediately afterwards).
-        conn.execute("DROP TRIGGER IF EXISTS events_no_update")
-        conn.execute("DROP TRIGGER IF EXISTS events_no_delete")
-        try:
-            event_ids = [
+        tombstone = _write_tombstone(
+            state_dir, digest, report.revoked_at, reason_code
+        )
+        _write_teardown_journal(state_dir, relationship_id, invite_ids, refs)
+    report.tombstone_path = str(tombstone)
+    log("write-tombstone")
+
+    # Step 4: delete operational state. D1: the append-only trigger drops,
+    # every relationship-scoped DB delete, and the trigger recreation run
+    # inside ONE explicit transaction. A crash can no longer leave the
+    # triggers missing or the deletes half-applied: either everything
+    # commits or everything rolls back. VACUUM stays outside the
+    # transaction, where SQLite requires it. D8: every IN (...) list is
+    # chunked so arbitrarily large histories cannot exceed the bound
+    # variable limit.
+    if not dry_run:
+        with transaction(conn):
+            triggers = {
                 r[0]
                 for r in conn.execute(
-                    "SELECT event_id FROM events WHERE relationship_id = ?",
-                    (relationship_id,),
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
                 ).fetchall()
+            }
+            missing = [
+                t
+                for t in ("events_no_update", "events_no_delete")
+                if t not in triggers
             ]
-            conv_ids = {
-                r[0]
-                for r in conn.execute(
-                    "SELECT DISTINCT conversation_id FROM events"
+            if missing:
+                # Fail closed: the append-only guarantee was already
+                # violated before teardown; refuse to proceed rather than
+                # silently accept a tampered event log.
+                raise TeardownError(
+                    "triggers-missing",
+                    f"append-only triggers missing: {missing}",
+                )
+            # Lift the append-only triggers for this transaction only;
+            # they are recreated before commit, so they are never
+            # observable missing.
+            conn.execute("DROP TRIGGER events_no_update")
+            conn.execute("DROP TRIGGER events_no_delete")
+            try:
+                event_ids = [
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT event_id FROM events WHERE relationship_id = ?",
+                        (relationship_id,),
+                    ).fetchall()
+                ]
+                conv_ids = {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT DISTINCT conversation_id FROM events"
+                        " WHERE relationship_id = ?",
+                        (relationship_id,),
+                    ).fetchall()
+                }
+                nonces = [
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT replay_nonce FROM events"
+                        " WHERE relationship_id = ?"
+                        " AND replay_nonce IS NOT NULL",
+                        (relationship_id,),
+                    ).fetchall()
+                ]
+                # Tables that were never created (e.g.
+                # deploy_key_registry on a store that never ran the pairing
+                # ceremony) are skipped.
+                existing_tables = {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                for table in (
+                    "projection_queue",
+                    "surface_queue",
+                    "receipt_queue",
+                ):
+                    # Scoping: only queue rows for this relationship's
+                    # events.
+                    col = (
+                        "event_id"
+                        if table != "receipt_queue"
+                        else "target_event_id"
+                    )
+                    for chunk in _chunks(event_ids):
+                        placeholders = ",".join("?" for _ in chunk)
+                        conn.execute(
+                            f"DELETE FROM {table} WHERE {col} IN ({placeholders})",
+                            chunk,
+                        )
+                # Scoping: only scheduler rows recorded for this
+                # relationship during migration...
+                sched_ids = _migration_scheduled_ids(conn, relationship_id)
+                for chunk in _chunks(sched_ids):
+                    placeholders = ",".join("?" for _ in chunk)
+                    conn.execute(
+                        "DELETE FROM scheduler_queue"
+                        f" WHERE scheduled_id IN ({placeholders})",
+                        chunk,
+                    )
+                # ...plus rows for this relationship's own events. The
+                # scheduler queue is the transactional outbox and
+                # scheduled_id IS the event_id for sends: any surviving
+                # row would later transmit for a dead relationship.
+                # Scoping: scheduled_id IN this relationship's event_ids
+                # only.
+                for chunk in _chunks(event_ids):
+                    eplaceholders = ",".join("?" for _ in chunk)
+                    conn.execute(
+                        "DELETE FROM scheduler_queue"
+                        f" WHERE scheduled_id IN ({eplaceholders})",
+                        chunk,
+                    )
+                    # sent_objects maps scheduled_id (= event_id) to
+                    # uploaded relay object names: per-relationship outbox
+                    # bookkeeping. Scoping: this relationship's event_ids
+                    # only.
+                    if "sent_objects" in existing_tables:
+                        conn.execute(
+                            "DELETE FROM sent_objects"
+                            f" WHERE scheduled_id IN ({eplaceholders})",
+                            chunk,
+                        )
+                for chunk in _chunks(nonces):
+                    # Scoping: only this relationship's replay nonces.
+                    nplaceholders = ",".join("?" for _ in chunk)
+                    conn.execute(
+                        "DELETE FROM replay_guard"
+                        f" WHERE replay_nonce IN ({nplaceholders})",
+                        chunk,
+                    )
+                # Encrypted payload cache must go before events (foreign
+                # key). Scoping: only this relationship's events.
+                for chunk in _chunks(event_ids):
+                    eplaceholders = ",".join("?" for _ in chunk)
+                    conn.execute(
+                        "DELETE FROM event_payloads"
+                        f" WHERE event_id IN ({eplaceholders})",
+                        chunk,
+                    )
+                # Projection tables: rows keyed by event, conversation, or
+                # relationship. No foreign keys, but they are relationship
+                # traces and must not survive teardown.
+                for chunk in _chunks(event_ids):
+                    placeholders = ",".join("?" for _ in chunk)
+                    conn.execute(
+                        "DELETE FROM message_revisions "
+                        f"WHERE edit_event_id IN ({placeholders})",
+                        chunk,
+                    )
+                    conn.execute(
+                        "DELETE FROM reactions "
+                        f"WHERE added_event_id IN ({placeholders})",
+                        chunk,
+                    )
+                    conn.execute(
+                        "DELETE FROM receipts "
+                        f"WHERE receipt_event_id IN ({placeholders})",
+                        chunk,
+                    )
+                    conn.execute(
+                        "DELETE FROM poll_responses "
+                        f"WHERE response_event_id IN ({placeholders})",
+                        chunk,
+                    )
+                for table in (
+                    "messages",
+                    "polls",
+                    "tasks",
+                    "human_requests",
+                    "deliveries",
+                    "security_key_events",
+                    "pending_refs",
+                    "sequence_gaps",
+                    "projection_cursors",
+                    "key_rotations",
+                    "rotation_quarantine",
+                    "transport_mutations",
+                    "transport_push_log",
+                    # Scoping on every table: WHERE relationship_id = ?,
+                    # so only this relationship's keys, approvals,
+                    # quarantine rows, relay config, and hook log are
+                    # deleted.
+                    "deploy_key_registry",
+                    "human_approvals",
+                    "quarantine",
+                    "receive_quarantine",
+                    "relay_config",
+                    "teardown_hook_log",
+                ):
+                    if table not in existing_tables:
+                        continue
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE relationship_id = ?",
+                        (relationship_id,),
+                    )
+                for chunk in _chunks(event_ids):
+                    # Scoping: only this relationship's sealed event rows.
+                    eplaceholders = ",".join("?" for _ in chunk)
+                    conn.execute(
+                        "DELETE FROM events"
+                        f" WHERE event_id IN ({eplaceholders})",
+                        chunk,
+                    )
+                # Conversations left with no events are local traces of this
+                # relationship; remove them and their threads. Conversations
+                # still referenced by other events are kept.
+                for cid in conv_ids:
+                    remaining = conn.execute(
+                        "SELECT COUNT(*) FROM events WHERE conversation_id = ?",
+                        (cid,),
+                    ).fetchone()[0]
+                    if remaining == 0:
+                        conn.execute(
+                            "DELETE FROM threads WHERE conversation_id = ?",
+                            (cid,),
+                        )
+                        conn.execute(
+                            "DELETE FROM conversations WHERE conversation_id = ?",
+                            (cid,),
+                        )
+                for chunk in _chunks(sorted(conv_ids)):
+                    cplaceholders = ",".join("?" for _ in chunk)
+                    conn.execute(
+                        "DELETE FROM thread_state "
+                        f"WHERE conversation_id IN ({cplaceholders})",
+                        chunk,
+                    )
+                # R9 recapture: a key row inserted between step 3's capture
+                # and this delete (a rotation that slipped in before
+                # revocation took effect) would otherwise leave its private
+                # key file on disk: the row is deleted below, but step 3
+                # only destroyed the files it captured. The write lock held
+                # by this transaction means no new row can appear after
+                # this point, so destroying recaptured files here closes
+                # the race. D5 applies: a failed wipe is a hard error, and
+                # keys_destroyed is appended only after success. A crash
+                # between the file deletion and the row delete below is
+                # safe (delete_private_key treats a missing file as done,
+                # and a re-run recaptures).
+                for (ref,) in conn.execute(
+                    "SELECT private_key_ref FROM key_epochs"
                     " WHERE relationship_id = ?",
                     (relationship_id,),
-                ).fetchall()
-            }
-            nonces = [
-                r[0]
-                for r in conn.execute(
-                    "SELECT replay_nonce FROM events WHERE relationship_id = ?",
-                    (relationship_id,),
-                ).fetchall()
-            ]
-            # Tables that were never created (e.g. deploy_key_registry on a
-            # store that never ran the pairing ceremony) are skipped.
-            existing_tables = {
-                r[0]
-                for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                ).fetchall()
-            }
-            for table in (
-                "projection_queue",
-                "surface_queue",
-                "receipt_queue",
-            ):
-                # Scoping: only queue rows for this relationship's events.
-                col = "event_id" if table != "receipt_queue" else "target_event_id"
-                for eid in event_ids:
-                    conn.execute(
-                        f"DELETE FROM {table} WHERE {col} = ?", (eid,)
-                    )
-            # Scoping: only scheduler rows recorded for this relationship
-            # during migration...
-            sched_ids = _migration_scheduled_ids(conn, relationship_id)
-            for sid in sched_ids:
+                ).fetchall():
+                    if ref == PEER_KEY_REF or ref in key_refs:
+                        continue
+                    key_refs.append(ref)
+                    if not delete_private_key(ref):
+                        raise TeardownError(
+                            "key-destruction-failed",
+                            f"secure wipe failed for {ref}; "
+                            "refusing to attest erasure",
+                        )
+                    report.keys_destroyed.append(ref)
                 conn.execute(
-                    "DELETE FROM scheduler_queue WHERE scheduled_id = ?", (sid,)
-                )
-            # ...plus rows for this relationship's own events. The
-            # scheduler queue is the transactional outbox and scheduled_id
-            # IS the event_id for sends: any surviving row would later
-            # transmit for a dead relationship.
-            # Scoping: scheduled_id IN this relationship's event_ids only.
-            if event_ids:
-                eplaceholders = ",".join("?" for _ in event_ids)
-                conn.execute(
-                    "DELETE FROM scheduler_queue"
-                    f" WHERE scheduled_id IN ({eplaceholders})",
-                    event_ids,
-                )
-                # sent_objects maps scheduled_id (= event_id) to uploaded
-                # relay object names: per-relationship outbox bookkeeping.
-                # Scoping: this relationship's event_ids only.
-                if "sent_objects" in existing_tables:
-                    conn.execute(
-                        "DELETE FROM sent_objects"
-                        f" WHERE scheduled_id IN ({eplaceholders})",
-                        event_ids,
-                    )
-            for nonce in nonces:
-                # Scoping: only this relationship's replay nonces.
-                conn.execute(
-                    "DELETE FROM replay_guard WHERE replay_nonce = ?", (nonce,)
-                )
-            # Encrypted payload cache must go before events (foreign key).
-            # Scoping: only this relationship's events.
-            for eid in event_ids:
-                conn.execute(
-                    "DELETE FROM event_payloads WHERE event_id = ?", (eid,)
-                )
-            # Projection tables: rows keyed by event, conversation, or
-            # relationship. No foreign keys, but they are relationship
-            # traces and must not survive teardown.
-            placeholders = ",".join("?" for _ in event_ids) or "NULL"
-            conn.execute(
-                "DELETE FROM message_revisions "
-                f"WHERE edit_event_id IN ({placeholders})",
-                event_ids,
-            )
-            conn.execute(
-                "DELETE FROM reactions "
-                f"WHERE added_event_id IN ({placeholders})",
-                event_ids,
-            )
-            conn.execute(
-                "DELETE FROM receipts "
-                f"WHERE receipt_event_id IN ({placeholders})",
-                event_ids,
-            )
-            conn.execute(
-                "DELETE FROM poll_responses "
-                f"WHERE response_event_id IN ({placeholders})",
-                event_ids,
-            )
-            for table in (
-                "messages",
-                "polls",
-                "tasks",
-                "human_requests",
-                "deliveries",
-                "security_key_events",
-                "pending_refs",
-                "sequence_gaps",
-                "projection_cursors",
-                "key_rotations",
-                "rotation_quarantine",
-                "transport_mutations",
-                "transport_push_log",
-                # Scoping on every table: WHERE relationship_id = ?, so only
-                # this relationship's keys, approvals, quarantine rows, and
-                # relay config are deleted.
-                "deploy_key_registry",
-                "human_approvals",
-                "quarantine",
-                "receive_quarantine",
-                "relay_config",
-            ):
-                if table not in existing_tables:
-                    continue
-                conn.execute(
-                    f"DELETE FROM {table} WHERE relationship_id = ?",
+                    "DELETE FROM key_epochs WHERE relationship_id = ?",
                     (relationship_id,),
                 )
-            for eid in event_ids:
-                # Scoping: only this relationship's sealed event rows.
-                conn.execute("DELETE FROM events WHERE event_id = ?", (eid,))
-            # Conversations left with no events are local traces of this
-            # relationship; remove them and their threads. Conversations
-            # still referenced by other events are kept.
-            for cid in conv_ids:
-                remaining = conn.execute(
-                    "SELECT COUNT(*) FROM events WHERE conversation_id = ?",
-                    (cid,),
-                ).fetchone()[0]
-                if remaining == 0:
-                    conn.execute(
-                        "DELETE FROM threads WHERE conversation_id = ?", (cid,)
-                    )
-                    conn.execute(
-                        "DELETE FROM conversations WHERE conversation_id = ?",
-                        (cid,),
-                    )
-            if conv_ids:
-                conv_list = sorted(conv_ids)
-                cplaceholders = ",".join("?" for _ in conv_list)
                 conn.execute(
-                    "DELETE FROM thread_state "
-                    f"WHERE conversation_id IN ({cplaceholders})",
-                    conv_list,
+                    "DELETE FROM sender_sequence WHERE relationship_id = ?",
+                    (relationship_id,),
                 )
-            conn.execute(
-                "DELETE FROM key_epochs WHERE relationship_id = ?",
-                (relationship_id,),
-            )
-            conn.execute(
-                "DELETE FROM sender_sequence WHERE relationship_id = ?",
-                (relationship_id,),
-            )
-            _delete_relationship_invites(conn, relationship_id, existing_tables)
-            _delete_relationship_mstate(conn, relationship_id)
-            conn.execute(
-                "DELETE FROM relationships WHERE relationship_id = ?",
-                (relationship_id,),
-            )
-        finally:
-            conn.execute(_TRIGGER_EVENTS_NO_UPDATE)
-            conn.execute(_TRIGGER_EVENTS_NO_DELETE)
+                _delete_relationship_invites(
+                    conn, relationship_id, existing_tables
+                )
+                _delete_relationship_mstate(conn, relationship_id)
+                conn.execute(
+                    "DELETE FROM relationships WHERE relationship_id = ?",
+                    (relationship_id,),
+                )
+            finally:
+                # Recreated inside the transaction: a crash before commit
+                # rolls the drops back, so the triggers are never left
+                # missing.
+                conn.execute(_TRIGGER_EVENTS_NO_UPDATE)
+                conn.execute(_TRIGGER_EVENTS_NO_DELETE)
+        # VACUUM cannot run inside a transaction; it follows the commit.
         conn.execute("VACUUM")
         try:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -966,80 +1408,23 @@ def teardown_relationship(
             pass
     log("delete-state")
 
-    # Step 4 (files) / 5: overwrite once, unlink, remove dirs. Every
-    # deletion below is scoped to this relationship_id: shared parent dirs
-    # (state dir, keys dir, relay.json) are pruned, never removed wholesale.
+    # Step 5 (files): overwrite once, unlink, remove dirs. Every deletion
+    # below is scoped to this relationship_id: shared parent dirs (state
+    # dir, keys dir, relay.json) are pruned, never removed wholesale.
     if not dry_run:
-        for dirname in _OPERATIONAL_DIRS:
-            _wipe_operational_dir(
-                state_dir / dirname, relationship_id, report, dry_run
-            )
-        # Per-relationship transport and watcher state (authoritative list
-        # from _relationship_fs_paths): the git mirror, the mirror lock,
-        # and watcher resume state. Wiping these is what lets the postcheck
-        # below pass after the keys were destroyed in step 3.
-        # Scoping: only this relationship's paths; sibling relationships'
-        # mirrors/locks/watcher files are untouched.
-        for path in _relationship_fs_paths(state_dir, relationship_id):
-            _wipe_tree(path, report, dry_run)
-        # Any stray file or dir named with the relationship id.
-        # Scoping: name match on relationship_id (validated path-safe
-        # above); the tombstones dir is excluded.
-        for p in list(state_dir.iterdir()):
-            if relationship_id in p.name and p.name != "tombstones":
-                _wipe_tree(p, report, dry_run)
-        # The per-relationship key subtree, secure-wiped first (random
-        # overwrite, fsync, unlink per file). Scoping: only
-        # <keys_dir>/<relationship_id>; the shared keys dir itself stays.
-        # Pairing-ephemeral key material for this relationship's invites
-        # (<keys_dir>/invites/<iid>, <keys_dir>/pairing/<iid>) goes too.
-        for keys_dir in _keys_dir_candidates(conn, state_dir):
-            _secure_wipe_subtree(
-                keys_dir / relationship_id, report, dry_run
-            )
-            for iid in invite_ids:
-                if (
-                    not iid
-                    or "/" in iid
-                    or "\\" in iid
-                    or iid in (".", "..")
-                ):
-                    continue
-                _secure_wipe_subtree(
-                    keys_dir / "invites" / iid, report, dry_run
-                )
-                _secure_wipe_subtree(
-                    keys_dir / "pairing" / iid, report, dry_run
-                )
-        # Relay config file: only this relationship's entries are pruned;
-        # the file survives while other relationships have entries.
-        _prune_relay_json(state_dir, refs, report, dry_run, log)
-        # relay.yaml is legacy ambient config (nothing in v0.2 writes it).
-        cfg = state_dir / "relay.yaml"
-        if cfg.is_file():
-            secure_unlink(cfg)
-            report.files_deleted += 1
+        _wipe_relationship_files(
+            conn,
+            state_dir,
+            relationship_id,
+            invite_ids,
+            refs,
+            report,
+            dry_run,
+            log,
+        )
     log("wipe-files")
 
-    # Step 6: minimal consent tombstone (id hash, revoked time, reason).
-    tombstone = _tombstone_path(state_dir, relationship_id)
-    if not dry_run:
-        tombstone.parent.mkdir(parents=True, exist_ok=True)
-        tombstone.write_text(
-            json.dumps(
-                {
-                    "relationship_id_sha256": digest,
-                    "revoked_at": report.revoked_at,
-                    "reason_code": reason_code,
-                }
-            ),
-            encoding="utf-8",
-        )
-        os.chmod(tombstone, 0o600)
-    report.tombstone_path = str(tombstone)
-    log("write-tombstone")
-
-    # Step 5 (post-check): scan for pair ID, peer label, key refs.
+    # Post-check: scan for pair ID, peer label, key refs.
     scan = postcheck_scan(
         state_dir, relationship_id, peer_label, tuple(key_refs)
     )
@@ -1052,9 +1437,12 @@ def teardown_relationship(
             "postcheck-dirty",
             f"residual traces remain: {hits[:5]}",
         )
+    # Success: the transient resume journal is no longer needed. The
+    # consent tombstone remains.
+    if not dry_run:
+        _delete_teardown_journal(state_dir, relationship_id)
+        log("delete-teardown-journal")
     return report
-
-
 def _relationship_invite_ids(conn: Any, relationship_id: str) -> list[str]:
     """Invite ids linked to this relationship via migration_state refs.
 
@@ -1117,12 +1505,11 @@ def _delete_relationship_invites(
     Scoping: only invites linked to this relationship_id (via
     migration_state refs); other relationships' invites keep their rows.
     Child rows (pairing_verifications, invite_bodies) are deleted before
-    the invites parent rows for the foreign key.
+    the invites parent rows for the foreign key. D8: IN lists are chunked.
     """
     invite_ids = _relationship_invite_ids(conn, relationship_id)
     if not invite_ids:
         return
-    placeholders = ",".join("?" for _ in invite_ids)
     for table in (
         "pairing_verifications",
         "invite_bodies",
@@ -1130,15 +1517,19 @@ def _delete_relationship_invites(
     ):
         if table not in existing_tables:
             continue
-        conn.execute(
-            f"DELETE FROM {table} WHERE invite_id IN ({placeholders})",
-            invite_ids,
-        )
+        for chunk in _chunks(invite_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(
+                f"DELETE FROM {table} WHERE invite_id IN ({placeholders})",
+                chunk,
+            )
     if "invites" in existing_tables:
-        conn.execute(
-            f"DELETE FROM invites WHERE invite_id IN ({placeholders})",
-            invite_ids,
-        )
+        for chunk in _chunks(invite_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(
+                f"DELETE FROM invites WHERE invite_id IN ({placeholders})",
+                chunk,
+            )
 
 
 def _delete_relationship_mstate(conn: Any, relationship_id: str) -> None:

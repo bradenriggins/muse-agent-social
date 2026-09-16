@@ -16,8 +16,16 @@ import os
 import re
 import threading
 from pathlib import Path
+from typing import Any, Callable
 
-from .base import OBJECT_MAX_BYTES, Transport, TransportError
+from .base import (
+    FETCH_MAX_AGGREGATE_BYTES,
+    FETCH_MAX_OBJECTS,
+    OBJECT_MAX_BYTES,
+    Transport,
+    TransportError,
+    new_stream_stats,
+)
 
 # base64url(24 random bytes) -> 32 chars, plus ".json". No timestamps, no
 # event IDs, no sender info in the name.
@@ -91,25 +99,86 @@ class LocalTransport(Transport):
     def changed(self, since_head: str) -> bool:
         return self.head() != since_head
 
-    def fetch_new(self, since: str) -> list[tuple[str, bytes]]:
+    def fetch_new_stream(
+        self, since: str, visit: Callable[[str, bytes], bool]
+    ) -> dict[str, Any]:
+        """Stream incoming objects, visiting each as it is read.
+
+        The visitor (watcher) calls transport.consume() per accepted /
+        quarantined object, and consume() takes self._lock: the lock must
+        NOT be held across visitor calls or the watcher deadlocks. The
+        file list is snapshotted under the lock; each object is then read
+        and visited without it, and a file consumed concurrently is
+        skipped (next poll converges).
+
+        The aggregate bounds (FETCH_MAX_OBJECTS / FETCH_MAX_AGGREGATE_BYTES)
+        are enforced before buffering the next object, exactly as in the
+        git transport.
+        """
+        stats = new_stream_stats()
         if since and since == self.head():
-            return []
-        items: list[tuple[str, bytes]] = []
-        for path in sorted(self.incoming.glob("*.json")):
-            # Size pre-check from stat() metadata BEFORE read_bytes(): an
-            # over-cap object is never buffered into memory. The receive
-            # loop (watcher.run_once) enforces the cap itself via len(data)
-            # and quarantines oversized input without failing the run, so
-            # an over-cap object is returned with a bounded placeholder
-            # that still trips that check instead of its full content.
+            return stats
+        with self._lock:
+            paths = sorted(self.incoming.glob("*.json"))
+        for path in paths:
+            if stats["objects_streamed"] >= FETCH_MAX_OBJECTS:
+                stats["truncated"] = True
+                stats["truncation_reason"] = "object_cap"
+                break
+            # Aggregate bound checked BEFORE buffering, counting what the
+            # stream actually delivers: an over-cap object is delivered as
+            # a bounded placeholder of OBJECT_MAX_BYTES + 1, so the
+            # placeholder counts toward the aggregate too. An exact-cap
+            # total is allowed.
             try:
-                check_object_size(path.name, path.stat().st_size)
+                size = path.stat().st_size
+            except FileNotFoundError:
+                continue  # consumed concurrently; next poll converges
+            deliver_size = (
+                size if size <= OBJECT_MAX_BYTES else OBJECT_MAX_BYTES + 1
+            )
+            if stats["bytes_streamed"] + deliver_size > FETCH_MAX_AGGREGATE_BYTES:
+                stats["truncated"] = True
+                stats["truncation_reason"] = "aggregate_bytes_cap"
+                break
+            # Size pre-check from stat() metadata BEFORE read_bytes():
+            # an over-cap object is never buffered into memory. The
+            # receive loop (watcher.run_once) enforces the cap itself
+            # via len(data) and quarantines oversized input without
+            # failing the run, so an over-cap object is delivered as a
+            # bounded placeholder that still trips that check instead
+            # of its full content.
+            try:
+                check_object_size(path.name, size)
             except TransportError as exc:
                 if exc.code != "object_too_large":
                     raise
-                items.append((path.name, b"\x00" * (OBJECT_MAX_BYTES + 1)))
-                continue
-            items.append((path.name, path.read_bytes()))
+                data = b"\x00" * (OBJECT_MAX_BYTES + 1)
+            else:
+                try:
+                    data = path.read_bytes()
+                except FileNotFoundError:
+                    continue  # consumed concurrently; next poll converges
+            stats["objects_streamed"] += 1
+            stats["bytes_streamed"] += len(data)
+            if visit(path.name, data) is False:
+                stats["truncated"] = True
+                stats["truncation_reason"] = "caller_stopped"
+                break
+        return stats
+
+    def fetch_new(self, since: str) -> list[tuple[str, bytes]]:
+        """Buffered legacy entry point; prefer fetch_new_stream.
+
+        Still bounded by FETCH_MAX_OBJECTS / FETCH_MAX_AGGREGATE_BYTES.
+        """
+        items: list[tuple[str, bytes]] = []
+
+        def visit(name: str, data: bytes) -> bool:
+            items.append((name, data))
+            return True
+
+        self.fetch_new_stream(since, visit)
         return items
 
     def read_object(self, object_name: str) -> bytes:

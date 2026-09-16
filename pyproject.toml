@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=78.1.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -12,10 +12,16 @@ dependencies = [
     "base58==2.1.1",
     "jsonschema==4.26.0",
     "regex==2026.9.10",
+    "referencing==0.37.0",
 ]
 
 [project.scripts]
 mas = "muse_agent_social.cli:main"
+
+[project.optional-dependencies]
+test = [
+    "pytest==9.1.1",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

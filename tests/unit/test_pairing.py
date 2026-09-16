@@ -898,3 +898,208 @@ def test_reset_invite_for_retry_unknown_invite_is_noop(inviter):
     make_invite(conn, inviter)
     # Must not raise on an invite id that was never issued here.
     cli_mod._reset_invite_for_retry(conn, "12345678-1234-4234-8234-123456789abc")
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for finding D7 (pairing retry and key cleanup).
+# ---------------------------------------------------------------------------
+
+
+def _setup_commit_inputs(tmp_path, inviter, acceptor):
+    """Build everything commit_pairing needs, stopping before the commit."""
+    conn_i, conn_a = make_db(), make_db()
+    keys_i = str(tmp_path / "keys_i")
+    keys_a = str(tmp_path / "keys_a")
+    deploy = str(tmp_path / "deploy")
+    os.makedirs(keys_a)
+    os.makedirs(deploy)
+    invite = make_invite(conn_i, inviter)
+    acceptance, _, _, _ = accept_invite(
+        conn_a, invite, acceptor, T0 + timedelta(seconds=30), keys_a, deploy
+    )
+    validate_invite(conn_i, invite, now=T0 + timedelta(seconds=60))
+    record_verification(
+        conn_i,
+        invite["invite_id"],
+        (
+            card_fingerprint(invite["inviter_card"]),
+            card_fingerprint(acceptance["acceptor_card"]),
+        ),
+        True,
+    )
+    return conn_i, invite, acceptance, inviter, keys_i
+
+
+def _commit_kwargs(conn_i, invite, acceptance, inviter, keys_i, rid):
+    return dict(
+        conn=conn_i,
+        acceptance=acceptance,
+        inviter_priv=inviter[0].ed25519_private,
+        relay_url="https://github.com/example-org/relay-xyz",
+        slots={"inviter_send_slot": "slot-a", "inviter_receive_slot": "slot-b"},
+        negotiated_capabilities=CAPS,
+        now=T0 + timedelta(seconds=90),
+        keys_dir=keys_i,
+        relationship_id=rid,
+    )
+
+
+def test_load_or_generate_deploy_keypair_reuses_existing(tmp_path):
+    """D7: a retry reuses the existing same-invite deploy keypair and
+    derives the identical public key from the stored private key."""
+    from muse_agent_social.model.invites import load_or_generate_deploy_keypair
+
+    path = str(tmp_path / "deploy-inviter")
+    pub1 = load_or_generate_deploy_keypair(path)
+    assert pub1.startswith("ssh-ed25519 ")
+    before = os.stat(path)
+    pub2 = load_or_generate_deploy_keypair(path)
+    assert pub2 == pub1
+    after = os.stat(path)
+    assert (after.st_mtime_ns, after.st_size) == (
+        before.st_mtime_ns,
+        before.st_size,
+    )
+
+
+def test_load_or_generate_deploy_keypair_rejects_non_ed25519(tmp_path):
+    """D7: an existing non-Ed25519 deploy key fails loudly instead of
+    being silently replaced."""
+    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+
+    from muse_agent_social.model.invites import load_or_generate_deploy_keypair
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    path = tmp_path / "deploy-inviter"
+    path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.OpenSSH,
+            serialization.NoEncryption(),
+        )
+    )
+    with pytest.raises(PairingError) as excinfo:
+        load_or_generate_deploy_keypair(str(path))
+    assert excinfo.value.code == "bad_deploy_key"
+
+
+def test_commit_pairing_retries_after_orphan_epoch1_key(
+    tmp_path, inviter, acceptor
+):
+    """D7: a crashed attempt that stored epoch1.key without committing is
+    reconciled on retry: the orphan is securely wiped and the store
+    succeeds instead of raising an uncaught FileExistsError."""
+    from muse_agent_social._keyfiles import store_private_key
+
+    conn_i, invite, acceptance, inv, keys_i = _setup_commit_inputs(
+        tmp_path, inviter, acceptor
+    )
+    rid = str(uuid.uuid4())
+    orphan = os.path.join(keys_i, rid, "epoch1.key")
+    os.makedirs(os.path.dirname(orphan), exist_ok=True)
+    store_private_key(orphan, os.urandom(32))  # the crashed attempt's key
+    commit = commit_pairing(
+        **_commit_kwargs(conn_i, invite, acceptance, inv, keys_i, rid)
+    )
+    assert commit["relationship_id"] == rid
+    # The committed key is the fresh one, not the orphan bytes.
+    assert os.path.exists(orphan)
+
+
+def test_commit_pairing_refuses_overwrite_with_live_state(
+    tmp_path, inviter, acceptor
+):
+    """D7: when live relationship state owns the key file, the retry
+    re-raises FileExistsError instead of overwriting."""
+    from muse_agent_social._keyfiles import store_private_key
+
+    conn_i, invite, acceptance, inv, keys_i = _setup_commit_inputs(
+        tmp_path, inviter, acceptor
+    )
+    rid = str(uuid.uuid4())
+    key_path = os.path.join(keys_i, rid, "epoch1.key")
+    os.makedirs(os.path.dirname(key_path), exist_ok=True)
+    store_private_key(key_path, os.urandom(32))
+    conn_i.execute(
+        "INSERT INTO relationships (relationship_id, peer_identity_id, "
+        "peer_display_name, consent_state, policy, created_at) "
+        "VALUES (?, 'did:key:z', 'P', 'pending', '{}', ?)",
+        (rid, T0.isoformat().replace("+00:00", "Z")),
+    )
+    with pytest.raises(FileExistsError):
+        commit_pairing(
+            **_commit_kwargs(conn_i, invite, acceptance, inv, keys_i, rid)
+        )
+
+
+def test_commit_pairing_failure_uses_secure_delete(
+    tmp_path, monkeypatch, inviter, acceptor
+):
+    """D7: a failed commit destroys the pairing key with delete_private_key
+    (overwrite + unlink), not a bare os.unlink."""
+    from muse_agent_social.model import invites as inv_mod
+
+    conn_i, invite, acceptance, inv, keys_i = _setup_commit_inputs(
+        tmp_path, inviter, acceptor
+    )
+    rid = str(uuid.uuid4())
+    calls = []
+    real_delete = inv_mod.delete_private_key
+
+    def spy(path):
+        calls.append(str(path))
+        return real_delete(path)
+
+    monkeypatch.setattr(inv_mod, "delete_private_key", spy)
+
+    def boom(*a, **k):
+        raise PairingError("boom", "simulated commit failure")
+
+    monkeypatch.setattr(inv_mod, "_commit_txn", boom)
+    with pytest.raises(PairingError) as excinfo:
+        commit_pairing(
+            **_commit_kwargs(conn_i, invite, acceptance, inv, keys_i, rid)
+        )
+    assert excinfo.value.code == "boom"
+    key_path = os.path.join(keys_i, rid, "epoch1.key")
+    assert calls == [key_path]
+    assert not os.path.exists(key_path)
+
+
+def test_destroy_pairing_key_failure_raises(tmp_path, monkeypatch):
+    """D7: when secure deletion fails, the cleanup raises
+    key_destruction_failed instead of silently leaving key material."""
+    from muse_agent_social.model import invites as inv_mod
+
+    path = str(tmp_path / "k.key")
+    with open(path, "wb") as fh:
+        fh.write(os.urandom(32))
+    monkeypatch.setattr(inv_mod, "delete_private_key", lambda p: False)
+    with pytest.raises(PairingError) as excinfo:
+        inv_mod._destroy_pairing_key(path)
+    assert excinfo.value.code == "key_destruction_failed"
+
+
+def test_reconcile_orphan_key_wipe_failure_raises(
+    tmp_path, monkeypatch, inviter, acceptor
+):
+    """D7: when the orphan wipe fails during retry reconciliation, the
+    retry aborts loudly instead of storing over recoverable key bytes."""
+    from muse_agent_social._keyfiles import store_private_key
+    from muse_agent_social.model import invites as inv_mod
+
+    conn_i, invite, acceptance, inv, keys_i = _setup_commit_inputs(
+        tmp_path, inviter, acceptor
+    )
+    rid = str(uuid.uuid4())
+    orphan = os.path.join(keys_i, rid, "epoch1.key")
+    os.makedirs(os.path.dirname(orphan), exist_ok=True)
+    store_private_key(orphan, os.urandom(32))
+    monkeypatch.setattr(inv_mod, "delete_private_key", lambda p: False)
+    with pytest.raises(PairingError) as excinfo:
+        commit_pairing(
+            **_commit_kwargs(conn_i, invite, acceptance, inv, keys_i, rid)
+        )
+    assert excinfo.value.code == "key_destruction_failed"

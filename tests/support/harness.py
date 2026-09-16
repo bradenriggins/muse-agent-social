@@ -233,8 +233,16 @@ def make_sealed(
     created_at: str | None = None,
     deliver_at: str | None = None,
     expires_at: str | None = None,
+    event_id: str | None = None,
+    replay_nonce: str | None = None,
 ) -> tuple[dict, bytes]:
     """Build a protected header (with an explicit sender_seq) and seal it.
+
+    event_id / replay_nonce override the fresh values build_protected
+    generates; they must be supplied before sealing because the seal's
+    wrap AAD binds the protected-header digest. Post-seal mutation of any
+    protected field breaks the seal (tampered_wrap) instead of reaching
+    the receive pipeline.
 
     Returns (envelope_dict, canonical_bytes).
     """
@@ -251,6 +259,10 @@ def make_sealed(
         created_at=created_at,
     )
     protected["sender_seq"] = seq
+    if event_id is not None:
+        protected["event_id"] = event_id
+    if replay_nonce is not None:
+        protected["replay_nonce"] = replay_nonce
     envelope = seal_envelope(
         protected,
         payload,

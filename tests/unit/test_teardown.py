@@ -17,6 +17,7 @@ from muse_agent_social.store.migrations import migrate as migrate_schema
 from muse_agent_social.teardown import (
     TeardownError,
     TeardownHooks,
+    _teardown_journal_path,
     postcheck_scan,
     secure_unlink,
     teardown_relationship,
@@ -254,7 +255,7 @@ def test_teardown_full(tmp_path):
     assert report.deploy_keys_revoked == [f"org/relay-repo:mas-pair-{REL}"]
     assert report.relay_repos_deleted == ["org/relay-repo"]
 
-    # Only the tombstone remains.
+    # Only the minimal-spec tombstone remains.
     tomb = json.loads(open(report.tombstone_path, encoding="utf-8").read())
     assert set(tomb.keys()) == {
         "relationship_id_sha256",
@@ -265,6 +266,9 @@ def test_teardown_full(tmp_path):
     assert PEER_LABEL not in json.dumps(tomb)
     assert REL not in json.dumps(tomb)
     assert stat.S_IMODE(os.stat(report.tombstone_path).st_mode) == 0o600
+    # The transient journal is deleted on success.
+    journal = _teardown_journal_path(state_dir, REL)
+    assert not journal.exists()
 
     # Post-check is clean and the append-only triggers were restored.
     assert report.postcheck_hits == []
@@ -737,3 +741,320 @@ def test_teardown_keeps_unattributed_relay_entries_when_ambiguous(tmp_path):
     ]
     assert cfg["repos"] == ["org/shared-relay", "org/legacy-repo"]
     fx["conn"].close()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for findings D1, D3, D5, D8, D9.
+# ---------------------------------------------------------------------------
+
+
+def test_chunks_splits_and_bounds():
+    from muse_agent_social.teardown import _chunks
+
+    assert list(_chunks([])) == []
+    assert list(_chunks([1, 2, 3], size=2)) == [[1, 2], [3]]
+    big = list(range(1200))
+    parts = list(_chunks(big))
+    assert len(parts) == 3
+    assert all(len(p) <= 500 for p in parts)
+    assert [x for p in parts for x in p] == big
+
+
+def test_teardown_trigger_drop_is_atomic_on_mid_txn_failure(
+    tmp_path, monkeypatch
+):
+    """D1: a failure inside the teardown transaction rolls everything back.
+
+    The append-only triggers must still exist and no relationship-scoped
+    row may be left partially deleted; a retry then converges.
+    """
+    import muse_agent_social.teardown as td_mod
+
+    fx = _two_rel_state(tmp_path)
+
+    def boom(conn, relationship_id):
+        raise RuntimeError("simulated crash inside teardown transaction")
+
+    monkeypatch.setattr(td_mod, "_delete_relationship_mstate", boom)
+    with pytest.raises(RuntimeError):
+        _teardown_a(fx)
+    conn = fx["conn"]
+    # The trigger drops were rolled back: the append-only guarantee is
+    # intact and observable.
+    triggers = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall()
+    }
+    assert {"events_no_update", "events_no_delete"} <= triggers
+    # Nothing was partially deleted.
+    assert _count(conn, "relationships", "relationship_id = ?", (fx["a"],)) == 1
+    assert _count(conn, "events", "relationship_id = ?", (fx["a"],)) == 1
+    assert _count(conn, "key_epochs", "relationship_id = ?", (fx["a"],)) == 1
+    # A retry converges fully.
+    monkeypatch.undo()
+    report = _teardown_a(fx)
+    assert report.postcheck_hits == []
+    assert _count(conn, "relationships", "relationship_id = ?", (fx["a"],)) == 0
+    conn.close()
+
+
+def test_teardown_completed_hooks_not_repeated_after_crash(
+    tmp_path, monkeypatch
+):
+    """D3: hooks recorded complete are never repeated by a resumed run."""
+    import muse_agent_social.teardown as td_mod
+
+    fx = _two_rel_state(tmp_path)
+    hooks = FakeHooks()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash before tombstone")
+
+    monkeypatch.setattr(td_mod, "_write_tombstone", boom)
+    with pytest.raises(RuntimeError):
+        _teardown_a(fx, hooks)
+    # The remote action completed and its completion was recorded.
+    assert len(hooks.revoked) == 1
+    conn = fx["conn"]
+    logged = conn.execute(
+        "SELECT hook, target FROM teardown_hook_log WHERE relationship_id = ?",
+        (fx["a"],),
+    ).fetchall()
+    # Only the deploy-key revoke: the shared relay repo is kept while B
+    # still references it, so no repo hook fired.
+    assert [r[0] for r in logged] == ["revoke_deploy_key"]
+    # Resume: the completed hook is skipped, teardown converges.
+    monkeypatch.undo()
+    report = _teardown_a(fx, hooks)
+    assert len(hooks.revoked) == 1
+    assert hooks.deleted_repos == []
+    assert report.postcheck_hits == []
+    conn.close()
+
+
+def test_teardown_tombstone_path_rewipes_leftover_files(tmp_path):
+    """D3: the tombstone path re-drives the file wipe instead of wedging.
+
+    A stray created after the first run's wipe is cleaned by the second
+    run; the postcheck stays clean and the run reports already_torn_down.
+    """
+    fx = _two_rel_state(tmp_path)
+    first = _teardown_a(fx)
+    assert first.already_torn_down is False
+    stray = fx["state_dir"] / "bundles" / "late-arrival.json"
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_text(json.dumps({"rel": fx["a"]}))
+    second = _teardown_a(fx)
+    assert second.already_torn_down is True
+    assert second.postcheck_hits == []
+    assert not stray.exists()
+    fx["conn"].close()
+
+
+def test_teardown_tombstone_path_still_dirty_raises(tmp_path, monkeypatch):
+    """D3: a postcheck that is STILL dirty after a fresh re-wipe raises
+    instead of silently succeeding."""
+    import muse_agent_social.teardown as td_mod
+
+    fx = _two_rel_state(tmp_path)
+    _teardown_a(fx)
+    stray = fx["state_dir"] / "bundles" / "late-arrival.json"
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_text(json.dumps({"rel": fx["a"]}))
+    # Break the re-wipe so the stray survives it.
+    monkeypatch.setattr(
+        td_mod, "_wipe_relationship_files", lambda *a, **k: None
+    )
+    with pytest.raises(TeardownError) as exc_info:
+        _teardown_a(fx)
+    assert exc_info.value.code == "postcheck-dirty"
+    fx["conn"].close()
+
+
+def test_teardown_key_wipe_failure_is_hard_error(tmp_path, monkeypatch):
+    """D5: a failed private-key wipe aborts teardown loudly and attests
+    nothing: no keys_destroyed entry, no tombstone, row still present."""
+    import muse_agent_social.teardown as td_mod
+
+    fx = _two_rel_state(tmp_path)
+    monkeypatch.setattr(td_mod, "delete_private_key", lambda ref: False)
+    with pytest.raises(TeardownError) as exc_info:
+        _teardown_a(fx)
+    assert exc_info.value.code == "key-destruction-failed"
+    conn = fx["conn"]
+    assert _count(conn, "relationships", "relationship_id = ?", (fx["a"],)) == 1
+    assert not td_mod._tombstone_path(fx["state_dir"], fx["a"]).is_file()
+    conn.close()
+
+
+def test_teardown_chunked_deletes_handle_large_history(tmp_path):
+    """D8: histories larger than the SQLite bound-variable limit are
+    deleted through chunked IN lists; the survivor is untouched."""
+    fx = _two_rel_state(tmp_path)
+    conn = fx["conn"]
+    rid = fx["a"]
+    for i in range(1200):
+        eid = f"bulk-{i:05d}"
+        conn.execute(
+            "INSERT INTO events (event_id, relationship_id, conversation_id,"
+            " thread_id, sender, sender_seq, created_at, key_epoch,"
+            " event_type, replay_nonce, sealed_envelope)"
+            " VALUES (?, ?, ?, ?, 'sender', ?, ?, 1, 'message.created', ?, ?)",
+            (
+                eid,
+                rid,
+                rid,
+                rid + ":t",
+                100 + i,
+                utcnow(),
+                f"bulk-nonce-{i}",
+                b"sealed",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO projection_queue (event_id, queued_at)"
+            " VALUES (?, ?)",
+            (eid, utcnow()),
+        )
+        conn.execute(
+            "INSERT INTO receipt_queue (target_event_id, kind, queued_at)"
+            " VALUES (?, 'accepted', ?)",
+            (eid, utcnow()),
+        )
+        conn.execute(
+            "INSERT INTO scheduler_queue (scheduled_id, inner_event,"
+            " deliver_at, state) VALUES (?, ?, ?, 'scheduled')",
+            (eid, b"sealed", utcnow()),
+        )
+    conn.commit()
+    report = _teardown_a(fx)
+    assert report.postcheck_hits == []
+    assert _count(conn, "events", "relationship_id = ?", (rid,)) == 0
+    assert _count(conn, "projection_queue") == 0
+    assert _count(conn, "receipt_queue") == 1
+    assert _count(conn, "scheduler_queue") == 1
+    # The surviving relationship is untouched.
+    assert _count(conn, "events", "relationship_id = ?", (fx["b"],)) == 1
+    conn.close()
+
+
+def test_teardown_tombstone_written_before_row_delete(tmp_path, monkeypatch):
+    """D9: a crash between the tombstone write and the relationship-row
+    delete leaves a resumable state (tombstone present, row present), and
+    a retry converges."""
+    import muse_agent_social.teardown as td_mod
+
+    fx = _two_rel_state(tmp_path)
+    real_transaction = td_mod.transaction
+    calls = []
+
+    def crash_on_entry(conn):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("simulated crash before main transaction")
+        return real_transaction(conn)
+
+    monkeypatch.setattr(td_mod, "transaction", crash_on_entry)
+    with pytest.raises(RuntimeError):
+        _teardown_a(fx)
+    conn = fx["conn"]
+    tombstone = td_mod._tombstone_path(fx["state_dir"], fx["a"])
+    assert tombstone.is_file()
+    assert _count(conn, "relationships", "relationship_id = ?", (fx["a"],)) == 1
+    # The journal already carries the invite ids for the resume wipe;
+    # the tombstone keeps the minimal spec contract.
+    journal = _teardown_journal_path(fx["state_dir"], fx["a"])
+    assert journal.is_file()
+    journal_data = json.loads(journal.read_text(encoding="utf-8"))
+    assert journal_data["invite_ids"] == [fx["inv"][fx["a"]]]
+    tomb = json.loads(tombstone.read_text(encoding="utf-8"))
+    assert set(tomb.keys()) == {
+        "relationship_id_sha256",
+        "revoked_at",
+        "reason_code",
+    }
+    # Retry converges.
+    monkeypatch.undo()
+    report = _teardown_a(fx)
+    assert report.postcheck_hits == []
+    assert _count(conn, "relationships", "relationship_id = ?", (fx["a"],)) == 0
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Regression test for finding D10.
+# ---------------------------------------------------------------------------
+
+
+def test_revoke_keeps_relay_config_for_discovery(tmp_path, monkeypatch):
+    """D10: cmd_revoke must not delete relay_config before teardown.
+
+    A's relay repo is claimed only by A's relay_config row. The old
+    pre-deletion blinded _discover_relay_refs: the repo looked unclaimed
+    while B still existed, so it was kept forever. Now the repo-delete
+    hook fires for A's repo and B's repo is untouched.
+    """
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import muse_agent_social.cli as cli_mod
+
+    fx = _two_rel_state(tmp_path)
+    conn = fx["conn"]
+    # Distinct peer ids: cmd_revoke derives the postcheck peer-label
+    # needle from the real peer_identity_id, and B's surviving row must
+    # not trip it.
+    conn.execute(
+        "UPDATE relationships SET peer_identity_id = 'did:key:zpeerA'"
+        " WHERE relationship_id = ?",
+        (fx["a"],),
+    )
+    conn.execute(
+        "UPDATE relay_config SET repo_url = ? WHERE relationship_id = ?",
+        ("https://github.com/org/a-relay.git", fx["a"]),
+    )
+    conn.execute(
+        "UPDATE relay_config SET repo_url = ? WHERE relationship_id = ?",
+        ("https://github.com/org/b-relay.git", fx["b"]),
+    )
+    conn.commit()
+    (fx["state_dir"] / "relay.json").write_text(
+        json.dumps({"deploy_keys": [], "repos": ["org/a-relay", "org/b-relay"]})
+    )
+
+    fired = []
+
+    class FakeRevokeHooks:
+        def __init__(self, state_dir, token, delete_remote):
+            pass
+
+        def revoke_deploy_key(self, ref):
+            fired.append(("revoke-deploy-key", ref.label))
+
+        def delete_relay_repo(self, ref):
+            fired.append(("delete-relay-repo", ref.repo))
+
+    class FakeCtx:
+        def __init__(self, state_dir):
+            self.state_dir = Path(state_dir)
+            self.conn = conn
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli_mod, "_RevokeHooks", FakeRevokeHooks)
+    monkeypatch.setattr(cli_mod, "Ctx", FakeCtx)
+    args = SimpleNamespace(
+        state_dir=str(fx["state_dir"]),
+        relationship=fx["a"],
+        yes=True,
+        reason="test",
+        token=None,
+        delete_remote=False,
+    )
+    assert cli_mod.cmd_revoke(args) == 0
+    assert ("delete-relay-repo", "org/a-relay") in fired
+    assert ("delete-relay-repo", "org/b-relay") not in fired
+    conn.close()

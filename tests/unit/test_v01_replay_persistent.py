@@ -81,7 +81,10 @@ def v01_ctx(tmp_path):
         conn, REL, agent_self, agent_peer, keys_dir=str(keys_dir)
     )
     pair_key = os.urandom(32)
-    mstate_set(conn, "migration.phase", "dual_read")
+    mstate_set(conn, "migration.phase", "staged")
+    # G1: the drain is migration state (legacy_read_open + drain_until),
+    # not a phase lookup.
+    mstate_set(conn, "migration.legacy_read_open", True)
     mstate_set(conn, "migration.pair_id", PAIR)
     mstate_set(conn, "migration.peer_legacy_id", BOB)
     mstate_set(conn, "migration.my_legacy_id", ALICE)

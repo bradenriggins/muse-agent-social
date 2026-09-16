@@ -116,3 +116,36 @@ def test_save_config_mode_0600_and_allows_updates(tmp_path):
     obj["relay"]["poll_interval_seconds"] = 60
     config.save_config(path, obj)
     assert config.load_config(path)["relay"]["poll_interval_seconds"] == 60
+
+
+# ---------------------------------------------------------------------------
+# Regression test for finding D12 (config permission degradation).
+# ---------------------------------------------------------------------------
+
+
+def test_save_config_warns_not_raises_when_parent_mode_unenforceable(
+    tmp_path, monkeypatch, capsys
+):
+    """D12: on a filesystem where the 0700 parent-dir mode cannot be
+    enforced, save_config degrades to a loud stderr warning (config holds
+    no secrets), while key material keeps the hard error."""
+    import os
+
+    from muse_agent_social import config as config_mod
+    from muse_agent_social._keyfiles import KeyFileError, store_private_key
+
+    def denied_chmod(p, m):
+        raise OSError("chmod denied by filesystem")
+
+    monkeypatch.setattr(os, "chmod", denied_chmod)
+    path = tmp_path / "sub" / "config.yaml"
+    obj = config_mod.default_config()
+    # Config: warns loudly, still writes.
+    config_mod.save_config(path, obj)
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "degraded" in err
+    assert config_mod.load_config(path) == obj
+    # Key material: still fail-closed under the same conditions.
+    with pytest.raises(KeyFileError):
+        store_private_key(tmp_path / "keys" / "k.key", os.urandom(32))

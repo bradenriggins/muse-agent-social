@@ -20,13 +20,22 @@ __all__ = [
     "MAX_PUSHES_PER_MINUTE",
     "SOFT_PUSH_TARGET_PER_MINUTE",
     "MIN_POLL_SECONDS",
+    "FETCH_MAX_OBJECTS",
+    "FETCH_MAX_AGGREGATE_BYTES",
     "REPO_SIZE_WARN_BYTES",
     "REPO_SIZE_BLOCK_BYTES",
     "REPO_SIZE_ROTATE_BYTES",
+    "MAX_SEQ_GAP",
+    "MAX_UNKNOWN_EPOCH_SIGHTINGS",
+    "MAX_CONSECUTIVE_RECEIVE_FAILURES",
+    "PRIOR_IDENTITY_GRACE_SECONDS",
     "ACCEPT_WINDOW_DAYS",
     "FUTURE_TOLERANCE_SECONDS",
     "CLOCK_WARN_SECONDS",
     "LATE_WINDOW_SECONDS",
+    "INGRESS_MAX_EVENTS_PER_DAY",
+    "RECEIVE_QUARANTINE_TTL_DAYS",
+    "RECEIVE_QUARANTINE_MAX_PER_RELATIONSHIP",
     "parse_canonical_utc",
     "format_canonical_utc",
     "check_send_rate",
@@ -49,6 +58,19 @@ SOFT_PUSH_TARGET_PER_MINUTE = 1
 # Watcher/transport change detection must not poll faster than this.
 MIN_POLL_SECONDS = 30
 
+# Streaming fetch bounds (fetch_new_stream): a single streaming fetch
+# delivers at most FETCH_MAX_OBJECTS objects and at most
+# FETCH_MAX_AGGREGATE_BYTES total bytes before stopping with a loud
+# truncation report. The per-object cap (MAX_ENVELOPE_BYTES = 256 KiB)
+# bounds each object, but a hostile relay can hold arbitrarily many
+# legal-size objects; without an aggregate bound the watcher would buffer
+# them all (10,000 x 256 KiB ~ 2.5 GiB) before any budget or replay check.
+# 256 MiB aggregate binds before the object count at max-size objects
+# (~1024 x 256 KiB); the object count binds the per-fetch git subprocess
+# count for many small objects.
+FETCH_MAX_OBJECTS = 5000
+FETCH_MAX_AGGREGATE_BYTES = 256 * 1024 * 1024
+
 # Relay repository size alarms (bytes).
 REPO_SIZE_WARN_BYTES = 100 * 1024 * 1024
 REPO_SIZE_BLOCK_BYTES = 250 * 1024 * 1024
@@ -69,6 +91,52 @@ LATE_WINDOW_SECONDS = 24 * 3600
 # unbounded in principle, so without a cap a peer can bloat the reactions
 # table one 32-byte row at a time.
 MAX_ACTIVE_REACTIONS_PER_SENDER_TARGET = 8
+
+# Sequence gap bound: a single accepted event may advance a sender's
+# high-water mark by at most this many sequence numbers. Without it, one
+# signed envelope with sender_seq near the schema max (9007199254740991)
+# makes the gap-fill loop insert ~9e15 sequence_gaps rows inside one
+# transaction: disk exhaustion, then a permanently wedged receive. Jumps
+# past this bound are quarantined before the event is committed, and the
+# projection layer caps recorded gap rows at the same constant.
+MAX_SEQ_GAP = 100_000
+
+# Unknown-future-epoch retry cap: a data event whose key_epoch is unknown
+# stays retryable while the rotation handshake may still be in flight, but
+# each re-sighting of the same object is counted. Past this many sightings
+# the object is terminally quarantined instead of draining availability
+# forever. The 24-hour first-seen rejection timer remains the harder
+# backstop for epochs that never become known.
+MAX_UNKNOWN_EPOCH_SIGHTINGS = 100
+
+# Transient storage failures (lock timeouts, disk-full) during receive keep
+# the object on the relay for a later poll, but not forever: after this
+# many consecutive failures the object is quarantined and the operator is
+# warned on stderr, so a sick database cannot spin the watcher silently.
+MAX_CONSECUTIVE_RECEIVE_FAILURES = 10
+
+# Post-rotation grace: events signed by the peer's retired (prior) identity
+# are accepted for this long after the identity.rotated announcement is
+# applied, so delayed pre-rotation events and redeliveries still land.
+# After the window, retired-key traffic is rejected outright: a
+# compromised old key must not sign forever.
+PRIOR_IDENTITY_GRACE_SECONDS = 72 * 3600
+
+# G15: per-relationship ingress quota. At most this many events are
+# accepted per relationship per rolling 24 hours, counted by the durable
+# receiver acceptance time (event_payloads.received_at), never by
+# sender-controlled created_at. A flooding peer's excess objects stay on
+# the relay (retry_pending) and are admitted as the window slides. This
+# is a DoS guard, not a UX limit, so it sits far above any legitimate
+# conversation rate.
+INGRESS_MAX_EVENTS_PER_DAY = 10000
+
+# G15: receive_quarantine bounds. Rows older than this TTL are expired on
+# every quarantine write, and each relationship keeps at most
+# RECEIVE_QUARANTINE_MAX_PER_RELATIONSHIP quarantine rows (oldest dropped
+# first). Quarantine is operator-visible evidence, not an unbounded log.
+RECEIVE_QUARANTINE_TTL_DAYS = 30
+RECEIVE_QUARANTINE_MAX_PER_RELATIONSHIP = 100
 
 _CANONICAL_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _CANONICAL_UTC_FMT = "%Y-%m-%dT%H:%M:%SZ"

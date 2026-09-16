@@ -64,9 +64,21 @@ def paired(tmp_path):
     invite = root / "invite.txt"
     cli(a, "pair", "invite", "--out", str(invite))
     accept = root / "accept.json"
+    # G6 two-run phrase flow: run 1 displays the phrase and refuses.
+    code, out, err = run_cli(
+        b, "pair", "accept", "--invite-file", str(invite),
+        "--out", str(accept))
+    assert code != 0, err
+    assert len(out.split()) == 8
     cli(b, "pair", "accept", "--invite-file", str(invite),
         "--i-compared-phrase", "--out", str(accept))
     commit = root / "commit.json"
+    code, out, err = run_cli(
+        a, "pair", "commit", "--acceptance-file", str(accept),
+        "--relay", "https://example.com/relay", "--transport", "local",
+        "--local-relay-dir", str(relay), "--out", str(commit))
+    assert code != 0, err
+    assert len(out.split()) == 8
     cli(a, "pair", "commit", "--acceptance-file", str(accept),
         "--relay", "https://example.com/relay", "--transport", "local",
         "--local-relay-dir", str(relay),

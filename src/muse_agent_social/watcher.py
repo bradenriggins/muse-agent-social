@@ -5,8 +5,10 @@ cycle and returns (exit_code, result_json).
 
 Exit codes:
     0   scan complete, all objects reached a terminal local state
-    20  retryable transport/push failure, or retry-pending work remains;
-        do not checkpoint; back off with jitter
+    20  retryable transport/push failure, retry-pending work remains, or
+        the fetch stream truncated at a documented aggregate bound (more
+        objects remain on the relay); do not checkpoint; back off with
+        jitter
     21  permanent local config/schema error; do not checkpoint; alert
     22  mirror lock busy; retry after 5-15 seconds
     23  partial work remains queued after the time budget; do not
@@ -197,6 +199,82 @@ def run_once(
         raise
 
 
+def _receive_stream(
+    transport: Transport,
+    relationship_id: str,
+    receive_fn: Callable[[str, str, bytes], dict[str, Any]],
+    state_dir: Path,
+    last_head: str,
+    time_budget: float,
+    now_fn: Callable[[], float],
+    t_start: float,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Run the receive phase over a streaming fetch.
+
+    Returns ``{"budget_hit": bool, "fatal": (code, reason) | None,
+    "stats": stream stats dict}``. ``fatal`` carries a ``(code, reason)``
+    pair when the run must abort outright (the old inline loop's ``return
+    finish(...)`` paths); the caller saves watcher state and finishes with
+    it.
+    """
+    budget_hit = False
+    fatal: tuple[int, str | None] | None = None
+
+    def visit(object_name: str, data: bytes) -> bool:
+        nonlocal budget_hit, fatal
+        if now_fn() - t_start > time_budget:
+            # Time budget is enforced INSIDE the retrieval loop: returning
+            # False tells the transport to stop fetching immediately, so
+            # no more objects are buffered after the budget is spent.
+            budget_hit = True
+            return False
+        if len(data) > OBJECT_MAX_BYTES:
+            # Terminal: quarantined hostile/oversized input never fails the run.
+            result["quarantined"] += 1
+            reasons = result["quarantine_reasons"]
+            reasons["object_too_large"] = reasons.get("object_too_large", 0) + 1
+            try:
+                transport.consume(object_name)
+            except TransportError as exc:
+                fatal = (exc.exit_code, exc.code)
+                return False
+            return True
+        try:
+            outcome_doc = receive_fn(relationship_id, object_name, data)
+        except Exception as exc:
+            fatal = (EXIT_PERMANENT, f"receive_error: {type(exc).__name__}")
+            return False
+        outcome = outcome_doc.get("outcome") if isinstance(outcome_doc, dict) else None
+        if outcome not in _VALID_OUTCOMES:
+            fatal = (EXIT_PERMANENT, "bad_receive_outcome")
+            return False
+        try:
+            result["surfaces"] += int(outcome_doc.get("surfaces", 0) or 0)
+            result["receipts_queued"] += int(outcome_doc.get("receipts_queued", 0) or 0)
+        except (TypeError, ValueError):
+            fatal = (EXIT_PERMANENT, "bad_receive_outcome")
+            return False
+        if outcome == "retry_pending":
+            result["retry_pending"] += 1
+            return True  # do not consume; retried on a later poll
+        if outcome == "accepted":
+            result["accepted"] += 1
+        else:
+            result["quarantined"] += 1
+            reasons = result["quarantine_reasons"]
+            reasons["receiver_quarantined"] = reasons.get("receiver_quarantined", 0) + 1
+        try:
+            transport.consume(object_name)
+        except TransportError as exc:
+            fatal = (exc.exit_code, exc.code)
+            return False
+        return True
+
+    stats = transport.fetch_new_stream(last_head, visit)
+    return {"budget_hit": budget_hit, "fatal": fatal, "stats": stats}
+
+
 def _run_once_locked(
     transport: Transport,
     relationship_id: str,
@@ -280,58 +358,31 @@ def _run_once_locked(
         save_watcher_state(state_dir, relationship_id, state)
         return finish_ok()
 
-    # -- receive phase --------------------------------------------------
+    # -- receive phase (streamed) ------------------------------------------
+    # The transport calls visit() per object AS it is fetched: the watcher
+    # processes each object (replay/signature checks, receive) before the
+    # next one is buffered, so a relay stuffed with legal-size objects can
+    # no longer force the watcher to buffer gigabytes. The time budget is
+    # enforced inside the retrieval loop: when it is spent, visit() returns
+    # False and the transport stops fetching immediately.
     try:
-        objects = transport.fetch_new(last_head)
+        stream_info = _receive_stream(
+            transport, relationship_id, receive_fn, state_dir, last_head,
+            time_budget, now_fn, t_start, result,
+        )
     except TransportError as exc:
         save_watcher_state(state_dir, relationship_id, state)
         return finish(exc.exit_code, exc.code)
-
-    budget_hit = False
-    for object_name, data in objects:
-        if now_fn() - t_start > time_budget:
-            budget_hit = True
-            break
-        if len(data) > OBJECT_MAX_BYTES:
-            # Terminal: quarantined hostile/oversized input never fails the run.
-            result["quarantined"] += 1
-            reasons = result["quarantine_reasons"]
-            reasons["object_too_large"] = reasons.get("object_too_large", 0) + 1
-            try:
-                transport.consume(object_name)
-            except TransportError as exc:
-                save_watcher_state(state_dir, relationship_id, state)
-                return finish(exc.exit_code, exc.code)
-            continue
-        try:
-            outcome_doc = receive_fn(relationship_id, object_name, data)
-        except Exception as exc:
-            save_watcher_state(state_dir, relationship_id, state)
-            return finish(EXIT_PERMANENT, f"receive_error: {type(exc).__name__}")
-        outcome = outcome_doc.get("outcome") if isinstance(outcome_doc, dict) else None
-        if outcome not in _VALID_OUTCOMES:
-            save_watcher_state(state_dir, relationship_id, state)
-            return finish(EXIT_PERMANENT, "bad_receive_outcome")
-        try:
-            result["surfaces"] += int(outcome_doc.get("surfaces", 0) or 0)
-            result["receipts_queued"] += int(outcome_doc.get("receipts_queued", 0) or 0)
-        except (TypeError, ValueError):
-            save_watcher_state(state_dir, relationship_id, state)
-            return finish(EXIT_PERMANENT, "bad_receive_outcome")
-        if outcome == "retry_pending":
-            result["retry_pending"] += 1
-            continue  # do not consume; retried on a later poll
-        if outcome == "accepted":
-            result["accepted"] += 1
-        else:
-            result["quarantined"] += 1
-            reasons = result["quarantine_reasons"]
-            reasons["receiver_quarantined"] = reasons.get("receiver_quarantined", 0) + 1
-        try:
-            transport.consume(object_name)
-        except TransportError as exc:
-            save_watcher_state(state_dir, relationship_id, state)
-            return finish(exc.exit_code, exc.code)
+    if stream_info["fatal"] is not None:
+        save_watcher_state(state_dir, relationship_id, state)
+        code, reason = stream_info["fatal"]
+        return finish(code, reason)
+    budget_hit = stream_info["budget_hit"]
+    # Loud truncation report: the stream stopped before exhausting the
+    # relay (documented aggregate bounds hit, or the caller's budget).
+    result["fetch_stream"] = stream_info["stats"]
+    if stream_info["stats"]["truncated"]:
+        result["fetch_truncated"] = True
 
     # -- push phase: flush queued outgoing mutations (receipts, consumes) --
     try:
@@ -350,14 +401,24 @@ def _run_once_locked(
     result["remote_head"] = new_remote
 
     pending = result["retry_pending"] + transport.pending_outgoing()
-    if budget_hit and pending > 0:
-        # Exit 23: partial work remains after the time budget. Do not
-        # checkpoint; the caller retries once immediately.
+    truncated = bool(stream_info["stats"]["truncated"])
+    if budget_hit or truncated:
+        # Never checkpoint a truncated scan: objects the stream never
+        # visited are still on the relay, and both transports list "newer
+        # than checkpoint" by diffing against it, so advancing past them
+        # would silently drop them. The next poll resumes from the old
+        # checkpoint. Partial work gets a partial/retryable status, never
+        # exit 0.
         state["retry_pending"] = result["retry_pending"]
         state["consecutive_failures"] = int(state.get("consecutive_failures", 0)) + 1
         state["next_retry_at"] = _utc_text(now_fn())
         save_watcher_state(state_dir, relationship_id, state)
-        return finish(EXIT_PARTIAL_TIMEOUT, "time_budget_exceeded")
+        if budget_hit:
+            return finish(EXIT_PARTIAL_TIMEOUT, "time_budget_exceeded")
+        return finish(
+            EXIT_RETRYABLE,
+            stream_info["stats"]["truncation_reason"] or "fetch_truncated",
+        )
 
     if pending == 0:
         # rc == 0 and retry_pending == 0: advance the checkpoint.

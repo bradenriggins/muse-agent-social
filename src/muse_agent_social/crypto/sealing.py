@@ -262,6 +262,11 @@ def seal_envelope(
         raise SealingError("bad_identity_key")
     if not isinstance(recipients, list) or not recipients:
         raise SealingError("no_recipients")
+    # G14 dual-wrap bound: a sender wraps to at most the recipient's
+    # current and immediately-previous agreement epochs. More than two
+    # wraps is a protocol violation, not just a schema failure.
+    if len(recipients) > 2:
+        raise SealingError("too_many_recipients")
     if not isinstance(protected, dict):
         raise SealingError("bad_protected")
     if not isinstance(payload, dict):

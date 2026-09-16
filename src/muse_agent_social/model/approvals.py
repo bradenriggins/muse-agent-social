@@ -64,10 +64,21 @@ def ensure_approvals_columns(conn: sqlite3.Connection) -> None:
     if "expires_at" not in cols:
         conn.execute("ALTER TABLE human_approvals ADD COLUMN expires_at TEXT;")
         # Backfill: pre-hardening rows get the full TTL from creation.
+        # G7: use the canonical T...Z form (not SQLite datetime()'s
+        # space-separated form) so lexical expiry comparisons work.
         conn.execute(
             "UPDATE human_approvals SET expires_at ="
-            " datetime(created_at, '+24 hours') WHERE expires_at IS NULL;"
+            " strftime('%Y-%m-%dT%H:%M:%SZ', datetime(created_at, '+24 hours'))"
+            " WHERE expires_at IS NULL;"
         )
+    # G7: normalize rows backfilled by older versions of this function in
+    # the space-separated form. The GLOB only matches "YYYY-MM-DD
+    # HH:MM:SS" rows, never canonical ones.
+    conn.execute(
+        "UPDATE human_approvals SET expires_at ="
+        " strftime('%Y-%m-%dT%H:%M:%SZ', expires_at)"
+        " WHERE expires_at GLOB '????-??-?? ??:??:??';"
+    )
     if "consumed_at" not in cols:
         conn.execute("ALTER TABLE human_approvals ADD COLUMN consumed_at TEXT;")
 
@@ -135,18 +146,50 @@ def create_approval(
 
 
 def consume_approval(
-    conn: sqlite3.Connection, approval_id: str, now: str
+    conn: sqlite3.Connection,
+    approval_id: str,
+    now: str,
+    *,
+    relationship_id: str | None = None,
+    subject_type: str | None = None,
+    subject_id: str | None = None,
+    answer: str | None = None,
+    approved: bool | None = None,
 ) -> bool:
     """Atomically mark an approval consumed iff it is live. Returns True on success.
 
     The UPDATE only fires when the row is unconsumed and unexpired, so two
     racing sends cannot both claim the same approval: exactly one wins.
+
+    G12: when the binding parameters are given, the UPDATE additionally
+    requires the record's relationship_id, subject_type, subject_id,
+    answer, and approved flag to match the send being authorized. The
+    claim then binds the approval to the exact response it authorized: a
+    concurrent or buggy caller cannot redirect an approval for request A
+    to a send answering request B. ``approved`` is stored as INTEGER 0/1.
     """
-    cur = conn.execute(
+    sql = (
         "UPDATE human_approvals SET consumed_at = ?"
-        " WHERE approval_id = ? AND consumed_at IS NULL AND expires_at > ?;",
-        (now, approval_id, now),
+        " WHERE approval_id = ? AND consumed_at IS NULL AND expires_at > ?"
     )
+    params: list = [now, approval_id, now]
+    if relationship_id is not None:
+        sql += " AND relationship_id = ?"
+        params.append(relationship_id)
+    if subject_type is not None:
+        sql += " AND subject_type = ?"
+        params.append(subject_type)
+    if subject_id is not None:
+        sql += " AND subject_id = ?"
+        params.append(subject_id)
+    if answer is not None:
+        sql += " AND answer = ?"
+        params.append(answer)
+    if approved is not None:
+        sql += " AND approved = ?"
+        params.append(1 if approved else 0)
+    sql += ";"
+    cur = conn.execute(sql, params)
     return cur.rowcount == 1
 
 

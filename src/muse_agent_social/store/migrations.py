@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import sqlite3
 
-from muse_agent_social.store.db import transaction
+from muse_agent_social.store.db import (
+    DbError,
+    SchemaTooNewError,
+    transaction,
+)
 
 SCHEMA_VERSION = 4
 
@@ -31,6 +35,39 @@ from muse_agent_social.store.projections import _V3_DDL as _PROJECTIONS_V3_DDL
 # rotation announcements from the old identity are still attributable
 # instead of being rejected as unknown_sender.
 _V4_COLUMN = "prior_peer_identity_id"
+
+
+# Migration 3: attestation column on human_requests. The backfill UPDATE is
+# naturally idempotent, so it always runs; the ADD COLUMN is guarded like
+# migration 4's, because a crash between a bare ALTER and the version bump
+# used to wedge the retry on "duplicate column name".
+_V3_COLUMN = "attestation"
+
+
+def _ensure_v3_attestation(conn: sqlite3.Connection) -> None:
+    """Idempotently add the migration-3 column to ``human_requests``.
+
+    A bare ALTER TABLE ... ADD COLUMN is not re-runnable: a crash between
+    the ALTER and the version bump used to leave the column present with
+    the version still at 2, and the retry died with "duplicate column
+    name". Checking PRAGMA table_info first makes the migration genuinely
+    idempotent, so both crash-recovery (including a user_version reset to
+    0 on an already-migrated database) and concurrent first-run migrate()
+    calls converge instead of wedging.
+    """
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(human_requests);")]
+    if _V3_COLUMN not in cols:
+        conn.execute(
+            "ALTER TABLE human_requests ADD COLUMN attestation TEXT NOT NULL "
+            "DEFAULT 'peer' CHECK(attestation IN ('local', 'peer'));"
+        )
+    conn.execute(
+        "UPDATE human_requests SET attestation = 'local' "
+        "WHERE approval_record_id IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM human_approvals "
+        "WHERE human_approvals.approval_id "
+        "= human_requests.approval_record_id);"
+    )
 
 
 def _ensure_v4_column(conn: sqlite3.Connection) -> None:
@@ -53,6 +90,32 @@ def _ensure_v4_column(conn: sqlite3.Connection) -> None:
 _V4_DDL = f"""
 ALTER TABLE relationships ADD COLUMN {_V4_COLUMN} TEXT;
 """
+
+
+# Post-v4 hardening columns. Added idempotently (no version bump), the
+# same way _ensure_v4_column works: PRAGMA table_info first, so crash
+# recovery and concurrent first-run migrate() calls converge.
+#
+# - replay_guard.event_id / replay_guard.envelope_digest: bind each replay
+#   record to the exact event it guarded, so a reused nonce with different
+#   bytes is quarantined instead of silently reported "accepted".
+# - relationships.prior_identity_grace_until: expiry bound on accepting
+#   events signed by the peer's retired identity after a rotation.
+_V5_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("replay_guard", "event_id", "TEXT"),
+    ("replay_guard", "envelope_digest", "TEXT"),
+    ("relationships", "prior_identity_grace_until", "TEXT"),
+)
+
+
+def _ensure_v5_columns(conn: sqlite3.Connection) -> None:
+    """Idempotently add the post-v4 hardening columns (see _V5_COLUMNS)."""
+    for table, column, coltype in _V5_COLUMNS:
+        cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table});")]
+        if column not in cols:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {coltype};"
+            )
 from muse_agent_social.transports.tables import TRANSPORT_DDL
 
 _V2_DDL = "\n".join(
@@ -244,7 +307,7 @@ def migrate(conn: sqlite3.Connection) -> int:
     """
     current = conn.execute("PRAGMA user_version;").fetchone()[0]
     if current > SCHEMA_VERSION:
-        raise RuntimeError(
+        raise SchemaTooNewError(
             f"database schema version {current} is newer than supported "
             f"version {SCHEMA_VERSION}; refusing to downgrade"
         )
@@ -259,6 +322,8 @@ def migrate(conn: sqlite3.Connection) -> int:
                 continue
             if version == 4:
                 _ensure_v4_column(conn)
+            elif version == 3:
+                _ensure_v3_attestation(conn)
             else:
                 # Never executescript() here: it implicitly commits and
                 # would break the per-migration atomic transaction.
@@ -266,6 +331,52 @@ def migrate(conn: sqlite3.Connection) -> int:
             conn.execute(f"PRAGMA user_version = {version};")
     # Lifecycle columns for human_approvals (single-use + expiry) may be
     # missing on databases created before that hardening; backfill them.
+    # Same for the G13 receiver acceptance timestamp on event_payloads.
     with transaction(conn):
         ensure_approvals_columns(conn)
+        _ensure_v5_columns(conn)
+        from muse_agent_social.store.projections import (
+            _ensure_event_payloads_received_at,
+        )
+
+        _ensure_event_payloads_received_at(conn)
+    _verify_append_only_triggers(conn)
     return conn.execute("PRAGMA user_version;").fetchone()[0]
+
+
+#: The append-only triggers the audit model rests on. Teardown drops and
+#: recreates them inside a single transaction, so a crash can never leave
+#: them missing; a missing trigger therefore means tampering or an older
+#: buggy teardown ran, and the database must not be used.
+_APPEND_ONLY_TRIGGERS = ("events_no_update", "events_no_delete")
+
+
+def _verify_append_only_triggers(conn: sqlite3.Connection) -> None:
+    """Refuse to run when the append-only triggers on ``events`` are missing.
+
+    Without these triggers, ``events`` rows could be UPDATEd or DELETEd
+    silently and the append-only guarantee the audit model rests on would
+    be gone without a word. Refusing loudly is the only safe behavior.
+    """
+    tables = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if "events" not in tables:
+        return
+    triggers = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        )
+    }
+    missing = [t for t in _APPEND_ONLY_TRIGGERS if t not in triggers]
+    if missing:
+        raise DbError(
+            "schema-integrity: append-only trigger(s) missing on events: "
+            + ", ".join(missing)
+            + "; refusing to run without the append-only guarantee "
+            "(restore the triggers or the database from backup)"
+        )

@@ -19,7 +19,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Callable, Iterator
 
 # ---------------------------------------------------------------------------
 # Plan constants (GIT TRANSPORT section). Canonical values live in
@@ -47,10 +47,24 @@ from muse_agent_social.policy.limits import (
 from muse_agent_social.policy.limits import (
     SOFT_PUSH_TARGET_PER_MINUTE,
 )
+from muse_agent_social.policy.limits import (
+    FETCH_MAX_OBJECTS,
+    FETCH_MAX_AGGREGATE_BYTES,
+)
 
 PUSH_SOFT_INTERVAL_SECONDS = 60 // SOFT_PUSH_TARGET_PER_MINUTE  # 1 push/min soft
 LOCK_TIMEOUT_SECONDS = 30  # mirror lock acquisition timeout
 PUSH_MAX_ATTEMPTS = 3  # push retry attempts before preserving queue
+
+
+def new_stream_stats() -> dict[str, Any]:
+    """Fresh stats dict for fetch_new_stream implementations."""
+    return {
+        "objects_streamed": 0,
+        "bytes_streamed": 0,
+        "truncated": False,
+        "truncation_reason": None,
+    }
 
 
 class TransportError(Exception):
@@ -217,6 +231,56 @@ class Transport:
         transport.
         """
         raise NotImplementedError
+
+    def fetch_new_stream(
+        self,
+        since: str,
+        visit: Callable[[str, bytes], bool],
+    ) -> dict[str, Any]:
+        """Stream objects newer than `since`, visiting each as it is fetched.
+
+        ``visit(name, data)`` runs AS each object is fetched, so the whole
+        batch is never materialized: this is the memory-safe way to consume
+        a relay. ``visit`` returns True to continue, False to stop early
+        (e.g. the caller's time budget is spent); the transport stops
+        fetching as soon as it is told to.
+
+        Returns a stats dict: ``{"objects_streamed": int,
+        "bytes_streamed": int, "truncated": bool, "truncation_reason":
+        str | None}``. ``truncated`` is True when the stream stopped before
+        exhausting the relay: the caller asked to stop (``"caller_stopped"``)
+        or a documented bound was hit (``"object_cap"``,
+        ``"aggregate_bytes_cap"``).
+
+        Hard bounds per call, independent of the visitor: at most
+        FETCH_MAX_OBJECTS objects and at most FETCH_MAX_AGGREGATE_BYTES
+        total bytes are ever delivered; hitting either stops the stream
+        with ``truncated=True``. A relay that exceeds them is hostile or
+        pathological, and the truncation is reported loudly rather than
+        buffered into the watcher process.
+
+        The default implementation delegates to fetch_new (buffered, but
+        still capped); transports that can page SHOULD override so objects
+        are processed per-fetch.
+        """
+        stats = new_stream_stats()
+        for name, data in self.fetch_new(since):
+            if stats["objects_streamed"] >= FETCH_MAX_OBJECTS:
+                stats["truncated"] = True
+                stats["truncation_reason"] = "object_cap"
+                break
+            # An exact-cap total is allowed; only exceeding it truncates.
+            if stats["bytes_streamed"] + len(data) > FETCH_MAX_AGGREGATE_BYTES:
+                stats["truncated"] = True
+                stats["truncation_reason"] = "aggregate_bytes_cap"
+                break
+            stats["objects_streamed"] += 1
+            stats["bytes_streamed"] += len(data)
+            if visit(name, data) is False:
+                stats["truncated"] = True
+                stats["truncation_reason"] = "caller_stopped"
+                break
+        return stats
 
     def upload(self, object_name: str, data: bytes) -> None:
         """Store a new object on the relay."""

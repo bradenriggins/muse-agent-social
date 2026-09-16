@@ -112,6 +112,10 @@ class EventLog:
             event_type=event_type,
             payload=payload,
             reply_to=reply_to,
+            # G13: the acceptance time is the receiver's clock at staging,
+            # not the event's created_at. The fixture simulates it with the
+            # same offset as created_at.
+            received_at=created,
         )
         return {
             "event_id": event_id,
@@ -1591,3 +1595,111 @@ def test_capsule_skew_tolerance(conn, log):
         ).fetchone()
         is not None
     )
+
+
+# ---------------------------------------------------------------------------
+# S7: delivery announcement idempotency + cancel authorization
+# ---------------------------------------------------------------------------
+
+
+def test_s7_duplicate_announcement_is_noop(conn, log):
+    inner = str(uuid.uuid4())
+    first = log.add(
+        "delivery.scheduled",
+        {"inner_event_id": inner, "deliver_at": ts(log.base, 3600)},
+        at=0,
+    )
+    log.apply(first)
+    # A re-signed announcement with a fresh envelope id for the same
+    # inner event must not create a second delivery row.
+    second = log.add(
+        "delivery.scheduled",
+        {"inner_event_id": inner, "deliver_at": ts(log.base, 3600)},
+        at=1,
+    )
+    mutations = log.apply(second)
+    assert mutations == [
+        {
+            "op": "noop",
+            "table": "deliveries",
+            "key": second["event_id"],
+            "info": {
+                "reason": "duplicate_announcement",
+                "existing_scheduled_event_id": first["event_id"],
+            },
+        }
+    ]
+    rows = conn.execute(
+        "SELECT scheduled_event_id FROM deliveries WHERE inner_event_id = ?;",
+        (inner,),
+    ).fetchall()
+    assert [r["scheduled_event_id"] for r in rows] == [first["event_id"]]
+
+
+def test_s7_exact_replay_still_noop(conn, log):
+    inner = str(uuid.uuid4())
+    scheduled = log.add(
+        "delivery.scheduled",
+        {"inner_event_id": inner, "deliver_at": ts(log.base, 3600)},
+        at=0,
+    )
+    log.apply(scheduled)
+    mutations = log.apply(scheduled)
+    assert mutations[0]["op"] == "noop"
+    assert mutations[0]["info"]["reason"] == "already_projected"
+
+
+def test_s7_cancel_by_non_announcer_rejected(conn, log):
+    inner = str(uuid.uuid4())
+    scheduled = log.add(
+        "delivery.scheduled",
+        {"inner_event_id": inner, "deliver_at": ts(log.base, 3600)},
+        sender=SENDER_A,
+        at=0,
+    )
+    log.apply(scheduled)
+    # A cancel from anyone but the original announcer is a stable
+    # rejection, not a state change.
+    cancel = log.add(
+        "delivery.canceled",
+        {
+            "scheduled_event_id": scheduled["event_id"],
+            "canceled_at": ts(log.base, 10),
+        },
+        sender=SENDER_B,
+        at=10,
+    )
+    with pytest.raises(projections.ProjectionError) as excinfo:
+        log.apply(cancel)
+    assert excinfo.value.code == "delivery_cancel_not_sender"
+    row = conn.execute(
+        "SELECT state FROM deliveries WHERE scheduled_event_id = ?;",
+        (scheduled["event_id"],),
+    ).fetchone()
+    assert row["state"] == "scheduled"
+
+
+def test_s7_cancel_by_announcer_still_works(conn, log):
+    inner = str(uuid.uuid4())
+    scheduled = log.add(
+        "delivery.scheduled",
+        {"inner_event_id": inner, "deliver_at": ts(log.base, 3600)},
+        sender=SENDER_A,
+        at=0,
+    )
+    log.apply(scheduled)
+    cancel = log.add(
+        "delivery.canceled",
+        {
+            "scheduled_event_id": scheduled["event_id"],
+            "canceled_at": ts(log.base, 10),
+        },
+        sender=SENDER_A,
+        at=10,
+    )
+    log.apply(cancel)
+    row = conn.execute(
+        "SELECT state FROM deliveries WHERE scheduled_event_id = ?;",
+        (scheduled["event_id"],),
+    ).fetchone()
+    assert row["state"] == "canceled"

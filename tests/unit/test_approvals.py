@@ -164,7 +164,8 @@ def test_failed_send_does_not_burn_approval(conn, monkeypatch):
         # receipt path) always provide one via db.transaction().
         with db.transaction(conn):
             events.persist_outgoing_in_txn(
-                conn, _protected(), {"ok": True}, None, [], approval_id=aid
+                conn, _protected(), {"request_id": "req-1", "answer": "yes", "approved": True},
+                None, [], approval_id=aid
             )
     row = get_approval(conn, aid)
     assert row["consumed_at"] is None
@@ -183,7 +184,9 @@ def test_consumed_approval_blocks_second_persist(conn, monkeypatch):
     protected = _protected()
     with pytest.raises(EventStoreError) as excinfo:
         events.persist_outgoing_in_txn(
-            conn, protected, {"ok": True}, None, [], approval_id=aid
+            conn, protected,
+            {"request_id": "req-1", "answer": "yes", "approved": True},
+            None, [], approval_id=aid
         )
     assert excinfo.value.code == "approval_consumed"
     assert (
@@ -205,7 +208,8 @@ def test_expired_approval_blocks_persist(conn):
     conn.commit()
     with pytest.raises(EventStoreError) as excinfo:
         events.persist_outgoing_in_txn(
-            conn, _protected(), {"ok": True}, None, [], approval_id=aid
+            conn, _protected(), {"request_id": "req-1", "answer": "yes", "approved": True},
+                None, [], approval_id=aid
         )
     assert excinfo.value.code == "approval_consumed"
 

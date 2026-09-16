@@ -48,9 +48,15 @@ from muse_agent_social.canonical import restricted_jcs, strict_parse
 from muse_agent_social.policy.limits import (
     FUTURE_TOLERANCE_SECONDS,
     MAX_ACTIVE_REACTIONS_PER_SENDER_TARGET,
+    MAX_SEQ_GAP,
     add_seconds,
 )
-from muse_agent_social.store.db import get_user_version, transaction, utcnow
+from muse_agent_social.store.db import (
+    SchemaTooNewError,
+    get_user_version,
+    transaction,
+    utcnow,
+)
 from muse_agent_social.validation import PAYLOAD_DISPATCH, validate_payload
 
 __all__ = [
@@ -88,7 +94,13 @@ CREATE TABLE IF NOT EXISTS event_payloads (
     event_id   TEXT PRIMARY KEY REFERENCES events(event_id),
     event_type TEXT NOT NULL,
     payload    TEXT NOT NULL,
-    reply_to   TEXT
+    reply_to   TEXT,
+    -- G13: the receiver's acceptance time, staged in the same atomic
+    -- transaction as the events row. Projection handlers must use this,
+    -- never the sender-controlled created_at, for receive-time decisions
+    -- (e.g. poll closure). Durable here so rebuilds after a crash reuse
+    -- the ORIGINAL acceptance time instead of the rebuild time.
+    received_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -228,6 +240,13 @@ CREATE TABLE IF NOT EXISTS deliveries (
 );
 CREATE INDEX IF NOT EXISTS idx_deliveries_inner
     ON deliveries(inner_event_id);
+-- S7: one announcement per (relationship, sender, inner event). The
+-- deliveries PK only dedups exact envelope replays; a re-signed
+-- announcement with a new envelope id for the same inner event must not
+-- create a second delivery row. The handler checks this triple first and
+-- this index makes the invariant structural.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_announcement
+    ON deliveries(relationship_id, sender, inner_event_id);
 
 -- Projected stream of key-rotation events. The rotation track owns the
 -- key_epochs table; this table is the queryable event stream only.
@@ -354,6 +373,13 @@ def _exec_ddl(conn: sqlite3.Connection, ddl: str) -> None:
             conn.execute(statement + ";")
 
 
+def _ensure_event_payloads_received_at(conn: sqlite3.Connection) -> None:
+    """Idempotently add event_payloads.received_at (G13) to older DBs."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(event_payloads);")]
+    if "received_at" not in cols:
+        conn.execute("ALTER TABLE event_payloads ADD COLUMN received_at TEXT;")
+
+
 def migrate_projections(conn: sqlite3.Connection) -> int:
     """Apply the projection-track migrations (schema version 4).
 
@@ -370,7 +396,7 @@ def migrate_projections(conn: sqlite3.Connection) -> int:
             "run the skeleton migrate() (version 1) before migrate_projections()",
         )
     if current > PROJECTIONS_SCHEMA_VERSION:
-        raise RuntimeError(
+        raise SchemaTooNewError(
             f"database schema version {current} is newer than supported "
             f"version {PROJECTIONS_SCHEMA_VERSION}; refusing to downgrade"
         )
@@ -387,11 +413,19 @@ def migrate_projections(conn: sqlite3.Connection) -> int:
         from muse_agent_social.store.migrations import _ensure_v4_column
 
         _ensure_v4_column(conn)
+        # Post-v4 hardening columns (replay_guard binding, prior-identity
+        # grace): same idempotent treatment, so databases that took the
+        # projections track keep the shared columns honest too.
+        from muse_agent_social.store.migrations import _ensure_v5_columns
+
+        _ensure_v5_columns(conn)
         # Same story for the approval lifecycle columns: this track also
         # stamps version 4, so it must also guarantee the columns exist.
         from muse_agent_social.model.approvals import ensure_approvals_columns
 
         ensure_approvals_columns(conn)
+        # G13: the durable receiver acceptance timestamp on event_payloads.
+        _ensure_event_payloads_received_at(conn)
         if current < PROJECTIONS_SCHEMA_VERSION:
             conn.execute(
                 f"PRAGMA user_version = {PROJECTIONS_SCHEMA_VERSION};"
@@ -415,7 +449,8 @@ def record_projection_input(
     event_type: str,
     payload: Mapping[str, Any],
     reply_to: str | None = None,
-) -> None:
+    received_at: str | None = None,
+) -> str:
     """Stage the validated decrypted payload for one accepted event.
 
     Call inside the same atomic transaction that inserts the ``events`` row.
@@ -423,17 +458,33 @@ def record_projection_input(
     canonical JSON, so projections never see an unvalidated body. ``reply_to``
     is carried from the protected header, which has no column on ``events``.
 
-    Idempotent: re-staging the same event is a no-op.
+    ``received_at`` is the receiver's acceptance time (G13): the wall clock
+    at the moment this event was accepted, staged durably so rebuilds after
+    a crash reuse the ORIGINAL acceptance time instead of the rebuild time.
+    Defaults to now; callers that already know the acceptance moment (the
+    receive path computed it before staging) should pass it explicitly.
+
+    Idempotent: re-staging the same event is a no-op. Returns the staged
+    ``received_at``.
     """
     validate_payload(event_type, payload)
     if reply_to is not None and not isinstance(reply_to, str):
         raise ProjectionError("invalid_reply_to", "reply_to must be a string or null")
+    if received_at is None:
+        received_at = utcnow()
     payload_json = restricted_jcs(dict(payload)).decode("utf-8")
     conn.execute(
-        "INSERT OR IGNORE INTO event_payloads(event_id, event_type, payload, reply_to)"
-        " VALUES (?, ?, ?, ?);",
-        (event_id, event_type, payload_json, reply_to),
+        "INSERT OR IGNORE INTO event_payloads(event_id, event_type, payload, reply_to,"
+        " received_at) VALUES (?, ?, ?, ?, ?);",
+        (event_id, event_type, payload_json, reply_to, received_at),
     )
+    # INSERT OR IGNORE is a no-op on re-stage: return the row's actual
+    # received_at so callers always see the durable acceptance time.
+    row = conn.execute(
+        "SELECT received_at FROM event_payloads WHERE event_id = ?;",
+        (event_id,),
+    ).fetchone()
+    return row["received_at"] if row and row["received_at"] else received_at
 
 
 # ---------------------------------------------------------------------------
@@ -651,7 +702,13 @@ def _update_seq_state(
             (seq, relationship_id, sender),
         )
     if seq > prev_max:
-        for missing in range(prev_max + 1, seq):
+        # Gap rows are evidence, not protocol: cap how many one event may
+        # record. The cursor still advances to seq (the sender really did
+        # claim that number), so a later event never re-inserts rows for
+        # this range. Without the cap, one hostile sender_seq near the
+        # schema max makes this loop insert ~9e15 rows in one transaction.
+        recordable = min(seq - prev_max - 1, MAX_SEQ_GAP)
+        for missing in range(prev_max + 1, prev_max + 1 + recordable):
             cur = conn.execute(
                 "INSERT OR IGNORE INTO sequence_gaps"
                 "(relationship_id, sender, missing_seq, first_observed_at)"
@@ -1035,8 +1092,16 @@ def _handle_poll_created(
 
 
 def _handle_poll_responded(
-    conn: sqlite3.Connection, ev: Mapping[str, Any]
+    conn: sqlite3.Connection, ev: Mapping[str, Any], now: str
 ) -> list[dict[str, Any]]:
+    """Project a poll response.
+
+    ``now`` is the RECEIVER's acceptance time (G13): the durable
+    ``received_at`` staged with the payload, never the sender-controlled
+    ``created_at``. A response accepted at or after ``closes_at`` is
+    rejected, and the acceptance time (not the sender's claim) is stored
+    as ``responded_at``.
+    """
     payload = ev["payload"]
     poll_id = payload["poll_id"]
     poll_row = conn.execute(
@@ -1069,9 +1134,11 @@ def _handle_poll_responded(
             "poll_multi_choice_single_select",
             "single-select poll response must choose exactly one choice",
         )
-    if ev["created_at"] > poll_row["closes_at"]:
+    # G13: compare the receiver acceptance time against closes_at. A
+    # sender can backdate created_at, so it must not decide lateness.
+    if now >= poll_row["closes_at"]:
         raise ProjectionError(
-            "poll_closed", "poll response arrived after closes_at"
+            "poll_closed", "poll response arrived at or after closes_at"
         )
     conn.execute(
         "INSERT INTO poll_responses(poll_id, sender, choice_ids, human_confirmed,"
@@ -1090,7 +1157,7 @@ def _handle_poll_responded(
             1 if payload.get("human_confirmed") else 0,
             payload.get("approval_record_id"),
             ev["event_id"],
-            ev["created_at"],
+            now,
         ),
     )
     conn.execute(
@@ -1295,6 +1362,27 @@ def _handle_delivery_scheduled(
         return [
             _mutation("noop", "deliveries", ev["event_id"], {"reason": "already_projected"})
         ]
+    # S7: idempotency on (relationship_id, sender, inner_event_id), not on
+    # the announcement envelope id alone. A re-signed announcement with a
+    # fresh envelope id for the same inner event is a duplicate, not a new
+    # delivery: treat it as a noop instead of inserting a second row.
+    dup = conn.execute(
+        "SELECT scheduled_event_id FROM deliveries "
+        "WHERE relationship_id = ? AND sender = ? AND inner_event_id = ?;",
+        (ev["relationship_id"], ev["sender"], payload["inner_event_id"]),
+    ).fetchone()
+    if dup is not None:
+        return [
+            _mutation(
+                "noop",
+                "deliveries",
+                ev["event_id"],
+                {
+                    "reason": "duplicate_announcement",
+                    "existing_scheduled_event_id": dup["scheduled_event_id"],
+                },
+            )
+        ]
     conn.execute(
         "INSERT INTO deliveries(scheduled_event_id, relationship_id, sender,"
         " created_at, inner_event_id, deliver_at, late_by_seconds, state)"
@@ -1326,7 +1414,8 @@ def _handle_delivery_canceled(
     payload = ev["payload"]
     scheduled_id = payload["scheduled_event_id"]
     row = conn.execute(
-        "SELECT state FROM deliveries WHERE scheduled_event_id = ?;", (scheduled_id,)
+        "SELECT state, sender FROM deliveries WHERE scheduled_event_id = ?;",
+        (scheduled_id,),
     ).fetchone()
     if row is None:
         _target_status(
@@ -1337,6 +1426,16 @@ def _handle_delivery_canceled(
             "delivery_cancel_target_not_scheduled",
         )
         return [_add_pending(conn, ev, scheduled_id, "delivery_cancel")]
+    # S7: only the original announcer may cancel a scheduled delivery. A
+    # cancel from any other sender is a stable rejection, not a state
+    # change: otherwise anyone could silently kill another sender's
+    # time-capsule delivery.
+    if ev["sender"] != row["sender"]:
+        raise ProjectionError(
+            "delivery_cancel_not_sender",
+            f"delivery.canceled sender {ev['sender']} is not the announcer "
+            f"{row['sender']} of {scheduled_id}",
+        )
     if row["state"] == "canceled":
         return [
             _mutation("noop", "deliveries", scheduled_id, {"reason": "already_canceled"})
@@ -1405,7 +1504,7 @@ def _dispatch(
     if event_type == "poll.created":
         return _handle_poll_created(conn, ev)
     if event_type == "poll.responded":
-        return _handle_poll_responded(conn, ev)
+        return _handle_poll_responded(conn, ev, now)
     if event_type == "task.created":
         return _handle_task_created(conn, ev)
     if event_type == "task.updated":
@@ -1475,7 +1574,7 @@ def _resolve_pending(
         row = conn.execute(
             "SELECT e.event_id, e.relationship_id, e.conversation_id, e.thread_id,"
             " e.sender, e.sender_seq, e.created_at, e.key_epoch, e.event_type,"
-            " p.payload, p.reply_to"
+            " p.payload, p.reply_to, p.received_at"
             " FROM events e JOIN event_payloads p ON p.event_id = e.event_id"
             " WHERE e.event_id = ?;",
             (ref_id,),
@@ -1545,7 +1644,19 @@ def apply_event(
     Does not open its own transaction; call inside the caller's transaction.
     """
     ev = _row_to_event(event_row)
-    return _apply_inner(conn, ev, utcnow())
+    # G13: the acceptance time is the durable received_at staged with the
+    # payload, not the moment apply_event happens to run. Fall back to the
+    # staged row, then to now, for payloads staged before G13.
+    received_at = ev.get("received_at")
+    if not received_at:
+        row = conn.execute(
+            "SELECT received_at FROM event_payloads WHERE event_id = ?;",
+            (ev["event_id"],),
+        ).fetchone()
+        if row is not None and row["received_at"]:
+            received_at = row["received_at"]
+            ev["received_at"] = received_at
+    return _apply_inner(conn, ev, received_at or utcnow())
 
 
 def _iter_relationship_events(
@@ -1555,7 +1666,7 @@ def _iter_relationship_events(
     rows = conn.execute(
         "SELECT e.event_id, e.relationship_id, e.conversation_id, e.thread_id,"
         " e.sender, e.sender_seq, e.created_at, e.key_epoch, e.event_type,"
-        " p.payload, p.reply_to"
+        " p.payload, p.reply_to, p.received_at"
         " FROM events e JOIN event_payloads p ON p.event_id = e.event_id"
         " WHERE e.relationship_id = ?"
         " ORDER BY e.created_at ASC, e.sender ASC, e.sender_seq ASC, e.event_id ASC;",
@@ -1652,7 +1763,9 @@ def rebuild_projections(conn: sqlite3.Connection, relationship_id: str) -> None:
         )
         for ev in _iter_relationship_events(conn, relationship_id):
             try:
-                _apply_inner(conn, ev, now)
+                # G13: rebuilds reuse the ORIGINAL receiver acceptance time
+                # staged with the payload, not the rebuild time.
+                _apply_inner(conn, ev, ev.get("received_at") or now)
             except ProjectionError as exc:
                 quarantine_event(
                     conn,

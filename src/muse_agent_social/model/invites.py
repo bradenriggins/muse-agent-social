@@ -53,7 +53,7 @@ from cryptography.hazmat.primitives import serialization
 from muse_agent_social.canonical import restricted_jcs, strict_parse, CanonicalizationError
 from muse_agent_social.validation import validate
 from muse_agent_social.store.db import transaction
-from .._keyfiles import store_private_key, default_keys_dir
+from .._keyfiles import store_private_key, delete_private_key, default_keys_dir
 from ..crypto.identity import (
     agreement_key_multibase_from_pubkey,
     b64url_decode,
@@ -78,15 +78,22 @@ __all__ = [
     "COMMIT_VERSION",
     "INVITE_LIFETIME",
     "MAX_CLOCK_SKEW",
+    "MAX_INVITE_FILE_BYTES",
+    "MAX_INVITE_URI_BYTES",
     "INVITE_URI_SCHEME",
     "create_invite",
     "invite_uri",
     "parse_invite_uri",
+    "parse_invite_json",
     "write_invite_file",
     "read_invite_file",
     "validate_invite",
+    "preview_invite",
+    "record_displayed_phrase",
+    "confirm_verification",
     "generate_relationship_keypair",
     "generate_deploy_keypair",
+    "load_or_generate_deploy_keypair",
     "create_acceptance",
     "pairing_phrase",
     "record_verification",
@@ -106,6 +113,10 @@ INVITE_URI_SCHEME = "muse-agent-social://pair/v1#"
 # Invite files/URIs are small JSON documents; cap reads at the same 262144
 # byte ceiling every envelope path enforces.
 MAX_INVITE_FILE_BYTES = 262144
+# Upper bound on the text form of an invite URI (scheme + base64url of a
+# max-size invite file, with slack). parse_invite_uri rejects longer input
+# before base64url-decoding it (G9).
+MAX_INVITE_URI_BYTES = len(INVITE_URI_SCHEME) + (MAX_INVITE_FILE_BYTES * 4 // 3) + 8
 
 _UUID4_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -376,6 +387,12 @@ def parse_invite_uri(uri: str) -> dict:
             "bad_invite_uri",
             "invite URI must start with muse-agent-social://pair/v1#",
         )
+    # G9: reject oversized URI text BEFORE base64url-decoding it.
+    if len(uri) > MAX_INVITE_URI_BYTES:
+        raise PairingError(
+            "invite_too_large",
+            f"invite URI exceeds {MAX_INVITE_URI_BYTES} characters",
+        )
     try:
         raw = b64url_decode(uri[len(INVITE_URI_SCHEME):])
     except ValueError as exc:
@@ -400,6 +417,28 @@ def write_invite_file(invite: dict, path) -> None:
         fh.write("\n")
 
 
+def _invite_from_raw(raw: bytes, what: str) -> dict:
+    """Parse and schema-validate invite JSON bytes (already bounded)."""
+    try:
+        invite = strict_parse(raw)
+    except CanonicalizationError as exc:
+        raise PairingError("bad_invite_file", f"not valid JSON: {exc}") from exc
+    if not isinstance(invite, dict):
+        raise PairingError("bad_invite_file", "invite must be a JSON object")
+    validate("invite", invite)
+    return invite
+
+
+def parse_invite_json(text: str) -> dict:
+    """Parse and schema-validate invite JSON text (already bounded).
+
+    Used by the CLI accept path so a file read once is not read again
+    (G9): ``_load_invite_text`` bounds the read, this parses the text.
+    """
+    raw = text.encode("utf-8") if isinstance(text, str) else bytes(text)
+    return _invite_from_raw(raw, "invite")
+
+
 def read_invite_file(path) -> dict:
     """Read and schema-validate an invite file. Returns the invite dict."""
     # Bounded read: invite files are small JSON documents; never buffer an
@@ -411,14 +450,7 @@ def read_invite_file(path) -> dict:
             "invite_too_large",
             f"invite file exceeds {MAX_INVITE_FILE_BYTES} bytes",
         )
-    try:
-        invite = strict_parse(raw)
-    except CanonicalizationError as exc:
-        raise PairingError("bad_invite_file", f"not valid JSON: {exc}") from exc
-    if not isinstance(invite, dict):
-        raise PairingError("bad_invite_file", "invite must be a JSON object")
-    validate("invite", invite)
-    return invite
+    return _invite_from_raw(raw, "invite")
 
 
 def _check_invite_pure(invite: dict, now: datetime) -> None:
@@ -445,17 +477,19 @@ def _check_invite_pure(invite: dict, now: datetime) -> None:
         raise PairingError("expired", "invite has expired")
 
 
-def validate_invite(conn, invite: dict, now: Optional[datetime] = None) -> dict:
-    """Fully validate an invite and atomically consume its one-use status.
+def preview_invite(conn, invite: dict, now: Optional[datetime] = None) -> dict:
+    """Validate an invite WITHOUT consuming its one-use status (G5).
 
-    Checks the schema, the inviter card, the invite signature, the 15-minute
-    lifetime cap, expiry, and clock skew, then requires the invite to be in
-    state ``issued`` in the local store and moves it to ``accepted`` inside
-    one transaction. A second call for the same invite raises
-    ``already_used``.
+    Runs the same pure checks as ``validate_invite`` (schema, inviter card,
+    signature, 15-minute lifetime cap, expiry, clock skew) and requires the
+    invite to be in state ``issued`` in the local store, but does NOT move
+    it to ``accepted``. Remote mutations (relay provisioning) must happen
+    only after this passes, so an expired/canceled/tampered invite fails
+    before anything is provisioned. Consumption happens later, atomically
+    inside the commit transaction (see ``commit_pairing(claim_invite=True)``).
 
-    This runs on the inviter's side when the acceptance arrives (only the
-    inviter holds the one-use ledger). Returns the invite dict.
+    An expired invite is still marked ``expired`` (a terminal state, not a
+    consumption). Returns the invite dict.
     """
     _ensure_pairing_tables(conn)
     now = _coerce_now(now)
@@ -483,9 +517,39 @@ def validate_invite(conn, invite: dict, now: Optional[datetime] = None) -> dict:
                 "already_used",
                 f"invite is in state {row['state']!r}, not 'issued'",
             )
-        conn.execute(
-            "UPDATE invites SET state='accepted' WHERE invite_id=?", (invite_id,)
+    return invite
+
+
+def validate_invite(conn, invite: dict, now: Optional[datetime] = None) -> dict:
+    """Fully validate an invite and atomically consume its one-use status.
+
+    Checks the schema, the inviter card, the invite signature, the 15-minute
+    lifetime cap, expiry, and clock skew, then requires the invite to be in
+    state ``issued`` in the local store and moves it to ``accepted`` inside
+    one transaction. A second call for the same invite raises
+    ``already_used``.
+
+    This runs on the inviter's side when the acceptance arrives (only the
+    inviter holds the one-use ledger). Returns the invite dict.
+
+    Prefer ``preview_invite`` followed by ``commit_pairing(claim_invite=True)``
+    for the CLI path: that makes claim and commit atomic and leaves no
+    accepted-but-uncommitted window (G8).
+    """
+    preview_invite(conn, invite, now)
+    invite_id = invite.get("invite_id")
+    _require_uuid4(invite_id, "invite_id")
+    with transaction(conn):
+        cursor = conn.execute(
+            "UPDATE invites SET state='accepted'"
+            " WHERE invite_id=? AND state='issued'",
+            (invite_id,),
         )
+        if cursor.rowcount != 1:
+            raise PairingError(
+                "already_used",
+                "invite was consumed concurrently; refusing double use",
+            )
     return invite
 
 
@@ -527,6 +591,44 @@ def generate_deploy_keypair(private_path) -> str:
         format=serialization.PublicFormat.OpenSSH,
     )
     return public_bytes.decode("ascii").strip()
+
+
+def load_or_generate_deploy_keypair(private_path) -> str:
+    """Return the OpenSSH public key for the deploy keypair at *private_path*.
+
+    Reuses an existing keypair when the private key file is already there
+    (a retry after a crashed pairing attempt): the public key is derived
+    from the stored OpenSSH private key, never regenerated, so the retry
+    registers the same key the first attempt may already have provisioned.
+    Otherwise generates a fresh Ed25519 keypair like
+    :func:`generate_deploy_keypair`.
+    """
+    if os.path.exists(private_path):
+        try:
+            with open(private_path, "rb") as fh:
+                priv = serialization.load_ssh_private_key(
+                    fh.read(), password=None
+                )
+        except (OSError, ValueError) as exc:
+            raise PairingError(
+                "bad_deploy_key",
+                f"cannot load existing deploy private key {private_path}: {exc}",
+            ) from exc
+        if not isinstance(priv, Ed25519PrivateKey):
+            raise PairingError(
+                "bad_deploy_key",
+                f"existing deploy private key {private_path} is not Ed25519",
+            )
+        return (
+            priv.public_key()
+            .public_bytes(
+                encoding=serialization.Encoding.OpenSSH,
+                format=serialization.PublicFormat.OpenSSH,
+            )
+            .decode("ascii")
+            .strip()
+        )
+    return generate_deploy_keypair(private_path)
 
 
 def create_acceptance(
@@ -724,9 +826,162 @@ def record_verification(
     }
 
 
+def record_displayed_phrase(
+    conn,
+    invite_id: str,
+    fingerprints: tuple,
+    now: Optional[datetime] = None,
+) -> dict:
+    """Record the phrase the human was shown, WITHOUT approving it (G6).
+
+    Run 1 of the sticky verification flow: the caller computed the
+    eight-word phrase from (inviter_card, acceptor_card) and printed it.
+    This stores the exact fingerprints that were displayed with
+    ``human_approved=0``. Run 2 (``confirm_verification``) must present the
+    same fingerprints before approval flips to 1, so an attacker cannot
+    swap the acceptor card between display and confirmation.
+
+    Re-displaying (a second run 1) overwrites the stored fingerprints and
+    resets approval to 0, which is safe: only the newly displayed phrase
+    can be confirmed next.
+    """
+    _ensure_pairing_tables(conn)
+    _require_uuid4(invite_id, "invite_id")
+    inviter_fp, acceptor_fp = fingerprints
+    with transaction(conn):
+        state_row = conn.execute(
+            "SELECT state FROM invites WHERE invite_id=?", (invite_id,)
+        ).fetchone()
+        if state_row is None:
+            raise PairingError("unknown_invite", "invite was not issued here")
+        if state_row["state"] == "committed":
+            raise PairingError(
+                "already_committed",
+                "invite is already committed; too late to verify",
+            )
+        verified_at = format_timestamp(_coerce_now(now))
+        conn.execute(
+            "INSERT OR REPLACE INTO pairing_verifications"
+            " (invite_id, inviter_card_fingerprint, acceptor_card_fingerprint,"
+            "  verified_at, human_approved) VALUES (?, ?, ?, ?, 0)",
+            (invite_id, inviter_fp, acceptor_fp, verified_at),
+        )
+    return {
+        "invite_id": invite_id,
+        "inviter_card_fingerprint": inviter_fp,
+        "acceptor_card_fingerprint": acceptor_fp,
+        "verified_at": verified_at,
+        "human_approved": False,
+    }
+
+
+def confirm_verification(
+    conn,
+    invite_id: str,
+    fingerprints: tuple,
+    now: Optional[datetime] = None,
+) -> dict:
+    """Confirm the displayed phrase and flip approval to true (G6).
+
+    Run 2 of the sticky verification flow: the caller computed the phrase
+    again from the acceptance file and the human confirmed it matches what
+    they compared out-of-band. The fingerprints MUST match the ones stored
+    by ``record_displayed_phrase``; a mismatch means the acceptance changed
+    between display and confirmation (exactly the substitution the
+    verification binds against), and raises ``phrase_record_mismatch``
+    WITHOUT burning the invite: the human can re-run run 1 to display the
+    new phrase and start a fresh comparison.
+    """
+    _ensure_pairing_tables(conn)
+    _require_uuid4(invite_id, "invite_id")
+    inviter_fp, acceptor_fp = fingerprints
+    with transaction(conn):
+        vrow = conn.execute(
+            "SELECT human_approved, inviter_card_fingerprint,"
+            " acceptor_card_fingerprint FROM pairing_verifications"
+            " WHERE invite_id=?",
+            (invite_id,),
+        ).fetchone()
+        if vrow is None:
+            raise PairingError(
+                "no_phrase_displayed",
+                "no verification phrase was displayed for this invite; "
+                "run without --i-compared-phrase first",
+            )
+        if (
+            vrow["inviter_card_fingerprint"] != inviter_fp
+            or vrow["acceptor_card_fingerprint"] != acceptor_fp
+        ):
+            raise PairingError(
+                "phrase_record_mismatch",
+                "the acceptance changed since the phrase was displayed; "
+                "re-run without --i-compared-phrase to display the new "
+                "phrase and compare it again",
+            )
+        if vrow["human_approved"]:
+            return {"invite_id": invite_id, "human_approved": True}
+        verified_at = format_timestamp(_coerce_now(now))
+        conn.execute(
+            "UPDATE pairing_verifications SET human_approved=1,"
+            " verified_at=? WHERE invite_id=?",
+            (verified_at, invite_id),
+        )
+    return {"invite_id": invite_id, "human_approved": True}
+
+
 # ---------------------------------------------------------------------------
 # Commit (inviter side) and activation
 # ---------------------------------------------------------------------------
+
+def _reconcile_orphan_pairing_key(
+    conn, relationship_id: str, key_path: str
+) -> None:
+    """Reconcile a pre-existing pairing key file before a fresh store.
+
+    Called when ``store_private_key`` raises FileExistsError in
+    ``commit_pairing``. When the database holds a live relationship or key
+    row for the id, the file is genuinely owned: re-raise FileExistsError,
+    never overwrite. Otherwise the file is an orphan from a crashed
+    attempt (stored but never committed): securely delete it so the caller
+    can retry the store.
+    """
+    rel_row = conn.execute(
+        "SELECT 1 FROM relationships WHERE relationship_id=?",
+        (relationship_id,),
+    ).fetchone()
+    key_row = conn.execute(
+        "SELECT 1 FROM key_epochs WHERE relationship_id=? AND epoch=1",
+        (relationship_id,),
+    ).fetchone()
+    if rel_row is not None or key_row is not None:
+        raise FileExistsError(
+            f"key file {key_path} already exists and relationship "
+            f"{relationship_id} has live pairing state; refusing to overwrite"
+        )
+    if not delete_private_key(key_path):
+        raise PairingError(
+            "key_destruction_failed",
+            f"could not securely delete orphan pairing key {key_path}; "
+            "refusing to retry the store over key material that may "
+            "still be recoverable",
+        )
+
+
+def _destroy_pairing_key(key_path: str) -> None:
+    """Securely destroy a pairing private key after a failed commit.
+
+    Uses delete_private_key (overwrite + unlink), never a bare os.unlink:
+    the file holds a real private key that must not stay recoverable on
+    disk. Raises PairingError when the secure wipe fails, so the operator
+    knows key material may remain.
+    """
+    if not delete_private_key(key_path):
+        raise PairingError(
+            "key_destruction_failed",
+            f"secure deletion of pairing key {key_path} failed after a "
+            "failed commit; key material may remain recoverable on disk",
+        )
+
 
 def commit_pairing(
     conn,
@@ -738,6 +993,7 @@ def commit_pairing(
     now: Optional[datetime] = None,
     keys_dir=None,
     relationship_id: Optional[str] = None,
+    claim_invite: bool = False,
 ) -> dict:
     """Validate an acceptance and issue the signed pairing commit (step 4).
 
@@ -753,6 +1009,14 @@ def commit_pairing(
 
     Pass ``relationship_id`` to mint the id before calling (so relay
     provisioning can reference it); when omitted a fresh uuid4 is used.
+
+    ``claim_invite`` (G8): when True, the invite is claimed
+    (``issued`` -> ``accepted``) inside the same transaction as the commit
+    instead of requiring a prior ``validate_invite`` call. On any failure
+    the whole transaction rolls back and the invite stays ``issued``, so
+    there is no accepted-but-uncommitted window and no reset race. When
+    False, the caller must have consumed the invite with ``validate_invite``
+    first (legacy behavior, kept for tests and API users).
     """
     _ensure_pairing_tables(conn)
     now = _coerce_now(now)
@@ -780,12 +1044,21 @@ def commit_pairing(
         rel_priv.public_key().public_bytes_raw()
     )
     key_path = os.path.join(kdir, relationship_id, "epoch1.key")
-    store_private_key(key_path, rel_priv.private_bytes_raw())
+    try:
+        store_private_key(key_path, rel_priv.private_bytes_raw())
+    except FileExistsError:
+        # A crashed earlier attempt may have stored the key file without
+        # committing the pairing (same caller-minted relationship_id on
+        # retry). Reconcile: wipe the orphan and retry the store, or
+        # re-raise when live state owns the file.
+        _reconcile_orphan_pairing_key(conn, relationship_id, key_path)
+        store_private_key(key_path, rel_priv.private_bytes_raw())
     try:
         with transaction(conn):
             return _commit_txn(
                 conn, acceptance, inviter_priv, relay_url, slots, negotiated,
                 invite_id, relationship_id, rel_pub_mb, key_path, now,
+                claim_invite=claim_invite,
             )
     except _BurnAndAbort:
         # The transaction rolled back; honor the burn in a fresh transaction,
@@ -793,10 +1066,7 @@ def commit_pairing(
         try:
             burn_invite(conn, invite_id)
         finally:
-            try:
-                os.unlink(key_path)
-            except OSError:
-                pass
+            _destroy_pairing_key(key_path)
         raise
     except PairingError as exc:
         if exc.code == "expired":
@@ -805,22 +1075,17 @@ def commit_pairing(
                     "UPDATE invites SET state='expired' WHERE invite_id=?",
                     (invite_id,),
                 )
-        try:
-            os.unlink(key_path)
-        except OSError:
-            pass
+        _destroy_pairing_key(key_path)
         raise
     except Exception:
-        try:
-            os.unlink(key_path)
-        except OSError:
-            pass
+        _destroy_pairing_key(key_path)
         raise
 
 
 def _commit_txn(
     conn, acceptance, inviter_priv, relay_url, slots, negotiated,
     invite_id, relationship_id, rel_pub_mb, key_path, now,
+    claim_invite: bool = False,
 ):
     def _burn(code, message):
         # Returns the abort; commit_pairing honors the burn AFTER the
@@ -835,13 +1100,37 @@ def _commit_txn(
     ).fetchone()
     if body_row is None or state_row is None:
         raise PairingError("unknown_invite", "invite was not issued here")
-    if state_row["state"] != "accepted":
+    invite = json.loads(body_row["invite_json"])
+    if claim_invite:
+        # Self-contained: in claim mode there is no separate validate_invite
+        # call, so run the pure checks (signature, lifetime cap, expiry)
+        # before claiming.
+        _check_invite_pure(invite, now)
+        # G8: claim and commit in one transaction. The claim succeeds only
+        # from 'issued'; on any later failure in this transaction the claim
+        # rolls back with everything else, so the invite stays 'issued' and
+        # there is no accepted-but-uncommitted window and no reset race.
+        cursor = conn.execute(
+            "UPDATE invites SET state='accepted'"
+            " WHERE invite_id=? AND state='issued'",
+            (invite_id,),
+        )
+        if cursor.rowcount != 1:
+            raise PairingError(
+                "invite_not_issued",
+                f"invite is in state {state_row['state']!r}, not 'issued';"
+                " the invite may have been used concurrently",
+            )
+    elif state_row["state"] != "accepted":
         raise PairingError(
             "invite_not_accepted",
             f"invite is in state {state_row['state']!r}; validate the acceptance first",
         )
-    invite = json.loads(body_row["invite_json"])
-    if now >= parse_timestamp(invite["expires_at"]):
+    if not claim_invite and now >= parse_timestamp(invite["expires_at"]):
+        # Legacy mode: the invite was validated earlier by validate_invite,
+        # but it can expire between validation and commit (TOCTOU), so the
+        # expiry check is repeated here at commit time. Claim mode already
+        # checked expiry via _check_invite_pure above.
         # State update is honored by commit_pairing after rollback.
         raise PairingError("expired", "invite expired before commit")
 

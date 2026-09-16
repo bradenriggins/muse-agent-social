@@ -1,0 +1,37 @@
+# requirements-lock.txt: known-good resolved dependency tree for
+# muse-agent-social 0.2.0 (including the [test] extra).
+#
+# Generated 2026-09-16 from a CLEAN virtualenv on Python 3.12:
+#
+#   python3 -m venv /tmp/mas-lock-venv
+#   /tmp/mas-lock-venv/bin/pip install --upgrade "pip" "setuptools>=78.1.1" wheel
+#   /tmp/mas-lock-venv/bin/pip install "<repo>[test]"
+#   /tmp/mas-lock-venv/bin/pip freeze | sort > requirements-lock.txt
+#
+# Regenerate after ANY change to pyproject.toml dependencies or
+# build-system requires, then re-run the test suite.
+#
+# The raw freeze's `muse-agent-social @ file:///...` line is omitted below:
+# the lock pins third-party packages only; install the project itself with
+# `pip install -e .` (or `pip install .`) on top of this lock.
+#
+# To reproduce the pinned tree: `pip install -r requirements-lock.txt`.
+
+attrs==26.1.0
+base58==2.1.1
+cffi==2.1.1
+cryptography==50.0.1
+iniconfig==2.3.0
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+packaging==26.3
+pluggy==1.6.0
+Pygments==2.21.0
+pycparser==3.0
+pytest==9.1.1
+referencing==0.37.0
+regex==2026.9.10
+rpds-py==2026.6.3
+setuptools==84.0.0
+typing_extensions==4.16.0
+wheel==0.48.0

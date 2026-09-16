@@ -44,7 +44,9 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from itertools import count as _count
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
@@ -78,6 +80,9 @@ __all__ = [
     "OLD_KEY_EVENT_LIMIT",
     "ROTATION_QUARANTINE_CAP",
     "ROTATION_QUARANTINE_REJECTED_RETENTION",
+    "KEY_ROTATION_COMMITTED_RETENTION",
+    "PEER_KEY_EPOCH_RETAIN_NEWEST",
+    "SECURITY_KEY_EVENT_RETENTION",
     "agreement_fingerprint",
     "build_prepare",
     "build_ack",
@@ -97,6 +102,31 @@ OLD_KEY_EVENT_LIMIT = 100
 # rows older than the retention window are expired by sweep().
 ROTATION_QUARANTINE_CAP = 50
 ROTATION_QUARANTINE_REJECTED_RETENTION = timedelta(days=30)
+
+# G16: committed rotation history retention. Committed key_rotations rows
+# are history, not live state: sweep() deletes committed rows older than
+# this, always keeping the newest committed row per (relationship, role)
+# so build_commit()'s redelivery fallback and mark_committed()'s
+# crash re-drive keep working. Safe because the 7-day accept window
+# means no commit redelivery can arrive after the retention age.
+KEY_ROTATION_COMMITTED_RETENTION = timedelta(days=30)
+
+# G16: peer agreement-key retention. The seal side wraps to at most the
+# peer's current and previous epoch (dual-wrap bound), and the 7-day
+# accept window means no legitimate send can need an older peer public
+# key, so sweep() keeps only the two newest peer key_epochs rows per
+# relationship. Own private keys are unaffected: their 24h/100-event
+# replay-acceptance retention (OLD_KEY_RETENTION/OLD_KEY_EVENT_LIMIT)
+# is handled separately and must not be shortened, or delayed
+# pre-rotation events would fail to unseal.
+PEER_KEY_EPOCH_RETAIN_NEWEST = 2
+
+# G16: projected security-key ceremony index retention. The ceremony
+# events themselves are immutable in the event log; security_key_events
+# is a convenience projection, compacted by receiver acceptance time
+# (never sender-created_at). A rebuild re-derives the full history from
+# the log, so this bounds steady-state growth, not disaster recovery.
+SECURITY_KEY_EVENT_RETENTION = timedelta(days=90)
 
 _PEER_REF = "peer"
 
@@ -150,6 +180,52 @@ class IdentityRotationError(Exception):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+_savepoint_ids = _count()
+
+
+@contextmanager
+def _savepoint(conn):
+    """Atomic sub-unit when the connection already holds a transaction.
+
+    SQLite rejects a nested BEGIN IMMEDIATE, which happens on legacy
+    implicit-transaction connections (some tests open one and never
+    commit). A SAVEPOINT scopes the same atomicity without nesting.
+    """
+    name = f"mas_txn_{next(_savepoint_ids)}"
+    conn.execute(f"SAVEPOINT {name};")
+    try:
+        yield conn
+    except BaseException:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {name};")
+        conn.execute(f"RELEASE SAVEPOINT {name};")
+        raise
+    else:
+        conn.execute(f"RELEASE SAVEPOINT {name};")
+
+
+def _txn(conn):
+    """A real BEGIN IMMEDIATE transaction without a top-level import.
+
+    ``from ..store.db import transaction`` at module top is circular:
+    muse_agent_social.store imports this module at package init (for the
+    rotation-table DDL), which breaks ``import
+    muse_agent_social.crypto.rotation`` as an entry point. Import lazily at
+    call time instead; by then every package is fully initialized.
+
+    Re-entrant: when the connection already holds a transaction (legacy
+    implicit-transaction connections), a SAVEPOINT provides the atomic
+    sub-unit instead of a nested BEGIN IMMEDIATE, which SQLite rejects.
+    On production connections (autocommit) this always takes the real
+    BEGIN IMMEDIATE path.
+    """
+    from ..store.db import transaction
+
+    if conn.in_transaction:
+        return _savepoint(conn)
+    return transaction(conn)
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -244,11 +320,63 @@ CREATE TABLE IF NOT EXISTS rotation_quarantine (
 );
 CREATE INDEX IF NOT EXISTS idx_rotation_quarantine_rel
     ON rotation_quarantine (relationship_id);
+-- Durable first-seen record for unknown future epochs. rotation_quarantine
+-- is capped by evicting the oldest rows, which must not reset the 24-hour
+-- rejection timer: this table keeps one row per (relationship, epoch) that
+-- cap eviction can never touch.
+CREATE TABLE IF NOT EXISTS unknown_epoch_first_seen (
+    relationship_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    -- Permanent tombstone: once the 24h window elapses the epoch is
+    -- rejected forever. Cap eviction must never delete a rejected row,
+    -- or the rejection timer would reset and the epoch would become
+    -- retryable again.
+    rejected INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (relationship_id, epoch)
+);
+-- Rotation events whose post-receive hook was attempted (success or
+-- deterministic rejection). The per-poll reconciler re-drives accepted
+-- rotation events lacking a row here, converging the crash gap between
+-- the receive commit and _post_receive_hooks.
+CREATE TABLE IF NOT EXISTS rotation_processed_events (
+    event_id TEXT PRIMARY KEY,
+    relationship_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    processed_at TEXT NOT NULL
+);
+-- Decrypt signals that arrived before their rotation row was acknowledged
+-- (a new-epoch data event can beat the ack on a quiet relationship). The
+-- ack consumes the parked signal so confirm_rotation never stalls on pure
+-- reordering. Swept after ROTATION_WINDOW when never consumed.
+CREATE TABLE IF NOT EXISTS rotation_wrap_seen_pending (
+    relationship_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    seen_at TEXT NOT NULL,
+    PRIMARY KEY (relationship_id, epoch)
+);
 """
 
 
 def _ensure_tables(conn: sqlite3.Connection) -> None:
     conn.executescript(_ROTATION_TABLES)
+    _ensure_first_seen_rejected(conn)
+
+
+def _ensure_first_seen_rejected(conn: sqlite3.Connection) -> None:
+    """Backfill the ``rejected`` tombstone column on older databases.
+
+    The CREATE TABLE above is IF NOT EXISTS, so databases created before
+    the tombstone existed keep the old shape without this.
+    """
+    cols = [row[1] for row in conn.execute(
+        "PRAGMA table_info(unknown_epoch_first_seen);"
+    ).fetchall()]
+    if "rejected" not in cols:
+        conn.execute(
+            "ALTER TABLE unknown_epoch_first_seen"
+            " ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0;"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -403,9 +531,19 @@ class RotationManager:
         prepare = build_prepare(
             new_pub, agreement_fingerprint(prior_pub), deadline
         )
-        with self.conn:
+        try:
             store_private_key(key_path, new_priv.private_bytes_raw())
-            try:
+        except FileExistsError:
+            # A crashed earlier attempt may have stored the key file without
+            # committing its rows. Reconcile: wipe the orphan and retry the
+            # store, or re-raise when live state owns the file.
+            self._reconcile_orphan_key_file(rid, new_epoch, key_path)
+            store_private_key(key_path, new_priv.private_bytes_raw())
+        try:
+            # All three writes are one atomic transaction (BEGIN IMMEDIATE):
+            # a crash between them used to leave a key row with no rotation
+            # row (or vice versa), wedging the rotation permanently.
+            with _txn(self.conn):
                 self.conn.execute(
                     "INSERT INTO key_epochs (relationship_id, epoch, public_key, "
                     "private_key_ref, state) VALUES (?, ?, ?, ?, 'candidate')",
@@ -428,21 +566,46 @@ class RotationManager:
                         prepare_event_id, _ts(now), _ts(deadline),
                     ),
                 )
-            except Exception:
-                delete_private_key(key_path)
-                raise
+        except Exception:
+            delete_private_key(key_path)
+            raise
         return {"epoch": new_epoch, "prepare": prepare}
+
+    def _reconcile_orphan_key_file(
+        self, rid: str, epoch: int, key_path: str
+    ) -> None:
+        """Reconcile a pre-existing key file before a fresh rotation store.
+
+        Called when ``store_private_key`` raises FileExistsError. When the
+        database holds a live key row or a live rotation row for the epoch,
+        the file is genuinely owned: re-raise FileExistsError, never
+        overwrite. Otherwise the file is an orphan from a crashed attempt
+        (stored but never committed, or discarded with the file deletion
+        lost): securely delete it so the caller can retry the store.
+        """
+        key_row = self.conn.execute(
+            "SELECT 1 FROM key_epochs WHERE relationship_id=? AND epoch=? "
+            "AND private_key_ref != ?",
+            (rid, epoch, _PEER_REF),
+        ).fetchone()
+        rotation = self._rotation(rid, epoch, "rotating")
+        live = key_row is not None or (
+            rotation is not None and rotation["phase"] != "discarded"
+        )
+        if live:
+            raise FileExistsError(
+                f"key file {key_path} already exists and epoch {epoch} has "
+                "live rotation state; refusing to overwrite"
+            )
+        delete_private_key(key_path)
 
     def on_ack(self, rid: str, ack: dict, now=None) -> None:
         """Process the peer's ``security.key.ack`` for my prepare."""
         now = self._now(now)
         validate_payload("security.key.ack", ack)
-        rotation = self._rotation(rid, int(ack["epoch"]), "rotating")
-        if (
-            rotation is None
-            or rotation["role"] != "rotating"
-            or rotation["phase"] != "candidate"
-        ):
+        epoch = int(ack["epoch"])
+        rotation = self._rotation(rid, epoch, "rotating")
+        if rotation is None or rotation["role"] != "rotating":
             raise ConfirmRejected(
                 f"no candidate rotation for epoch {ack['epoch']}"
             )
@@ -451,49 +614,100 @@ class RotationManager:
             and rotation["prepare_event_id"] != ack["prepare_event_id"]
         ):
             raise ConfirmRejected("ack references a different prepare event")
+        if rotation["phase"] == "acknowledged":
+            # Idempotent re-drive (crash converged the ack but the hook
+            # never got marked): already applied. Still consume any decrypt
+            # signal parked before the ack arrived.
+            with _txn(self.conn):
+                self._consume_pending_wrap_seen(rid, epoch)
+            return
+        if rotation["phase"] != "candidate":
+            raise ConfirmRejected(
+                f"no candidate rotation for epoch {ack['epoch']}"
+            )
         if now > parse_timestamp(rotation["deadline"]):
             raise ConfirmRejected("ack arrived after the prepare deadline")
-        with self.conn:
-            self.conn.execute(
+        with _txn(self.conn):
+            cur = self.conn.execute(
                 "UPDATE key_rotations SET phase='acknowledged', "
                 "acknowledged_at=? WHERE relationship_id=? AND epoch=? "
-                "AND role='rotating'",
-                (_ts(now), rid, int(ack["epoch"])),
+                "AND role='rotating' AND phase='candidate'",
+                (_ts(now), rid, epoch),
             )
+            if cur.rowcount == 0:
+                # Lost a race (e.g. sweep discarded the candidate
+                # concurrently): re-read and report honestly instead of
+                # silently succeeding or resurrecting the row.
+                raise ConfirmRejected(
+                    f"no candidate rotation for epoch {epoch}"
+                )
             self.conn.execute(
                 "UPDATE key_epochs SET state='acknowledged' "
                 "WHERE relationship_id=? AND epoch=? AND private_key_ref != ?",
-                (rid, int(ack["epoch"]), _PEER_REF),
+                (rid, epoch, _PEER_REF),
+            )
+            self._consume_pending_wrap_seen(rid, epoch)
+
+    def _consume_pending_wrap_seen(self, rid: str, epoch: int) -> None:
+        """Backfill new_wrap_seen from a decrypt signal parked pre-ack.
+
+        Must be called inside the caller's transaction.
+        """
+        cur = self.conn.execute(
+            "DELETE FROM rotation_wrap_seen_pending "
+            "WHERE relationship_id=? AND epoch=?",
+            (rid, epoch),
+        )
+        if cur.rowcount:
+            self.conn.execute(
+                "UPDATE key_rotations SET new_wrap_seen=1 "
+                "WHERE relationship_id=? AND epoch=? AND role='rotating' "
+                "AND phase NOT IN ('discarded', 'committed')",
+                (rid, epoch),
             )
 
     def note_decrypted_new_wrap(self, rid: str, epoch: int, now=None) -> None:
-        """Record that a new-epoch wrap was successfully decrypted."""
-        self._now(now)
-        rotation = self._rotation(rid, int(epoch), "rotating")
-        if (
-            rotation is None
-            or rotation["role"] != "rotating"
-            or rotation["phase"] != "acknowledged"
-        ):
-            raise RotationError(
-                "no_acknowledged_rotation",
-                f"no acknowledged rotation at epoch {epoch}",
-            )
-        with self.conn:
-            self.conn.execute(
-                "UPDATE key_rotations SET new_wrap_seen=1 "
-                "WHERE relationship_id=? AND epoch=? AND role='rotating'",
-                (rid, int(epoch)),
-            )
+        """Record that a new-epoch wrap was successfully decrypted.
 
-    def confirm_rotation(self, rid: str, now=None) -> dict:
-        """Send ``security.key.confirm`` after decrypting a new-epoch wrap."""
+        Idempotent and phase-agnostic: a new-epoch data event can arrive
+        before the ack on a quiet relationship, and the old code dropped
+        the signal (raising ``no_acknowledged_rotation``), which later
+        failed ``confirm_rotation`` with ``no_new_wrap_seen``. The signal
+        is recorded on any live rotating row; when no row exists yet it is
+        parked and consumed by ``on_ack``.
+        """
         now = self._now(now)
+        epoch = int(epoch)
+        with _txn(self.conn):
+            cur = self.conn.execute(
+                "UPDATE key_rotations SET new_wrap_seen=1 "
+                "WHERE relationship_id=? AND epoch=? AND role='rotating' "
+                "AND phase NOT IN ('discarded', 'committed')",
+                (rid, epoch),
+            )
+            if cur.rowcount == 0:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO rotation_wrap_seen_pending "
+                    "(relationship_id, epoch, seen_at) VALUES (?, ?, ?)",
+                    (rid, epoch, _ts(now)),
+                )
+
+    def build_confirm_payload(self, rid: str, now=None) -> dict:
+        """Build ``security.key.confirm`` without changing phase.
+
+        Idempotent: safe to call any number of times while the rotation is
+        acknowledged (or already confirmed, for re-emit after a crash
+        between send and mark). The CLI sends this payload first and calls
+        ``mark_confirmed`` only after the send is durably enqueued, so a
+        failed send never wedges the rotation in 'confirmed' with no
+        confirm event on the wire.
+        """
+        self._now(now)
         rotation = self._in_flight(rid, role='rotating')
         if (
             rotation is None
             or rotation["role"] != "rotating"
-            or rotation["phase"] != "acknowledged"
+            or rotation["phase"] not in ("acknowledged", "confirmed")
         ):
             raise RotationError(
                 "nothing_to_confirm", "no acknowledged rotation to confirm"
@@ -503,13 +717,78 @@ class RotationManager:
                 "no_new_wrap_seen",
                 "confirm requires decrypting at least one new-epoch wrap first",
             )
-        with self.conn:
-            self.conn.execute(
+        return build_confirm(int(rotation["epoch"]))
+
+    def mark_confirmed(self, rid: str, now=None) -> None:
+        """Record that the confirm was sent (acknowledged -> confirmed).
+
+        Idempotent: a re-drive after a crash between the send and this
+        mark is a no-op.
+        """
+        now = self._now(now)
+        with _txn(self.conn):
+            rotation = self._in_flight(rid, role='rotating')
+            if rotation is not None and rotation["phase"] == "confirmed":
+                return
+            if (
+                rotation is None
+                or rotation["role"] != "rotating"
+                or rotation["phase"] != "acknowledged"
+            ):
+                raise RotationError(
+                    "nothing_to_confirm", "no acknowledged rotation to confirm"
+                )
+            cur = self.conn.execute(
                 "UPDATE key_rotations SET phase='confirmed', confirmed_at=? "
-                "WHERE relationship_id=? AND epoch=? AND role='rotating'",
+                "WHERE relationship_id=? AND epoch=? AND role='rotating' "
+                "AND phase='acknowledged'",
                 (_ts(now), rid, int(rotation["epoch"])),
             )
-        return build_confirm(int(rotation["epoch"]))
+            if cur.rowcount == 0:
+                raise RotationError(
+                    "nothing_to_confirm", "lost race confirming rotation"
+                )
+
+    def confirm_rotation(self, rid: str, now=None) -> dict:
+        """Build and mark the confirm atomically (single-process path).
+
+        Prefer ``build_confirm_payload`` + ``mark_confirmed`` around the
+        real send: this combined form transitions before the caller can
+        send, so a send failure after it returns still needs the
+        idempotent re-emit below to recover.
+        """
+        now = self._now(now)
+        with _txn(self.conn):
+            rotation = self._in_flight(rid, role='rotating')
+            if rotation is not None and rotation["phase"] == "confirmed":
+                # Idempotent re-emit: the confirm was already marked (a
+                # previous send failed after the transition); hand the
+                # payload back so the caller can retry the send.
+                return build_confirm(int(rotation["epoch"]))
+            if (
+                rotation is None
+                or rotation["role"] != "rotating"
+                or rotation["phase"] != "acknowledged"
+            ):
+                raise RotationError(
+                    "nothing_to_confirm", "no acknowledged rotation to confirm"
+                )
+            if not rotation["new_wrap_seen"]:
+                raise RotationError(
+                    "no_new_wrap_seen",
+                    "confirm requires decrypting at least one new-epoch wrap first",
+                )
+            cur = self.conn.execute(
+                "UPDATE key_rotations SET phase='confirmed', confirmed_at=? "
+                "WHERE relationship_id=? AND epoch=? AND role='rotating' "
+                "AND phase='acknowledged'",
+                (_ts(now), rid, int(rotation["epoch"])),
+            )
+            if cur.rowcount == 0:
+                raise RotationError(
+                    "nothing_to_confirm", "lost race confirming rotation"
+                )
+            return build_confirm(int(rotation["epoch"]))
 
     def on_commit(self, rid: str, commit: dict, now=None) -> None:
         """Process the peer's ``security.key.commit``; start old-key retention."""
@@ -517,29 +796,56 @@ class RotationManager:
         validate_payload("security.key.commit", commit)
         epoch = int(commit["epoch"])
         rotation = self._rotation(rid, epoch, "rotating")
-        if (
-            rotation is None
-            or rotation["role"] != "rotating"
-            or rotation["phase"] != "confirmed"
-        ):
+        if rotation is None:
+            # The committed row may have been cleaned up by sweep after
+            # old-key deletion (R10): if the epoch is already our active
+            # epoch, this is a benign redelivery.
+            rel = self.conn.execute(
+                "SELECT key_epoch FROM relationships WHERE relationship_id=?",
+                (rid,),
+            ).fetchone()
+            if rel is not None and int(rel["key_epoch"]) == epoch:
+                return
+            raise ConfirmRejected(
+                f"no confirmed rotation for epoch {epoch}"
+            )
+        if rotation["role"] != "rotating":
+            raise ConfirmRejected(
+                f"no confirmed rotation for epoch {epoch}"
+            )
+        if rotation["phase"] == "committed":
+            return  # idempotent re-drive: already applied
+        if rotation["phase"] != "confirmed":
             raise ConfirmRejected(
                 f"no confirmed rotation for epoch {epoch}"
             )
         own = self._own_epochs(rid)
-        prior_epoch = int(rotation["prior_epoch"])
-        with self.conn:
-            self.conn.execute(
+        prior_epoch = (
+            int(rotation["prior_epoch"])
+            if rotation["prior_epoch"] is not None
+            else None
+        )
+        with _txn(self.conn):
+            cur = self.conn.execute(
                 "UPDATE key_rotations SET phase='committed', committed_at=?, "
                 "accepted_events_since_commit=0 "
-                "WHERE relationship_id=? AND epoch=? AND role='rotating'",
+                "WHERE relationship_id=? AND epoch=? AND role='rotating' "
+                "AND phase='confirmed'",
                 (_ts(now), rid, epoch),
             )
+            if cur.rowcount == 0:
+                row = self._rotation(rid, epoch, "rotating")
+                if row is not None and row["phase"] == "committed":
+                    return  # re-drive won by a concurrent apply
+                raise ConfirmRejected(
+                    f"no confirmed rotation for epoch {epoch}"
+                )
             self.conn.execute(
                 "UPDATE key_epochs SET state='active' "
                 "WHERE relationship_id=? AND epoch=? AND private_key_ref != ?",
                 (rid, epoch, _PEER_REF),
             )
-            if prior_epoch in own:
+            if prior_epoch is not None and prior_epoch in own:
                 self.conn.execute(
                     "UPDATE key_epochs SET state='retired' "
                     "WHERE relationship_id=? AND epoch=? AND private_key_ref != ?",
@@ -551,14 +857,30 @@ class RotationManager:
             )
 
     def note_accepted_event(self, rid: str, now=None) -> None:
-        """Count an accepted data event toward old-key deletion."""
+        """Count an accepted data event toward old-key deletion.
+
+        Only the committed rotating row for the relationship's CURRENT
+        ``key_epoch`` is incremented. Delayed traffic under an older
+        envelope epoch must not bump a historical rotation (R10): the
+        100-event retirement bound belongs to the live epoch, and
+        historical committed rows are deleted by the sweep once their
+        old key is retired, so only one counter can move per event.
+        """
         self._now(now)
-        with self.conn:
+        rel = self.conn.execute(
+            "SELECT key_epoch FROM relationships WHERE relationship_id=?",
+            (rid,),
+        ).fetchone()
+        if rel is None:
+            return
+        current_epoch = int(rel["key_epoch"])
+        with _txn(self.conn):
             self.conn.execute(
                 "UPDATE key_rotations SET accepted_events_since_commit = "
                 "accepted_events_since_commit + 1 "
-                "WHERE relationship_id=? AND phase='committed' AND role='rotating'",
-                (rid,),
+                "WHERE relationship_id=? AND epoch=? AND role='rotating' "
+                "AND phase='committed'",
+                (rid, current_epoch),
             )
 
     # -- acking side ------------------------------------------------------
@@ -602,6 +924,15 @@ class RotationManager:
                     f"two different keys proposed for epoch {new_epoch}; "
                     "quarantined for human resolution",
                 )
+            # Redelivery: the peer key row is already stored. A crash
+            # between that INSERT and the rotation-row INSERT used to ack
+            # here without the rotation row, wedging dual_wrap_keys
+            # forever; repair the missing row first, then ack idempotently.
+            with _txn(self.conn):
+                self._record_acking_rotation(
+                    rid, new_epoch, prior_epoch, prepare, prepare_event_id,
+                    now,
+                )
             return build_ack(new_epoch, prepare_event_id)  # redelivery
         if prior_epoch != max(peer_epochs):
             raise RotationError(
@@ -612,12 +943,14 @@ class RotationManager:
         own = self._own_epochs(rid)
         if new_epoch in own:
             rotation = self._rotation(rid, new_epoch, "rotating")
-            if (
-                rotation is not None
-                and rotation["role"] == "rotating"
+            if rotation is None or (
+                rotation["role"] == "rotating"
                 and rotation["phase"] not in ("committed", "discarded")
             ):
-                # I am also rotating into this epoch: human must decide.
+                # I am also rotating into this epoch, or my key row exists
+                # with no rotation row (a crashed or interleaved begin):
+                # quarantine for human resolution, never misdiagnose as
+                # stale_epoch (which would stall on a 24h NoAckTimeout).
                 self._quarantine(
                     rid, new_epoch, "conflicting_prepare",
                     {"prepare": prepare, "prepare_event_id": prepare_event_id},
@@ -647,36 +980,69 @@ class RotationManager:
                 "prepare_expired", "prepare arrived after its own deadline"
             )
         deadline = parse_timestamp(prepare["deadline"])
-        with self.conn:
+        # The peer key row and the rotation row commit atomically (BEGIN
+        # IMMEDIATE): a crash between them used to leave the peer key row
+        # with no rotation row, and the redelivery shortcut then acked
+        # without repairing it.
+        with _txn(self.conn):
             self.conn.execute(
                 "INSERT INTO key_epochs (relationship_id, epoch, public_key, "
                 "private_key_ref, state) VALUES (?, ?, ?, ?, 'acknowledged')",
                 (rid, new_epoch, prepare["new_agreement_key"], _PEER_REF),
             )
-            # A discarded earlier attempt for this epoch must not block retry.
-            self.conn.execute(
-                "DELETE FROM key_rotations WHERE relationship_id=? "
-                "AND epoch=? AND role='acking' AND phase='discarded'",
-                (rid, new_epoch),
-            )
-            self.conn.execute(
-                "INSERT INTO key_rotations (relationship_id, epoch, role, "
-                "phase, prior_epoch, prior_fingerprint, new_public_key, "
-                "prepare_event_id, prepared_at, acknowledged_at, deadline) "
-                "VALUES (?, ?, 'acking', 'acknowledged', ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    rid, new_epoch, prior_epoch, prepare["prior_fingerprint"],
-                    prepare["new_agreement_key"], prepare_event_id,
-                    _ts(now), _ts(now), _ts(deadline),
-                ),
-            )
-            # A real prepare resolves any queued future-epoch data events.
-            self.conn.execute(
-                "DELETE FROM rotation_quarantine WHERE relationship_id=? "
-                "AND reason='unknown_future_epoch' AND epoch <= ?",
-                (rid, new_epoch),
+            self._record_acking_rotation(
+                rid, new_epoch, prior_epoch, prepare, prepare_event_id, now
             )
         return build_ack(new_epoch, prepare_event_id)
+
+    def _record_acking_rotation(
+        self,
+        rid: str,
+        new_epoch: int,
+        prior_epoch: int,
+        prepare: dict,
+        prepare_event_id: str,
+        now: datetime,
+    ) -> None:
+        """Insert the acking-side rotation row (idempotent repair).
+
+        Must be called inside the caller's transaction. Clears a discarded
+        earlier attempt, then inserts the row only when no live acking row
+        exists for the epoch: the redelivery path uses this to repair a
+        rotation row lost to a crash, never to duplicate a live one.
+        """
+        self.conn.execute(
+            "DELETE FROM key_rotations WHERE relationship_id=? "
+            "AND epoch=? AND role='acking' AND phase='discarded'",
+            (rid, new_epoch),
+        )
+        existing = self._rotation(rid, new_epoch, "acking")
+        if existing is not None and existing["phase"] != "discarded":
+            return
+        deadline = parse_timestamp(prepare["deadline"])
+        self.conn.execute(
+            "INSERT INTO key_rotations (relationship_id, epoch, role, "
+            "phase, prior_epoch, prior_fingerprint, new_public_key, "
+            "prepare_event_id, prepared_at, acknowledged_at, deadline) "
+            "VALUES (?, ?, 'acking', 'acknowledged', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rid, new_epoch, prior_epoch, prepare["prior_fingerprint"],
+                prepare["new_agreement_key"], prepare_event_id,
+                _ts(now), _ts(now), _ts(deadline),
+            ),
+        )
+        # A real prepare resolves any queued future-epoch data events.
+        self.conn.execute(
+            "DELETE FROM rotation_quarantine WHERE relationship_id=? "
+            "AND reason='unknown_future_epoch' AND epoch <= ?",
+            (rid, new_epoch),
+        )
+        # And their first-seen records: the epoch is known now.
+        self.conn.execute(
+            "DELETE FROM unknown_epoch_first_seen WHERE relationship_id=? "
+            "AND epoch <= ?",
+            (rid, new_epoch),
+        )
 
     def dual_wrap_keys(self, rid: str) -> dict:
         """Peer's keys for dual-wrap: {prior_epoch: key, new_epoch: key}.
@@ -728,42 +1094,105 @@ class RotationManager:
         """Process the rotating side's ``security.key.confirm``."""
         now = self._now(now)
         validate_payload("security.key.confirm", confirm)
-        rotation = self._rotation(rid, int(confirm["epoch"]), "acking")
-        if (
-            rotation is None
-            or rotation["role"] != "acking"
-            or rotation["phase"] != "acknowledged"
-        ):
+        epoch = int(confirm["epoch"])
+        rotation = self._rotation(rid, epoch, "acking")
+        if rotation is None or rotation["role"] != "acking":
             raise ConfirmRejected(
-                f"no acknowledged rotation for epoch {confirm['epoch']}"
+                f"no acknowledged rotation for epoch {epoch}"
             )
-        with self.conn:
-            self.conn.execute(
+        if rotation["phase"] == "confirmed":
+            return  # idempotent re-drive: already applied
+        if rotation["phase"] != "acknowledged":
+            raise ConfirmRejected(
+                f"no acknowledged rotation for epoch {epoch}"
+            )
+        with _txn(self.conn):
+            cur = self.conn.execute(
                 "UPDATE key_rotations SET phase='confirmed', confirmed_at=? "
-                "WHERE relationship_id=? AND epoch=? AND role='acking'",
-                (_ts(now), rid, int(confirm["epoch"])),
-            )
-
-    def build_commit_payload(self, rid: str, now=None) -> dict:
-        """Build ``security.key.commit``; the peer stops writing old wraps."""
-        now = self._now(now)
-        rotation = self._in_flight(rid, role='acking')
-        if (
-            rotation is None
-            or rotation["role"] != "acking"
-            or rotation["phase"] != "confirmed"
-        ):
-            raise RotationError(
-                "nothing_to_commit", "no confirmed rotation to commit"
-            )
-        epoch = int(rotation["epoch"])
-        new_peer_key = rotation["new_public_key"]
-        with self.conn:
-            self.conn.execute(
-                "UPDATE key_rotations SET phase='committed', committed_at=? "
-                "WHERE relationship_id=? AND epoch=? AND role='acking'",
+                "WHERE relationship_id=? AND epoch=? AND role='acking' "
+                "AND phase='acknowledged'",
                 (_ts(now), rid, epoch),
             )
+            if cur.rowcount == 0:
+                row = self._rotation(rid, epoch, "acking")
+                if row is not None and row["phase"] == "confirmed":
+                    return  # re-drive won by a concurrent apply
+                raise ConfirmRejected(
+                    f"no acknowledged rotation for epoch {epoch}"
+                )
+
+    def build_commit_payload(self, rid: str, now=None) -> dict:
+        """Build ``security.key.commit`` without changing phase.
+
+        Idempotent: safe to call any number of times while the rotation is
+        confirmed. When the rotation is already committed, the payload for
+        the latest committed epoch is re-emitted (recovery after a crash
+        between send and mark). The CLI sends this payload first and calls
+        ``mark_committed`` only after the send is durably enqueued, so a
+        failed send never wedges the rotation in 'committed' with no
+        commit event on the wire.
+        """
+        self._now(now)
+        rotation = self._in_flight(rid, role='acking')
+        if (
+            rotation is not None
+            and rotation["role"] == "acking"
+            and rotation["phase"] == "confirmed"
+        ):
+            return build_commit(int(rotation["epoch"]))
+        row = self.conn.execute(
+            "SELECT epoch FROM key_rotations WHERE relationship_id=? "
+            "AND role='acking' AND phase='committed' "
+            "ORDER BY epoch DESC LIMIT 1",
+            (rid,),
+        ).fetchone()
+        if row is not None:
+            return build_commit(int(row["epoch"]))
+        raise RotationError(
+            "nothing_to_commit", "no confirmed rotation to commit"
+        )
+
+    def mark_committed(self, rid: str, now=None) -> None:
+        """Record that the commit was sent (confirmed -> committed).
+
+        The peer stops writing old wraps only after this. Idempotent: a
+        re-drive after a crash between the send and this mark is a no-op.
+        """
+        now = self._now(now)
+        with _txn(self.conn):
+            rotation = self._in_flight(rid, role='acking')
+            if rotation is None:
+                # _in_flight excludes committed rows: this may be a re-drive
+                # after a crash between the send and this mark.
+                row = self.conn.execute(
+                    "SELECT 1 FROM key_rotations WHERE relationship_id=? "
+                    "AND role='acking' AND phase='committed' LIMIT 1",
+                    (rid,),
+                ).fetchone()
+                if row is not None:
+                    return
+                raise RotationError(
+                    "nothing_to_commit", "no confirmed rotation to commit"
+                )
+            if (
+                rotation["role"] != "acking"
+                or rotation["phase"] != "confirmed"
+            ):
+                raise RotationError(
+                    "nothing_to_commit", "no confirmed rotation to commit"
+                )
+            epoch = int(rotation["epoch"])
+            new_peer_key = rotation["new_public_key"]
+            cur = self.conn.execute(
+                "UPDATE key_rotations SET phase='committed', committed_at=? "
+                "WHERE relationship_id=? AND epoch=? AND role='acking' "
+                "AND phase='confirmed'",
+                (_ts(now), rid, epoch),
+            )
+            if cur.rowcount == 0:
+                raise RotationError(
+                    "nothing_to_commit", "lost race committing rotation"
+                )
             self.conn.execute(
                 "UPDATE key_epochs SET state='active' "
                 "WHERE relationship_id=? AND epoch=? AND private_key_ref=?",
@@ -779,7 +1208,6 @@ class RotationManager:
                 "WHERE relationship_id=?",
                 (epoch, new_peer_key, rid),
             )
-        return build_commit(epoch)
 
     # -- data-plane epoch gate --------------------------------------------
     def on_data_event_epoch(self, rid: str, key_epoch: int, now=None) -> str:
@@ -789,55 +1217,93 @@ class RotationManager:
         ``RotationError("unknown_future_epoch")`` for a future unknown epoch
         (quarantined as retryable); after 24 hours without the epoch becoming
         known, raises ``RotationError("unknown_future_epoch_rejected")``.
+
+        The 24-hour window is measured from a durable first-seen record
+        that the rotation_quarantine cap cannot evict: without it, a storm
+        of distinct bogus epochs evicts the oldest quarantine rows and
+        resets the rejection timer forever. Callers must authenticate the
+        envelope (unseal/signature verify) BEFORE calling this: the gate
+        mutates rotation state.
         """
         now = self._now(now)
         key_epoch = int(key_epoch)
         known = self._current_epoch(rid)
         if key_epoch <= known:
             return "ok"
-        entry = self.conn.execute(
-            "SELECT * FROM rotation_quarantine WHERE relationship_id=? "
-            "AND epoch=? AND reason IN "
-            "('unknown_future_epoch', 'unknown_future_epoch_rejected') "
-            "ORDER BY id DESC LIMIT 1",
-            (rid, key_epoch),
-        ).fetchone()
-        if entry is not None:
-            if entry["reason"] == "unknown_future_epoch_rejected":
-                raise RotationError(
-                    "unknown_future_epoch_rejected",
-                    f"epoch {key_epoch} was rejected after the 24h window",
-                )
-            if now > parse_timestamp(entry["received_at"]) + ROTATION_WINDOW:
-                with self.conn:
-                    self.conn.execute(
-                        "UPDATE rotation_quarantine SET reason=?, payload=? "
-                        "WHERE id=?",
-                        (
-                            "unknown_future_epoch_rejected",
-                            json.dumps({"epoch": key_epoch}),
-                            entry["id"],
-                        ),
-                    )
-                raise RotationError(
-                    "unknown_future_epoch_rejected",
-                    f"epoch {key_epoch} still unknown after 24h; rejecting",
-                )
-            raise RotationError(
-                "unknown_future_epoch",
-                f"epoch {key_epoch} is unknown; quarantined as retryable",
-            )
-        with self.conn:
+        # The first-seen record and the quarantine insert are one atomic
+        # transaction: a crash between them used to lose the quarantine
+        # row while keeping the timer (or vice versa).
+        with _txn(self.conn):
             self.conn.execute(
-                "INSERT INTO rotation_quarantine "
-                "(relationship_id, epoch, reason, payload, received_at) "
-                "VALUES (?, ?, 'unknown_future_epoch', ?, ?)",
-                (rid, key_epoch, json.dumps({"epoch": key_epoch}), _ts(now)),
+                "INSERT OR IGNORE INTO unknown_epoch_first_seen"
+                "(relationship_id, epoch, first_seen_at, rejected)"
+                " VALUES (?, ?, ?, 0)",
+                (rid, key_epoch, _ts(now)),
             )
-            self._cap_quarantine(rid)
+            self._cap_first_seen(rid)
+            first = self.conn.execute(
+                "SELECT first_seen_at, rejected FROM unknown_epoch_first_seen"
+                " WHERE relationship_id=? AND epoch=?",
+                (rid, key_epoch),
+            ).fetchone()
+            if first is not None and first["rejected"]:
+                rejected = True
+            else:
+                rejected = (
+                    first is not None
+                    and now
+                    > parse_timestamp(first["first_seen_at"]) + ROTATION_WINDOW
+                )
+                if rejected:
+                    # Permanent tombstone: cap eviction can never resurrect
+                    # this epoch as retryable.
+                    self.conn.execute(
+                        "UPDATE unknown_epoch_first_seen SET rejected=1"
+                        " WHERE relationship_id=? AND epoch=?",
+                        (rid, key_epoch),
+                    )
+            self._quarantine_in_txn(
+                rid,
+                key_epoch,
+                (
+                    "unknown_future_epoch_rejected"
+                    if rejected
+                    else "unknown_future_epoch"
+                ),
+                {"epoch": key_epoch},
+                now,
+            )
+        if rejected:
+            raise RotationError(
+                "unknown_future_epoch_rejected",
+                f"epoch {key_epoch} still unknown after 24h; rejecting",
+            )
         raise RotationError(
             "unknown_future_epoch",
             f"epoch {key_epoch} is unknown; quarantined as retryable",
+        )
+
+    def _cap_first_seen(self, rid: str) -> None:
+        """Bound unknown_epoch_first_seen per relationship.
+
+        The rows are tiny, but a hostile peer signs each bogus epoch, so
+        distinct epochs are not free: cap at 1000 non-rejected rows and
+        evict the oldest first. Rejected rows are tombstones the cap can
+        never touch: evicting one would reset its 24h timer and make a
+        permanently rejected epoch retryable again. Evicting a
+        non-rejected row can reset that epoch's timer, but the
+        per-object retry-sighting ceiling on the receive path terminates
+        each storming object independently of the timer.
+        """
+        self.conn.execute(
+            "DELETE FROM unknown_epoch_first_seen WHERE relationship_id=?"
+            " AND rejected = 0"
+            " AND (relationship_id, epoch) NOT IN ("
+            "  SELECT relationship_id, epoch FROM unknown_epoch_first_seen"
+            "  WHERE relationship_id=? AND rejected = 0"
+            "  ORDER BY first_seen_at DESC, epoch DESC"
+            "  LIMIT 1000)",
+            (rid, rid),
         )
 
     # -- quarantine ---------------------------------------------------------
@@ -857,14 +1323,17 @@ class RotationManager:
         )
 
     def _quarantine(self, rid, epoch, reason, payload, now) -> None:
-        with self.conn:
-            self.conn.execute(
-                "INSERT INTO rotation_quarantine "
-                "(relationship_id, epoch, reason, payload, received_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (rid, epoch, reason, json.dumps(payload), _ts(now)),
-            )
-            self._cap_quarantine(rid)
+        with _txn(self.conn):
+            self._quarantine_in_txn(rid, epoch, reason, payload, now)
+
+    def _quarantine_in_txn(self, rid, epoch, reason, payload, now) -> None:
+        self.conn.execute(
+            "INSERT INTO rotation_quarantine "
+            "(relationship_id, epoch, reason, payload, received_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (rid, epoch, reason, json.dumps(payload), _ts(now)),
+        )
+        self._cap_quarantine(rid)
 
     def list_quarantine(self, rid: str) -> list:
         """List quarantine entries for a relationship (oldest first)."""
@@ -904,39 +1373,162 @@ class RotationManager:
             )
         payload = json.loads(entry["payload"])
         epoch = int(entry["epoch"])
-        with self.conn:
+        if choice == "theirs":
+            # Discard my candidate FIRST: on_prepare rejects a prepare for
+            # an epoch I am still rotating into, so processing it before the
+            # discard always re-conflicts. The quarantine entry is deleted
+            # only after the peer's prepare is accepted, so a failure in
+            # on_prepare preserves the payload for retry or a different
+            # choice (the candidate stays discarded, which the human already
+            # chose).
+            with _txn(self.conn):
+                claimed, discarded_key_path = self._discard_candidate(rid, epoch)
+            # The key file is deleted after the transaction commits: a crash
+            # between them leaves an orphan file (reconciled on the next
+            # begin_rotation), never a live row pointing at a deleted key.
+            if discarded_key_path:
+                delete_private_key(discarded_key_path)
+            ack = self.on_prepare(
+                rid, payload["prepare"], payload["prepare_event_id"], now=now
+            )
+            with _txn(self.conn):
+                self.conn.execute(
+                    "DELETE FROM rotation_quarantine WHERE id=?", (entry["id"],)
+                )
+            return ack
+        # choice == "mine": keep my candidate, drop their quarantined prepare.
+        with _txn(self.conn):
             self.conn.execute(
                 "DELETE FROM rotation_quarantine WHERE id=?", (entry["id"],)
             )
-            if choice == "theirs":
-                self._discard_candidate(rid, epoch)
-        if choice == "theirs":
-            return self.on_prepare(
-                rid, payload["prepare"], payload["prepare_event_id"], now=now
-            )
         return None
 
-    def _discard_candidate(self, rid: str, epoch: int) -> None:
+    def _discard_candidate(
+        self, rid: str, epoch: int, expected_phase: str | None = None
+    ) -> tuple:
+        """Discard a rotating candidate.
+
+        Returns ``(claimed, key_path)``: *claimed* is True when the
+        guarded state update matched a row (the discard happened), and
+        *key_path* is the discarded key file's path, or None when the
+        candidate had no key row left to delete. The two are split
+        because a keyless candidate must still be discarded AND
+        reported (R1): returning only the path made a successful
+        keyless discard look like a lost race. The caller deletes the
+        file AFTER the surrounding transaction commits. Must be called
+        inside the caller's transaction.
+
+        *expected_phase* adds a strict phase predicate to the UPDATE
+        (sweep passes ``"candidate"`` so a concurrent on_ack can neither
+        resurrect the row nor silently succeed); the default keeps the
+        historical ``NOT IN ('committed', 'discarded')`` predicate.
+        """
+        if expected_phase is None:
+            predicate = "AND phase NOT IN ('committed', 'discarded')"
+            params: tuple = (rid, epoch)
+        else:
+            predicate = "AND phase = ?"
+            params = (rid, epoch, expected_phase)
         row = self.conn.execute(
             "SELECT private_key_ref FROM key_epochs WHERE relationship_id=? "
             "AND epoch=? AND private_key_ref != ?",
             (rid, epoch, _PEER_REF),
         ).fetchone()
-        if row:
-            delete_private_key(row["private_key_ref"])
-            self.conn.execute(
-                "DELETE FROM key_epochs WHERE relationship_id=? AND epoch=? "
-                "AND private_key_ref != ?",
-                (rid, epoch, _PEER_REF),
-            )
-        self.conn.execute(
+        cur = self.conn.execute(
             "UPDATE key_rotations SET phase='discarded' "
             "WHERE relationship_id=? AND epoch=? AND role='rotating' "
-            "AND phase NOT IN ('committed', 'discarded')",
-            (rid, epoch),
+            + predicate,
+            params,
         )
+        if cur.rowcount == 0:
+            return (False, None)
+        self.conn.execute(
+            "DELETE FROM key_epochs WHERE relationship_id=? AND epoch=? "
+            "AND private_key_ref != ?",
+            (rid, epoch, _PEER_REF),
+        )
+        return (True, row["private_key_ref"] if row else None)
 
     # -- sweep ----------------------------------------------------------------
+    def _compact_committed_rotations(self, now) -> None:
+        """Delete superseded committed rotation rows (G16).
+
+        Must be called inside the caller's transaction. Deletes committed
+        rows older than ``KEY_ROTATION_COMMITTED_RETENTION``, always
+        keeping the newest committed row per (relationship_id, role) so
+        the commit redelivery fallbacks keep working. Rows with a NULL
+        ``committed_at`` are never deleted (fail-safe for legacy rows).
+        """
+        self.conn.execute(
+            "DELETE FROM key_rotations WHERE phase='committed'"
+            " AND committed_at IS NOT NULL"
+            " AND committed_at <= ?"
+            " AND (relationship_id, role, epoch) NOT IN ("
+            "  SELECT relationship_id, role, MAX(epoch) FROM key_rotations"
+            "  WHERE phase='committed'"
+            "  GROUP BY relationship_id, role);",
+            (_ts(now - KEY_ROTATION_COMMITTED_RETENTION),),
+        )
+
+    def _compact_peer_key_epochs(self) -> None:
+        """Delete peer agreement keys older than the dual-wrap window (G16).
+
+        Must be called inside the caller's transaction. Keeps the two
+        newest peer ``key_epochs`` rows per relationship: the seal side
+        wraps to at most the peer's current and previous epoch, so older
+        peer public keys can never be used again. Epoch-1 peer keys live
+        on the ``relationships`` row, not here, and are untouched. Own
+        private keys are untouched: their replay-acceptance retention is
+        handled by the old-key retirement above, not here.
+        """
+        for (rid,) in self.conn.execute(
+            "SELECT DISTINCT relationship_id FROM key_epochs "
+            "WHERE private_key_ref = ?;",
+            (_PEER_REF,),
+        ).fetchall():
+            self.conn.execute(
+                "DELETE FROM key_epochs WHERE relationship_id = ?"
+                " AND private_key_ref = ? AND epoch NOT IN ("
+                "  SELECT epoch FROM key_epochs WHERE relationship_id = ?"
+                "  AND private_key_ref = ? ORDER BY epoch DESC LIMIT ?);",
+                (rid, _PEER_REF, rid, _PEER_REF, PEER_KEY_EPOCH_RETAIN_NEWEST),
+            )
+
+    def _compact_security_key_events(self, now) -> None:
+        """Compact the projected security-key ceremony index (G16).
+
+        Must be called inside the caller's transaction. Deletes projected
+        rows whose receiver acceptance time is past
+        ``SECURITY_KEY_EVENT_RETENTION``. The ceremony events themselves
+        stay immutable in the event log, and a rebuild re-derives the
+        full history; this bounds steady-state growth only. Never uses
+        sender-controlled ``created_at`` for the age check: only rows with
+        a non-NULL receiver acceptance time are compacted; rows lacking
+        one are retained (fail-safe, same as committed rotations with a
+        NULL ``committed_at``).
+        """
+        tables = {
+            r[0]
+            for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+        }
+        if "security_key_events" not in tables or "event_payloads" not in tables:
+            return
+        # G16: p.received_at is the receiver's staging time (durable, not
+        # sender-controlled). No COALESCE fallback to s.created_at: a
+        # sender can backdate created_at, which would let an adversary's
+        # old ceremony rows either evade compaction or, worse, force
+        # deletion of rows that are not actually old.
+        self.conn.execute(
+            "DELETE FROM security_key_events WHERE event_id IN ("
+            "  SELECT s.event_id FROM security_key_events s"
+            "  JOIN event_payloads p ON p.event_id = s.event_id"
+            "  WHERE p.received_at IS NOT NULL"
+            "  AND p.received_at <= ?);",
+            (_ts(now - SECURITY_KEY_EVENT_RETENTION),),
+        )
+
     def sweep(self, now=None) -> None:
         """Run periodic rotation maintenance.
 
@@ -946,24 +1538,55 @@ class RotationManager:
           or 100 events were accepted under the new epoch, whichever first.
         - Expires rejected unknown-epoch quarantine rows older than
           ``ROTATION_QUARANTINE_REJECTED_RETENTION``.
+        - G16: compacts committed rotation history
+          (``KEY_ROTATION_COMMITTED_RETENTION``), old peer agreement keys
+          (``PEER_KEY_EPOCH_RETAIN_NEWEST``), and the projected
+          security-key ceremony index (``SECURITY_KEY_EVENT_RETENTION``).
         """
         now = self._now(now)
-        with self.conn:
+        with _txn(self.conn):
             self.conn.execute(
                 "DELETE FROM rotation_quarantine "
                 "WHERE reason='unknown_future_epoch_rejected' AND received_at <= ?",
                 (_ts(now - ROTATION_QUARANTINE_REJECTED_RETENTION),),
             )
-        row = self.conn.execute(
-            "SELECT relationship_id, epoch FROM key_rotations "
-            "WHERE role='rotating' AND phase='candidate' AND deadline <= ? "
-            "ORDER BY deadline LIMIT 1",
-            (_ts(now),),
-        ).fetchone()
-        if row is not None:
-            rid, epoch = row["relationship_id"], int(row["epoch"])
-            with self.conn:
-                self._discard_candidate(rid, epoch)
+            self.conn.execute(
+                "DELETE FROM rotation_wrap_seen_pending "
+                "WHERE seen_at <= ?",
+                (_ts(now - ROTATION_WINDOW),),
+            )
+            self._compact_committed_rotations(now)
+            self._compact_peer_key_epochs()
+            self._compact_security_key_events(now)
+        # Claim exactly one timed-out candidate inside a single BEGIN
+        # IMMEDIATE transaction: the SELECT and the guarded discard are
+        # atomic, so a concurrent on_ack can neither slip between them
+        # (resurrecting a discarded row, R1) nor silently succeed. The
+        # phase predicate is the guard; the key file is deleted only after
+        # the transaction commits.
+        timed_out = None
+        with _txn(self.conn):
+            row = self.conn.execute(
+                "SELECT relationship_id, epoch FROM key_rotations "
+                "WHERE role='rotating' AND phase='candidate' AND deadline <= ? "
+                "ORDER BY deadline LIMIT 1",
+                (_ts(now),),
+            ).fetchone()
+            if row is not None:
+                rid, epoch = row["relationship_id"], int(row["epoch"])
+                claimed, key_path = self._discard_candidate(
+                    rid, epoch, expected_phase="candidate"
+                )
+                # Under the write lock the guarded UPDATE applies unless a
+                # concurrent transition already moved the row; a keyless
+                # claim still counts as a timeout (R1) so the user is
+                # alerted even when the key file is already gone.
+                if claimed:
+                    timed_out = (rid, epoch, key_path)
+        if timed_out is not None:
+            rid, epoch, key_path = timed_out
+            if key_path is not None:
+                delete_private_key(key_path)
             raise NoAckTimeout(rid, epoch)
         for rotation in self.conn.execute(
             "SELECT relationship_id, epoch, prior_epoch, committed_at, "
@@ -984,7 +1607,8 @@ class RotationManager:
                 >= OLD_KEY_EVENT_LIMIT
             )
             if (due_time or due_events) and prior_epoch is not None:
-                with self.conn:
+                old_key_path = None
+                with _txn(self.conn):
                     # Never delete the old key unless the new epoch's own
                     # private key row still exists. A resurrected or stale
                     # rotating row (e.g. after conflict resolution chose the
@@ -1004,13 +1628,27 @@ class RotationManager:
                         "AND private_key_ref != ?",
                         (rid, prior_epoch, _PEER_REF),
                     ).fetchone()
-                    if key_row:
-                        delete_private_key(key_row["private_key_ref"])
+                    if key_row is not None:
+                        old_key_path = key_row["private_key_ref"]
                         self.conn.execute(
                             "DELETE FROM key_epochs WHERE relationship_id=? "
                             "AND epoch=? AND private_key_ref != ?",
                             (rid, prior_epoch, _PEER_REF),
                         )
+                    # The rotation is fully retired: delete its row so
+                    # historical committed rows do not accumulate (R10).
+                    # on_commit treats the missing row as a benign
+                    # redelivery when the epoch is already active.
+                    self.conn.execute(
+                        "DELETE FROM key_rotations WHERE relationship_id=? "
+                        "AND epoch=? AND role='rotating' AND phase='committed'",
+                        (rid, epoch),
+                    )
+                # Delete the key file after the transaction commits: a crash
+                # between them leaves an orphan file (reconciled on the next
+                # begin_rotation), never a live row pointing at a deleted key.
+                if old_key_path is not None:
+                    delete_private_key(old_key_path)
 
 
 # ---------------------------------------------------------------------------

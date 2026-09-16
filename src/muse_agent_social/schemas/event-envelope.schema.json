@@ -240,7 +240,7 @@
       "type": "object"
     },
     "recipients": {
-      "description": "Per-recipient key wraps, sorted by recipient then agreement_key.",
+      "description": "Per-recipient key wraps, sorted by recipient then agreement_key. At most two wraps: the dual-wrap bound. A sender wraps the CEK to at most the recipient's current and immediately-previous agreement epochs during a rotation; at all other times there is exactly one wrap. Receivers try at most those two epochs when unsealing.",
       "items": {
         "additionalProperties": false,
         "properties": {
@@ -269,8 +269,10 @@
         ],
         "type": "object"
       },
+      "maxItems": 2,
       "minItems": 1,
-      "type": "array"
+      "type": "array",
+      "uniqueItems": true
     },
     "signature": {
       "$ref": "#/$defs/base64url",

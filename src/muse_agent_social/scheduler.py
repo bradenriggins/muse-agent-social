@@ -22,8 +22,22 @@ State machine (locked by the plan):
 * A due event whose effective expiry has passed transitions to expired and
   is never released. With no explicit expires_at, the effective expiry is
   deliver_at plus the default 24h late window. A late but unexpired
-  release passes late_by_seconds to release_fn so the send path can mark
-  it in the payload.
+  release passes late_by_seconds to release_fn and reports it in run_due's
+  "late" summary. It is NOT marked in the sealed payload: sealed bytes are
+  immutable once sealed (the events table is append-only), so no release
+  path can amend them after the fact.
+* Release-time gates (S1/S2): the send path's release_fn must refuse
+  inside the release transaction when the relationship is revoked
+  (RevokedRelationshipError) or when the acking-side rotation deadline
+  pause is in force (SendPausedError). run_due converts these to the
+  "skipped_revoked" / "skipped_paused" statuses: the row stays scheduled,
+  no failure is recorded, and neither counts toward dead-lettering.
+* Approval restoration (S8): a scheduler row that consumed a human
+  approval carries its approval_id. When such a row dead-letters or
+  expires, the peer received nothing while the human's approval was
+  spent, so the approval is restored (consumed_at = NULL) iff it is still
+  within its TTL, and an operator-visible surface_queue notification is
+  enqueued so the response can be re-sent instead of silently dropped.
 
 release_fn contract::
 
@@ -33,28 +47,38 @@ release_fn contract::
   statements, do not BEGIN/COMMIT yourself.
 * Enqueue into the same transactional outgoing queue as immediate sends,
   keyed idempotently on scheduled_id.
-* Record late_by_seconds in the released payload when it is greater than
-  zero (the plan's "mark late_by_seconds in the payload").
+* late_by_seconds arrives for observability (it is reported in run_due's
+  "late" summary). It cannot be written into the sealed payload: sealed
+  bytes are immutable once sealed, so the "mark late_by_seconds in the
+  payload" plan line is not implementable on the release path and is
+  documented as such instead of pretended.
 * Durably finish before returning; run_due commits the transaction right
   after release_fn returns.
+* Refuse inside the transaction (do not upload, do not enqueue) when the
+  relationship is revoked or gone: raise RevokedRelationshipError. Refuse
+  likewise when RotationManager.may_send() raises: raise SendPausedError.
+  Both leave the row scheduled; neither counts as a release failure.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import uuid
 from typing import Any, Callable
 
 from muse_agent_social.policy.limits import (
+    ACCEPT_WINDOW_DAYS,
     FUTURE_TOLERANCE_SECONDS,
     LATE_WINDOW_SECONDS,
     MAX_ENVELOPE_BYTES,
     add_seconds,
     check_clock_skew,
+    format_canonical_utc,
     parse_canonical_utc,
 )
-from muse_agent_social.store.db import transaction
+from muse_agent_social.store.db import transaction, utcnow
 
 __all__ = [
     "SCHEDULER_STATES",
@@ -63,6 +87,8 @@ __all__ = [
     "SchedulerError",
     "UnknownScheduledIdError",
     "AlreadyReleasedError",
+    "RevokedRelationshipError",
+    "SendPausedError",
     "InvalidSchedulerTransition",
     "ScheduledIdConflictError",
     "schedule",
@@ -147,6 +173,33 @@ def _ensure_dead_letter_schema(conn: sqlite3.Connection) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_scheduler_deliver "
                 "ON scheduler_queue(deliver_at, state)"
             )
+    _ensure_approval_column(conn)
+
+
+def _ensure_approval_column(conn: sqlite3.Connection) -> None:
+    """Idempotently add scheduler_queue.approval_id (S8 bookkeeping).
+
+    The column records which human approval a scheduled row consumed, so
+    a dead-lettered or expired gated event can restore it. Safe to run on
+    every call; a no-op once applied. Runs after the dead-letter rebuild
+    so a rebuild never drops a populated column.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'scheduler_queue'"
+    ).fetchone()
+    if row is None:
+        return  # migrate() owns initial creation; nothing to widen yet
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(scheduler_queue)")}
+    if "approval_id" not in cols:
+        try:
+            conn.execute(
+                "ALTER TABLE scheduler_queue ADD COLUMN approval_id TEXT"
+            )
+        except sqlite3.OperationalError as exc:
+            # Lost a race with a concurrent ensure on another connection.
+            if "duplicate column name" not in str(exc):
+                raise
 
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -177,6 +230,62 @@ class AlreadyReleasedError(SchedulerError):
             "retraction request; use request_retraction_after_release()",
         )
         self.scheduled_id = scheduled_id
+
+
+class RevokedRelationshipError(SchedulerError):
+    """release_fn refused: the relationship is revoked (or its row is gone).
+
+    Raised by the send path's release_fn inside the release transaction
+    when the scheduler row's relationship has consent_state 'revoked' (or
+    no relationship row remains, e.g. teardown deleted it). run_due
+    converts it to the "skipped_revoked" status: the row stays scheduled,
+    no failure is recorded, and teardown's step-4 deletion eventually
+    removes the row. This closes the teardown race where a concurrent
+    run_due between step 1 (mark revoked) and step 4 (delete scheduler
+    rows) would otherwise transmit to a revoked relationship.
+    """
+
+    skip_status = "skipped_revoked"
+
+    def __init__(self, scheduled_id: str) -> None:
+        super().__init__(
+            "relationship_revoked",
+            f"{scheduled_id}: relationship revoked; release refused",
+        )
+        self.scheduled_id = scheduled_id
+
+
+class SendPausedError(SchedulerError):
+    """release_fn refused: the acking-side rotation deadline pause is on.
+
+    Raised by the send path's release_fn inside the release transaction
+    when RotationManager.may_send() refuses (an acknowledged rotation was
+    never confirmed and its deadline passed). run_due converts it to the
+    "skipped_paused" status: the row stays scheduled for a later run, and
+    the pause never counts toward dead-lettering.
+    """
+
+    skip_status = "skipped_paused"
+
+    def __init__(self, scheduled_id: str, detail: str = "") -> None:
+        super().__init__(
+            "send_paused",
+            f"{scheduled_id}: {detail}" if detail else scheduled_id,
+        )
+        self.scheduled_id = scheduled_id
+
+
+class _ReleaseGated(Exception):
+    """Control flow: release_fn refused a gated release.
+
+    Raised inside the release transaction so the scheduled -> released
+    claim rolls back with it; _release_one_row converts it to the gate's
+    skip status. Never escapes _release_one_row.
+    """
+
+    def __init__(self, status: str) -> None:
+        super().__init__(status)
+        self.status = status
 
 
 class InvalidSchedulerTransition(SchedulerError):
@@ -225,6 +334,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "expires_at": row["expires_at"],
         "state": row["state"],
         "release_failures": int(row["release_failures"] or 0),
+        "approval_id": row["approval_id"] if "approval_id" in row.keys() else None,
     }
 
 
@@ -252,7 +362,8 @@ def schedule(
 
     Raises:
         SchedulerError: on oversize/empty bytes, bad timestamps,
-            expires_at not after deliver_at, a conflicting scheduled_id,
+            expires_at not after deliver_at, deliver_at beyond the
+            receiver accept window, a conflicting scheduled_id,
             or clock skew that blocks scheduled sends.
     """
     _ensure_dead_letter_schema(conn)
@@ -264,6 +375,18 @@ def schedule(
     if len(sealed_event_envelope) > MAX_ENVELOPE_BYTES:
         raise SchedulerError("envelope_too_large", str(len(sealed_event_envelope)))
     _validate_moment(deliver_at, "deliver_at")
+    # S4: the receiver quarantines created_at older than the accept window
+    # (7 days), and created_at is the schedule time. A deliver_at beyond
+    # the window would release on time and then be quarantined while the
+    # sender sees success, so refuse loudly at schedule time instead.
+    accept_horizon = add_seconds(utcnow(), ACCEPT_WINDOW_DAYS * 24 * 3600)
+    if parse_canonical_utc(deliver_at) > parse_canonical_utc(accept_horizon):
+        raise SchedulerError(
+            "deliver_at_beyond_accept_window",
+            f"deliver_at={deliver_at} is more than {ACCEPT_WINDOW_DAYS}d "
+            "out; the receiver quarantines events older than the accept "
+            "window",
+        )
     if expires_at is not None:
         _validate_moment(expires_at, "expires_at")
         if parse_canonical_utc(expires_at) <= parse_canonical_utc(deliver_at):
@@ -319,7 +442,7 @@ def get_scheduled(
     _ensure_dead_letter_schema(conn)
     row = conn.execute(
         "SELECT scheduled_id, inner_event, deliver_at, expires_at, state, "
-        "release_failures FROM scheduler_queue WHERE scheduled_id = ?",
+        "release_failures, approval_id FROM scheduler_queue WHERE scheduled_id = ?",
         (scheduled_id,),
     ).fetchone()
     return _row_to_dict(row) if row is not None else None
@@ -335,13 +458,13 @@ def list_scheduled(
     if state is None:
         rows = conn.execute(
             "SELECT scheduled_id, inner_event, deliver_at, expires_at, state, "
-            "release_failures FROM scheduler_queue "
+            "release_failures, approval_id FROM scheduler_queue "
             "ORDER BY deliver_at, scheduled_id;"
         ).fetchall()
     else:
         rows = conn.execute(
             "SELECT scheduled_id, inner_event, deliver_at, expires_at, state, "
-            "release_failures FROM scheduler_queue WHERE state = ? "
+            "release_failures, approval_id FROM scheduler_queue WHERE state = ? "
             "ORDER BY deliver_at, scheduled_id;",
             (state,),
         ).fetchall()
@@ -430,6 +553,67 @@ def request_retraction_after_release(
 ReleaseFn = Callable[..., None]
 
 
+def _restore_approval_for_undelivered(
+    conn: sqlite3.Connection,
+    scheduled_id: str,
+    approval_id: str | None,
+    now_text: str,
+    terminal_state: str,
+) -> None:
+    """Restore a consumed approval whose gated event never delivered (S8).
+
+    A dead-lettered or expired scheduler row means the peer got nothing
+    while the human's approval was spent. The approval is restored
+    (consumed_at = NULL) iff it is still within its TTL, so the human is
+    not asked to re-approve a response the machine failed to deliver, and
+    an operator-visible surface_queue notification is enqueued so the
+    response is re-sent instead of silently dropped.
+
+    No-ops when the row carried no approval (non-gated sends keep the
+    existing list_scheduled/inspect visibility) or when the bookkeeping
+    tables are absent (e.g. a bare scheduler_queue in a unit test).
+    """
+    if not approval_id:
+        return
+    tables = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "human_approvals" not in tables or "surface_queue" not in tables:
+        return
+    cursor = conn.execute(
+        "UPDATE human_approvals SET consumed_at = NULL "
+        "WHERE approval_id = ? AND consumed_at IS NOT NULL "
+        "AND expires_at > ?",
+        (approval_id, now_text),
+    )
+    restored = cursor.rowcount == 1
+    snapshot = {
+        "kind": "scheduler_undelivered",
+        "scheduled_id": scheduled_id,
+        "terminal_state": terminal_state,
+        "approval_id": approval_id,
+        "approval_restored": restored,
+        "detail": (
+            f"scheduled event {scheduled_id} reached terminal state "
+            f"{terminal_state!r} without release; the peer received nothing"
+            + (
+                f"; approval {approval_id} restored, re-send the response"
+                if restored
+                else "; no live approval to restore, obtain a fresh one "
+                "before re-sending"
+            )
+        ),
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO surface_queue(event_id, policy_snapshot, "
+        "queued_at) VALUES (?, ?, ?)",
+        (scheduled_id, json.dumps(snapshot, sort_keys=True), now_text),
+    )
+
+
 def _release_one_row(
     conn: sqlite3.Connection,
     now_dt: Any,
@@ -440,55 +624,82 @@ def _release_one_row(
 
     Returns (status, late_by_seconds) where status is one of "released",
     "expired", "not_due", "skipped" (row left 'scheduled' by a concurrent
-    writer), or "skipped_canceled" (the row was canceled before the claim;
-    a stable no-op, never a delivery).
+    writer), "skipped_canceled" (the row was canceled before the claim; a
+    stable no-op, never a delivery), "skipped_revoked" (release_fn refused
+    inside the transaction because the relationship is revoked or gone;
+    the row stays scheduled and teardown deletes it), or
+    "skipped_paused" (release_fn refused because the acking-side rotation
+    deadline pause is in force; the row stays scheduled for a later run).
 
     Raises:
         Whatever release_fn raises (the caller records it per row), or
         InvalidSchedulerTransition on a concurrent state change.
+        RevokedRelationshipError and SendPausedError from release_fn are
+        converted to skip statuses instead of failures: the claim rolls
+        back with the transaction and the row stays scheduled.
     """
     sid = row["scheduled_id"]
-    with transaction(conn):
-        current = conn.execute(
-            "SELECT state FROM scheduler_queue WHERE scheduled_id = ?",
-            (sid,),
-        ).fetchone()
-        if current is None:
-            return ("skipped", 0)
-        if current["state"] == "canceled":
-            # Cancel wins over release: a cancel that landed between the
-            # due-row scan and this claim is honored inside the release
-            # transaction, so a canceled row is never delivered.
-            return ("skipped_canceled", 0)
-        if current["state"] != "scheduled":
-            return ("skipped", 0)
-        effective = _effective_expires_at(row["deliver_at"], row["expires_at"])
-        if now_dt >= parse_canonical_utc(effective):
-            conn.execute(
-                "UPDATE scheduler_queue SET state = 'expired' "
+    try:
+        with transaction(conn):
+            current = conn.execute(
+                "SELECT state FROM scheduler_queue WHERE scheduled_id = ?",
+                (sid,),
+            ).fetchone()
+            if current is None:
+                return ("skipped", 0)
+            if current["state"] == "canceled":
+                # Cancel wins over release: a cancel that landed between the
+                # due-row scan and this claim is honored inside the release
+                # transaction, so a canceled row is never delivered.
+                return ("skipped_canceled", 0)
+            if current["state"] != "scheduled":
+                return ("skipped", 0)
+            effective = _effective_expires_at(
+                row["deliver_at"], row["expires_at"]
+            )
+            if now_dt >= parse_canonical_utc(effective):
+                conn.execute(
+                    "UPDATE scheduler_queue SET state = 'expired' "
+                    "WHERE scheduled_id = ? AND state = 'scheduled'",
+                    (sid,),
+                )
+                # S8: an expired gated event never reaches the peer; restore
+                # its approval (iff still within TTL) and notify the
+                # operator, in the same transaction as the expiry.
+                _restore_approval_for_undelivered(
+                    conn,
+                    sid,
+                    row.get("approval_id"),
+                    format_canonical_utc(now_dt),
+                    "expired",
+                )
+                return ("expired", 0)
+            deliver_dt = parse_canonical_utc(row["deliver_at"])
+            if now_dt < deliver_dt:
+                return ("not_due", 0)
+            late_by = max(0, int((now_dt - deliver_dt).total_seconds()))
+            cursor = conn.execute(
+                "UPDATE scheduler_queue SET state = 'released' "
                 "WHERE scheduled_id = ? AND state = 'scheduled'",
                 (sid,),
             )
-            return ("expired", 0)
-        deliver_dt = parse_canonical_utc(row["deliver_at"])
-        if now_dt < deliver_dt:
-            return ("not_due", 0)
-        late_by = max(0, int((now_dt - deliver_dt).total_seconds()))
-        cursor = conn.execute(
-            "UPDATE scheduler_queue SET state = 'released' "
-            "WHERE scheduled_id = ? AND state = 'scheduled'",
-            (sid,),
-        )
-        if cursor.rowcount != 1:
-            raise InvalidSchedulerTransition(
-                sid, "row changed state concurrently"
-            )
-        release_fn(
-            conn,
-            scheduled_id=sid,
-            sealed_event_envelope=row["inner_event"],
-            late_by_seconds=late_by,
-        )
+            if cursor.rowcount != 1:
+                raise InvalidSchedulerTransition(
+                    sid, "row changed state concurrently"
+                )
+            try:
+                release_fn(
+                    conn,
+                    scheduled_id=sid,
+                    sealed_event_envelope=row["inner_event"],
+                    late_by_seconds=late_by,
+                )
+            except (RevokedRelationshipError, SendPausedError) as exc:
+                # Gate refusal: raise control flow so the claim above rolls
+                # back; the row stays scheduled. Not a release failure.
+                raise _ReleaseGated(exc.skip_status) from exc
+    except _ReleaseGated as exc:
+        return (exc.status, 0)
     return ("released", late_by)
 
 
@@ -497,7 +708,9 @@ def _record_release_failure(conn: sqlite3.Connection, scheduled_id: str) -> int:
 
     Returns the new failure count. When the count reaches
     MAX_RELEASE_ATTEMPTS the row moves to state "dead" and run_due stops
-    attempting it.
+    attempting it. A dead-lettered gated event never reaches the peer, so
+    its approval is restored (iff still within TTL) and the operator is
+    notified via surface_queue, in the same transaction (S8).
     """
     with transaction(conn):
         conn.execute(
@@ -517,6 +730,18 @@ def _record_release_failure(conn: sqlite3.Connection, scheduled_id: str) -> int:
                 "UPDATE scheduler_queue SET state = 'dead' "
                 "WHERE scheduled_id = ? AND state = 'scheduled'",
                 (scheduled_id,),
+            )
+            approval_id = conn.execute(
+                "SELECT approval_id FROM scheduler_queue "
+                "WHERE scheduled_id = ?",
+                (scheduled_id,),
+            ).fetchone()
+            _restore_approval_for_undelivered(
+                conn,
+                scheduled_id,
+                approval_id[0] if approval_id else None,
+                utcnow(),
+                "dead",
             )
     return failures
 
@@ -547,12 +772,19 @@ def run_due(
     row's state is re-checked inside the release transaction, so a cancel
     that lands between the due-row scan and the claim is honored.
 
+    Release-time gates: release_fn may raise RevokedRelationshipError
+    (relationship revoked or gone) or SendPausedError (acking-side
+    rotation deadline pause). Both are converted to the "skipped_revoked"
+    / "skipped_paused" summary buckets; the row stays scheduled and
+    neither counts toward dead-lettering.
+
     release_fn(conn, *, scheduled_id, sealed_event_envelope,
     late_by_seconds) must enqueue the sealed event into the same
     transactional outgoing queue as immediate sends, keyed idempotently on
-    scheduled_id, and record late_by_seconds in the payload when positive.
-    It must use plain statements on the given connection (no nested
-    transaction) and finish durably before returning.
+    scheduled_id. It must use plain statements on the given connection (no
+    nested transaction) and finish durably before returning. late_by_seconds
+    is observability only: sealed payloads are immutable, so release_fn
+    must not try to amend the payload with it.
 
     Restart safety: the claim (scheduled -> released) and the enqueue
     commit atomically. A crash before commit leaves the row scheduled for
@@ -564,7 +796,9 @@ def run_due(
         {"released": [scheduled_id...], "expired": [scheduled_id...],
          "late": {scheduled_id: late_by_seconds, ...},
          "failed": [scheduled_id...], "dead": [scheduled_id...],
-         "skipped_canceled": [scheduled_id...]}
+         "skipped_canceled": [scheduled_id...],
+         "skipped_revoked": [scheduled_id...],
+         "skipped_paused": [scheduled_id...]}
 
     Raises:
         SchedulerError: on a bad *now* timestamp or blocking clock skew.
@@ -581,10 +815,12 @@ def run_due(
         "failed": [],
         "dead": [],
         "skipped_canceled": [],
+        "skipped_revoked": [],
+        "skipped_paused": [],
     }
     rows = conn.execute(
         "SELECT scheduled_id, inner_event, deliver_at, expires_at, state, "
-        "release_failures FROM scheduler_queue "
+        "release_failures, approval_id FROM scheduler_queue "
         "WHERE state = 'scheduled' AND release_failures < ? "
         "ORDER BY deliver_at, scheduled_id;",
         (MAX_RELEASE_ATTEMPTS,),
@@ -611,4 +847,8 @@ def run_due(
             summary["expired"].append(sid)
         elif status == "skipped_canceled":
             summary["skipped_canceled"].append(sid)
+        elif status == "skipped_revoked":
+            summary["skipped_revoked"].append(sid)
+        elif status == "skipped_paused":
+            summary["skipped_paused"].append(sid)
     return summary

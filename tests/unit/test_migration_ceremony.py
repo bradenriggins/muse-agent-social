@@ -695,7 +695,10 @@ def _cli_drain_ctx(tmp_path, name, pair_id, pair_key, sealed,
         conn, f"rel-{name}", make_agent("Self"), make_agent("Peer"),
         keys_dir=str(state_dir / "keys"),
     )
-    mstate_set(conn, "migration.phase", "dual_read")
+    mstate_set(conn, "migration.phase", "staged")
+    # G1: the drain is migration state (legacy_read_open + drain_until),
+    # not a phase lookup.
+    mstate_set(conn, "migration.legacy_read_open", True)
     mstate_set(conn, "migration.pair_id", pair_id)
     mstate_set(conn, "migration.peer_legacy_id", BOB)
     mstate_set(conn, "migration.my_legacy_id", ALICE)

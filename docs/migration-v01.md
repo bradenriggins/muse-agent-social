@@ -105,6 +105,19 @@ operation.
   deleted keys; deleted relationship keys stay deleted, and recovery proceeds
   through a new rotation or re-pairing.
 
+## The v0.1 send kill switch
+
+"No new v0.1 sends" is not a promise, it is a wired switch. The migration
+sets `migration.v01_sends_allowed = false` in the migration database at
+commit, and `muse_agent_social.migrate.v01_sends_allowed(state_dir)` reads
+it back. But the flag alone stops nothing: the operator MUST wire
+`MigrationHooks.set_v01_sends` (or gate their v0.1 sender on
+`v01_sends_allowed()`) so the legacy sender actually stops transmitting.
+An unwired hook prints a loud warning at commit time and the migration
+refuses to report success quietly. Verify after commit: attempt a v0.1
+send on each side and confirm it is refused before declaring the
+migration complete.
+
 ## The 24-hour drain, stated plainly
 
 For 24 hours after commit, each side keeps a read-only v0.1 adapter so any

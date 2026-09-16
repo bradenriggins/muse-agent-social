@@ -41,6 +41,7 @@ from typing import Any, Optional
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from muse_agent_social.canonical import restricted_jcs
+from muse_agent_social import scheduler as _scheduler
 from muse_agent_social.crypto.identity import (
     parse_agreement_key,
     parse_identity_id,
@@ -54,6 +55,7 @@ from muse_agent_social.crypto.sealing import (
 from muse_agent_social.model.approvals import consume_approval
 from muse_agent_social.model.cards import parse_timestamp
 from muse_agent_social.store.db import transaction, utcnow
+from muse_agent_social.store.projections import record_projection_input
 from muse_agent_social.validation import PAYLOAD_DISPATCH
 
 __all__ = [
@@ -283,9 +285,12 @@ def persist_outgoing_in_txn(
 
     The shared core of :func:`assign_and_persist_outgoing`: assigns
     sender_seq = max+1, seals, inserts the events row, upserts
-    sender_sequence, enqueues projection_queue and the scheduler outbox.
+    sender_sequence, stages the validated projection input, enqueues
+    projection_queue and the scheduler outbox. All of it commits or rolls
+    back together in the caller's transaction.
     Raises EventStoreError on persistence conflicts, SealingError on
-    crypto/schema failure. Callers needing their own atomic scope use
+    crypto/schema failure, ProjectionError/SchemaError on payload
+    validation failure. Callers needing their own atomic scope use
     this directly instead of duplicating the persist sequence.
 
     When ``approval_id`` is given, the human-approval record is claimed
@@ -294,10 +299,49 @@ def persist_outgoing_in_txn(
     durably persisted event. Exactly one racing send can win the claim.
     """
     if approval_id is not None:
-        if not consume_approval(conn, approval_id, utcnow()):
+        # G12: bind the atomic claim to the exact response being
+        # authorized, not just the approval ID. The bindings are derived
+        # from the event being persisted: a concurrent or buggy caller
+        # cannot redirect an approval for request A to a send answering
+        # request B.
+        bindings: dict = {}
+        event_type = protected.get("event_type")
+        if event_type == "human.responded":
+            bindings = {
+                "relationship_id": protected.get("relationship_id"),
+                "subject_type": "human_request",
+                "subject_id": payload.get("request_id"),
+                "answer": payload.get("answer"),
+                "approved": payload.get("approved"),
+            }
+        elif event_type == "poll.responded" and payload.get("human_confirmed"):
+            choice_ids = payload.get("choice_ids")
+            bindings = {
+                "relationship_id": protected.get("relationship_id"),
+                "subject_type": "poll",
+                "subject_id": payload.get("poll_id"),
+                "answer": (
+                    restricted_jcs(list(choice_ids)).decode("utf-8")
+                    if isinstance(choice_ids, (list, tuple))
+                    else None
+                ),
+                "approved": True,
+            }
+        if any(v is None for v in bindings.values()):
+            # Missing binding fields: do not guess. The semantic dry-run
+            # rejects malformed approval-gated events before persistence,
+            # so this only fires for a caller bypassing that path; failing
+            # closed is the safe choice.
+            raise EventStoreError(
+                "approval_binding_incomplete",
+                "approval-gated event is missing the fields needed to bind"
+                " the approval claim",
+            )
+        if not consume_approval(conn, approval_id, utcnow(), **bindings):
             raise EventStoreError(
                 "approval_consumed",
-                "approval was consumed by a concurrent send or expired",
+                "approval was consumed by a concurrent send, expired, or"
+                " does not match this response",
             )
     relationship_id = protected.get("relationship_id")
     sender = protected.get("sender")
@@ -378,6 +422,18 @@ def persist_outgoing_in_txn(
         "VALUES (?, ?)",
         (protected["event_id"], utcnow()),
     )
+    # Stage the validated payload atomically with the event row: without
+    # this, rebuild_projections raises payload_missing for locally
+    # generated events (notably the accepted receipts the receive path
+    # persists via this core), breaking disaster recovery after a single
+    # inbound message.
+    record_projection_input(
+        conn,
+        event_id=protected["event_id"],
+        event_type=protected["event_type"],
+        payload=payload,
+        reply_to=protected.get("reply_to"),
+    )
     try:
         conn.execute(
             "INSERT INTO scheduler_queue(scheduled_id, inner_event, "
@@ -393,6 +449,16 @@ def persist_outgoing_in_txn(
     except sqlite3.IntegrityError as exc:
         code, message = _classify_integrity(exc)
         raise EventStoreError(code, message) from None
+    if approval_id is not None:
+        # S8 bookkeeping: record which human approval this scheduled row
+        # consumed, so a dead-lettered or expired gated event can restore
+        # it instead of silently burning the human's approval.
+        _scheduler._ensure_approval_column(conn)
+        conn.execute(
+            "UPDATE scheduler_queue SET approval_id = ? "
+            "WHERE scheduled_id = ?",
+            (approval_id, protected["event_id"]),
+        )
 
     return envelope
 

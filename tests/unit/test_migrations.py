@@ -171,3 +171,92 @@ CREATE TABLE t2 (id INTEGER PRIMARY KEY);
         )
     finally:
         c.close()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for finding D4 (startup migration hardening).
+# ---------------------------------------------------------------------------
+
+
+def test_migrate_recovers_from_reset_user_version(tmp_path):
+    """D4: a user_version reset to 0 on an already-migrated database (the
+    old crash wedge) re-runs idempotently instead of dying on
+    'duplicate column name'."""
+    from muse_agent_social.store import migrations as mig
+
+    c = db.connect(tmp_path / "m.db")
+    try:
+        assert mig.migrate(c) == 4
+        # Simulate the wedge: column present, version reset.
+        assert "attestation" in _columns(c, "human_requests")
+        c.execute("PRAGMA user_version = 0;")
+        assert mig.migrate(c) == 4
+        assert "attestation" in _columns(c, "human_requests")
+        # And repeated runs stay clean.
+        assert mig.migrate(c) == 4
+    finally:
+        c.close()
+
+
+def test_migrate_refuses_missing_append_only_trigger(tmp_path):
+    """D4: a missing append-only trigger fails startup loudly instead of
+    running without the append-only guarantee."""
+    from muse_agent_social.store import migrations as mig
+
+    c = db.connect(tmp_path / "m.db")
+    try:
+        assert mig.migrate(c) == 4
+        c.execute("DROP TRIGGER events_no_update;")
+        with pytest.raises(db.DbError, match="append-only trigger"):
+            mig.migrate(c)
+    finally:
+        c.close()
+
+
+def test_migrate_schema_too_new_is_labeled(tmp_path):
+    """D4: a database newer than this code raises SchemaTooNewError, a
+    DbError the CLI maps to a labeled error."""
+    from muse_agent_social.store import migrations as mig
+
+    c = db.connect(tmp_path / "m.db")
+    try:
+        assert mig.migrate(c) == 4
+        c.execute("PRAGMA user_version = 999;")
+        with pytest.raises(db.SchemaTooNewError, match="newer than supported"):
+            mig.migrate(c)
+    finally:
+        c.close()
+
+
+def test_migrate_projections_schema_too_new_is_labeled(tmp_path):
+    """D4: migrate_projections maps schema-too-new to SchemaTooNewError
+    (not a raw RuntimeError), so Ctx reports schema_too_new."""
+    c = db.connect(tmp_path / "m.db")
+    try:
+        from muse_agent_social.store import migrations as mig
+
+        mig.migrate(c)
+        c.execute("PRAGMA user_version = 999;")
+        with pytest.raises(
+            db.SchemaTooNewError, match="newer than supported"
+        ):
+            projections.migrate_projections(c)
+    finally:
+        c.close()
+
+
+def test_migrate_projections_v3_column_idempotent(tmp_path):
+    """D4: the projections track tolerates a pre-existing v3 attestation
+    column (e.g. left by the skeleton track) without wedging."""
+    from muse_agent_social.store import migrations as mig
+
+    c = db.connect(tmp_path / "m.db")
+    try:
+        # Skeleton track first: v3 column present via _ensure_v3_attestation.
+        assert mig.migrate(c) == 4
+        c.execute("PRAGMA user_version = 1;")
+        assert projections.migrate_projections(c) == 4
+        assert projections.migrate_projections(c) == 4
+        assert "attestation" in _columns(c, "human_requests")
+    finally:
+        c.close()

@@ -49,6 +49,8 @@ from typing import Callable
 
 from ..store.db import open_db, utcnow
 from .base import (
+    FETCH_MAX_AGGREGATE_BYTES,
+    FETCH_MAX_OBJECTS,
     LOCK_TIMEOUT_SECONDS,
     OBJECT_MAX_BYTES,
     PUSH_HARD_CEILING_PER_MINUTE,
@@ -61,6 +63,7 @@ from .base import (
     Transport,
     TransportError,
     mirror_lock,
+    new_stream_stats,
 )
 from .local import OBJECT_NAME_RE, check_object_size
 
@@ -414,44 +417,87 @@ class GitHubTransport(Transport):
     def changed(self, since_head: str) -> bool:
         return self.head() != since_head
 
-    def fetch_new(self, since: str) -> list[tuple[str, bytes]]:
-        """Fetch origin and list incoming/*.json objects newer than `since`.
+    def _list_new_names_locked(self, since: str) -> tuple[list[str], str]:
+        """Fetch origin and list incoming/ paths newer than `since`.
 
-        `since` is a remote HEAD sha previously returned by head(). Objects
-        whose names do not match the relay object pattern are skipped (the
-        receive path quarantines by content; the transport never parses).
+        Must be called with the mirror lock held. Returns (names, ref) where
+        ref is the remote branch ref the names were listed against.
         """
-        with mirror_lock(self.state_dir, self.relationship_id, LOCK_TIMEOUT_SECONDS):
-            self._ensure_mirror_locked()
-            cp = self._git("fetch", "origin")
+        self._ensure_mirror_locked()
+        cp = self._git("fetch", "origin")
+        if cp.returncode != 0:
+            raise TransportError(
+                "fetch_failed",
+                "git fetch origin failed",
+                retryable=True,
+                detail=cp.stderr.decode("utf-8", "replace")[-500:],
+            )
+        ref = f"origin/{self.branch}"
+        names: list[str] = []
+        did_diff = False
+        if since and self._ref_exists(since) and self._ref_exists(ref):
+            cp = self._git(
+                "diff", "--name-only", "--diff-filter=AM",
+                since, ref, "--", "incoming",
+            )
+            if cp.returncode == 0:
+                names = cp.stdout.decode("utf-8", "replace").splitlines()
+                did_diff = True
+        if not did_diff and self._ref_exists(ref):
+            cp = self._git("ls-tree", "-r", "--name-only", ref, "--", "incoming")
             if cp.returncode != 0:
                 raise TransportError(
-                    "fetch_failed",
-                    "git fetch origin failed",
+                    "fetch_failed", "git ls-tree failed",
                     retryable=True,
                     detail=cp.stderr.decode("utf-8", "replace")[-500:],
                 )
-            ref = f"origin/{self.branch}"
-            names: list[str] = []
-            did_diff = False
-            if since and self._ref_exists(since) and self._ref_exists(ref):
-                cp = self._git(
-                    "diff", "--name-only", "--diff-filter=AM",
-                    since, ref, "--", "incoming",
-                )
-                if cp.returncode == 0:
-                    names = cp.stdout.decode("utf-8", "replace").splitlines()
-                    did_diff = True
-            if not did_diff and self._ref_exists(ref):
-                cp = self._git("ls-tree", "-r", "--name-only", ref, "--", "incoming")
-                if cp.returncode != 0:
-                    raise TransportError(
-                        "fetch_failed", "git ls-tree failed",
-                        retryable=True,
-                        detail=cp.stderr.decode("utf-8", "replace")[-500:],
-                    )
-                names = cp.stdout.decode("utf-8", "replace").splitlines()
-            items: list[tuple[str, bytes]] = []
+            names = cp.stdout.decode("utf-8", "replace").splitlines()
+        return names, ref
+
+    def _object_size_locked(self, ref: str, name: str) -> int | None:
+        """Blob size from git metadata, or None on raced deletion/garbage.
+
+        Never buffers the object: the size pre-check runs before any
+        content is read.
+        """
+        blob_ref = f"{ref}:incoming/{name}"
+        cp = self._git("cat-file", "-s", blob_ref)
+        if cp.returncode != 0:
+            return None  # raced deletion; next poll converges
+        try:
+            return int(cp.stdout.decode("ascii", "replace").strip())
+        except ValueError:
+            return None  # unexpected output; next poll converges
+
+    def _read_object_locked(self, ref: str, name: str) -> bytes | None:
+        """Object content, or None on raced deletion."""
+        cp = self._git("cat-file", "-p", f"{ref}:incoming/{name}")
+        if cp.returncode != 0:
+            return None  # raced deletion; next poll converges
+        return cp.stdout
+
+    def fetch_new_stream(
+        self,
+        since: str,
+        visit: Callable[[str, bytes], bool],
+    ) -> dict:
+        """Stream incoming/*.json objects newer than `since`.
+
+        Each object is fetched and visited one at a time: the watcher
+        processes an object (replay check, signature check) before the next
+        one is buffered, so a relay stuffed with legal-size objects can no
+        longer force the watcher to buffer gigabytes. The visitor returns
+        False to stop early (the watcher does this when its time budget is
+        spent), which also stops spawning per-object git subprocesses.
+
+        Loud, documented bounds per call (policy/limits.py): at most
+        FETCH_MAX_OBJECTS objects and FETCH_MAX_AGGREGATE_BYTES total bytes
+        are delivered; hitting either stops the stream with truncated=True
+        and the reason in the stats dict.
+        """
+        with mirror_lock(self.state_dir, self.relationship_id, LOCK_TIMEOUT_SECONDS):
+            stats = new_stream_stats()
+            names, ref = self._list_new_names_locked(since)
             for entry in names:
                 entry = entry.strip()
                 if not entry.startswith("incoming/"):
@@ -459,33 +505,73 @@ class GitHubTransport(Transport):
                 name = entry[len("incoming/"):]
                 if not OBJECT_NAME_RE.match(name):
                     continue
-                # Size pre-check BEFORE buffering: git cat-file -s reports
-                # the blob size from metadata, so a hostile oversized blob
-                # is never read into memory. The receive loop
-                # (watcher.run_once) enforces the cap itself via len(data)
-                # and quarantines oversized input without failing the run,
-                # so an over-cap blob is returned with a bounded placeholder
-                # that still trips that check instead of its full content.
-                blob_ref = f"{ref}:incoming/{name}"
-                cp = self._git("cat-file", "-s", blob_ref)
-                if cp.returncode != 0:
-                    continue  # raced deletion; next poll converges
+                if stats["objects_streamed"] >= FETCH_MAX_OBJECTS:
+                    stats["truncated"] = True
+                    stats["truncation_reason"] = "object_cap"
+                    break
+                size = self._object_size_locked(ref, name)
+                if size is None:
+                    continue
+                # Aggregate bound checked BEFORE buffering, counting what
+                # the stream actually delivers: an over-cap object is
+                # delivered as a bounded placeholder of
+                # OBJECT_MAX_BYTES + 1, so the placeholder counts toward
+                # the aggregate too. An exact-cap total is allowed.
+                deliver_size = (
+                    size if size <= OBJECT_MAX_BYTES else OBJECT_MAX_BYTES + 1
+                )
+                if (
+                    stats["bytes_streamed"] + deliver_size
+                    > FETCH_MAX_AGGREGATE_BYTES
+                ):
+                    stats["truncated"] = True
+                    stats["truncation_reason"] = "aggregate_bytes_cap"
+                    break
                 try:
-                    blob_size = int(cp.stdout.decode("ascii", "replace").strip())
-                except ValueError:
-                    continue  # unexpected output; next poll converges
-                try:
-                    check_object_size(name, blob_size)
+                    check_object_size(name, size)
                 except TransportError as exc:
                     if exc.code != "object_too_large":
                         raise
-                    items.append((name, b"\x00" * (OBJECT_MAX_BYTES + 1)))
-                    continue
-                cp = self._git("cat-file", "-p", blob_ref)
-                if cp.returncode != 0:
-                    continue  # raced deletion; next poll converges
-                items.append((name, cp.stdout))
-            return items
+                    # Size pre-check BEFORE buffering: an over-cap blob is
+                    # never read into memory. The receive loop
+                    # (watcher.run_once) enforces the cap itself via
+                    # len(data) and quarantines oversized input without
+                    # failing the run, so an over-cap blob is delivered as a
+                    # bounded placeholder that still trips that check
+                    # instead of its full content.
+                    data = b"\x00" * (OBJECT_MAX_BYTES + 1)
+                else:
+                    data = self._read_object_locked(ref, name)
+                    if data is None:
+                        continue
+                stats["objects_streamed"] += 1
+                stats["bytes_streamed"] += len(data)
+                if visit(name, data) is False:
+                    stats["truncated"] = True
+                    stats["truncation_reason"] = "caller_stopped"
+                    break
+            return stats
+
+    def fetch_new(self, since: str) -> list[tuple[str, bytes]]:
+        """Fetch origin and list incoming/*.json objects newer than `since`.
+
+        `since` is a remote HEAD sha previously returned by head(). Objects
+        whose names do not match the relay object pattern are skipped (the
+        receive path quarantines by content; the transport never parses).
+
+        Buffered legacy entry point: prefer fetch_new_stream, which applies
+        the same logic per-object with documented aggregate bounds. Kept
+        for callers that need the whole batch; it is still bounded by
+        FETCH_MAX_OBJECTS / FETCH_MAX_AGGREGATE_BYTES.
+        """
+        items: list[tuple[str, bytes]] = []
+
+        def visit(name: str, data: bytes) -> bool:
+            items.append((name, data))
+            return True
+
+        self.fetch_new_stream(since, visit)
+        return items
 
     def read_object(self, object_name: str) -> bytes:
         """Read a single relay object, checking size from metadata first.
