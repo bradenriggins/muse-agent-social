@@ -17,7 +17,7 @@ from muse_agent_social.store.db import (
     transaction,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Migration 2 gathers the auxiliary DDL owned by feature modules so that a
 # single migrate() call brings a fresh database to the full v0.2 schema.
@@ -253,11 +253,60 @@ CREATE INDEX IF NOT EXISTS idx_scheduler_deliver
 """
 
 # (version, name, ddl). Versions are strictly increasing and never reused.
+_V5_DDL = """
+-- Attachment metadata for message.created events carrying a file.
+-- The bytes themselves live on disk under <state_dir>/attachments/
+-- (materialized by the receive path); this table tracks what arrived,
+-- its integrity hash, and where it was written. stored_path is NULL
+-- until materialization succeeds, so a crash between projection and
+-- materialization is recoverable: the next receive retries the write.
+CREATE TABLE IF NOT EXISTS attachments (
+    event_id        TEXT PRIMARY KEY,
+    relationship_id TEXT NOT NULL,
+    filename        TEXT NOT NULL,
+    size            INTEGER NOT NULL,
+    content_type    TEXT,
+    sha256          TEXT NOT NULL,
+    stored_path     TEXT,
+    received_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_relationship
+    ON attachments(relationship_id);
+"""
+
+
+def _ensure_v5_attachments(conn: sqlite3.Connection) -> None:
+    """Idempotently create the attachments metadata table (v5).
+
+    Runs the two v5 statements individually (never executescript(), which
+    would implicitly commit the caller's transaction).
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS attachments (
+            event_id        TEXT PRIMARY KEY,
+            relationship_id TEXT NOT NULL,
+            filename        TEXT NOT NULL,
+            size            INTEGER NOT NULL,
+            content_type    TEXT,
+            sha256          TEXT NOT NULL,
+            stored_path     TEXT,
+            received_at     TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attachments_relationship"
+        " ON attachments(relationship_id);"
+    )
+
+
 MIGRATIONS: list[tuple[int, str, str]] = [
     (1, "v1_initial_schema", _V1_DDL),
     (2, "v2_projections_rotation_transport", _V2_DDL),
     (3, "v3_human_approval_attestation", _PROJECTIONS_V3_DDL),
     (4, "v4_prior_peer_identity", _V4_DDL),
+    (5, "v5_attachments", _V5_DDL),
 ]
 
 

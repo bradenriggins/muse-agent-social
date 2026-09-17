@@ -74,7 +74,7 @@ __all__ = [
 # Schema version owned by this track. The skeleton track owns version 1;
 # this migration is version 2, and the human-approval attestation column
 # is version 3. See INTERFACE.md for the bump contract.
-PROJECTIONS_SCHEMA_VERSION = 4
+PROJECTIONS_SCHEMA_VERSION = 5
 
 # Seven days, in seconds, before a missing projection target expires.
 PENDING_TARGET_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -381,13 +381,13 @@ def _ensure_event_payloads_received_at(conn: sqlite3.Connection) -> None:
 
 
 def migrate_projections(conn: sqlite3.Connection) -> int:
-    """Apply the projection-track migrations (schema version 4).
+    """Apply the projection-track migrations (schema version 5).
 
     Idempotent: safe to run repeatedly. Requires the skeleton migration
-    (version 1) to be applied first. Refuses databases newer than version 4.
+    (version 1) to be applied first. Refuses databases newer than version 5.
     Must be called outside any open transaction.
 
-    Returns the schema version (4).
+    Returns the schema version (5).
     """
     current = get_user_version(conn)
     if current < 1:
@@ -426,13 +426,18 @@ def migrate_projections(conn: sqlite3.Connection) -> int:
         ensure_approvals_columns(conn)
         # G13: the durable receiver acceptance timestamp on event_payloads.
         _ensure_event_payloads_received_at(conn)
+        # v5: the attachment metadata table. This track also stamps the
+        # shared version counter, so it must guarantee the table exists.
+        from muse_agent_social.store.migrations import _ensure_v5_attachments
+
+        _ensure_v5_attachments(conn)
         if current < PROJECTIONS_SCHEMA_VERSION:
             conn.execute(
                 f"PRAGMA user_version = {PROJECTIONS_SCHEMA_VERSION};"
             )
             conn.execute(
                 "INSERT OR REPLACE INTO migration_state(key, value) "
-                "VALUES ('projections_migration', '4');"
+                "VALUES ('projections_migration', '5');"
             )
     return PROJECTIONS_SCHEMA_VERSION
 
@@ -832,6 +837,28 @@ def _handle_message_created(
         " VALUES (?, 0, ?, ?);",
         (ev["event_id"], payload["body"], ev["created_at"]),
     )
+    attachment = payload.get("attachment")
+    if isinstance(attachment, dict):
+        # Record the attachment metadata now; the receive path materializes
+        # the bytes to disk afterwards. stored_path stays NULL until that
+        # write succeeds, so a crash in between is retried, not lost.
+        conn.execute(
+            "INSERT OR IGNORE INTO attachments(event_id, relationship_id,"
+            " filename, size, content_type, sha256, stored_path, received_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, NULL, ?);",
+            (
+                ev["event_id"],
+                ev["relationship_id"],
+                attachment["filename"],
+                attachment["size"],
+                attachment.get("content_type"),
+                attachment["sha256"],
+                now,
+            ),
+        )
+        mutations.append(
+            _mutation("insert", "attachments", ev["event_id"], {"filename": attachment["filename"]})
+        )
     _bump_thread_message(conn, ev.get("thread_id"), ev["created_at"])
     mutations.append(_mutation("insert", "messages", ev["event_id"], {"reply_state": reply_state}))
     return mutations

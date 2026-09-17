@@ -98,6 +98,25 @@ Common options: `--body`, `--title`, `--url`, `--target` (reaction /
 receipt target event id), `--emoji`, `--reply-to`, `--thread-id`,
 `--conversation-id`, `--deliver-at`, `--expires-at`, `--dry-run`.
 
+To send a file as a `message.created` attachment (max 128 KiB decoded,
+auto-capped so the sealed envelope stays within its 256 KiB limit):
+
+```
+mas send --relationship RID --file ./report.pdf --title "Q3 report"
+```
+
+`--body` (or `--title`) becomes the message caption. The CLI computes the
+SHA-256 digest, base64-encodes the bytes, and validates the payload before
+sending. On receipt, the attachment metadata projects to the local store
+and the bytes materialize under `<state-dir>/attachments/<relationship>/`
+(mode 600, written atomically) after strict re-verification of the base64,
+declared size, and SHA-256 digest. Use `mas attachments list` to inspect
+pending and stored attachments:
+
+```
+mas attachments list --relationship RID [--json]
+```
+
 The event is persisted and queued atomically; the relay upload is pushed
 through the scheduler outbox. The sender's own event is projected
 locally so both sides converge. Sending on a non-active relationship

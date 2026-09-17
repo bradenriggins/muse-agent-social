@@ -1430,7 +1430,7 @@ def cmd_pair_ingest(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 _SEND_TYPES = sorted(PAYLOAD_DISPATCH.keys())
-_LEGACY_SEND_TYPES = ("note", "link", "article", "file-ref")
+_LEGACY_SEND_TYPES = ("note", "link", "article", "file-ref", "file")
 
 
 def _iso_now() -> str:
@@ -1516,6 +1516,48 @@ def _require_approval_record(
     return record["approval_id"]
 
 
+def _attachment_from_file(path: str) -> dict:
+    """Read a local file into a message.created attachment dict.
+
+    Enforces the v0.2 attachment contract: at most MAX_ATTACHMENT_BYTES
+    decoded bytes, bare filename (no directories), MIME type guessed from
+    the name. Raises CliError on missing file, oversize, or unreadable.
+    """
+    import base64
+    import hashlib
+    import mimetypes
+    import os
+
+    from muse_agent_social.validation import MAX_ATTACHMENT_BYTES
+
+    if not os.path.isfile(path):
+        raise CliError("bad_args", f"--file not found: {path}")
+    size = os.path.getsize(path)
+    if size > MAX_ATTACHMENT_BYTES:
+        raise CliError(
+            "bad_args",
+            f"--file too large: {size} bytes (max {MAX_ATTACHMENT_BYTES})",
+        )
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        raise CliError("bad_args", f"--file unreadable: {exc}")
+    if len(raw) != size or len(raw) > MAX_ATTACHMENT_BYTES:
+        raise CliError("bad_args", "--file changed size during read; retry")
+    filename = os.path.basename(path)
+    if not filename or filename in (".", ".."):
+        raise CliError("bad_args", "--file needs a real filename")
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return {
+        "filename": filename,
+        "size": len(raw),
+        "content_type": content_type,
+        "data": base64.b64encode(raw).decode("ascii"),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def _build_payload(ctx: "Ctx", args: argparse.Namespace) -> dict:
     """Build and schema-validate the typed payload for ``mas send``.
 
@@ -1527,12 +1569,18 @@ def _build_payload(ctx: "Ctx", args: argparse.Namespace) -> dict:
     """
     t = args.type
     if t == "message.created":
-        if not args.body:
+        attachment = _attachment_from_file(args.file) if args.file else None
+        body = args.body or args.title or ""
+        if not body.strip() and attachment is None:
             raise CliError("bad_args", "message.created needs --body")
+        if attachment is not None and not body.strip():
+            body = "File: %s" % attachment["filename"]
         payload = {
-            "body": args.body,
+            "body": body,
             "format": args.format or "plain",
         }
+        if attachment is not None:
+            payload["attachment"] = attachment
     elif t == "message.edited":
         if not args.target or not args.body:
             raise CliError("bad_args", "message.edited needs --target and --body")
@@ -1740,11 +1788,17 @@ def _legacy_payload(args: argparse.Namespace) -> tuple[str, dict]:
         text = "\n\n".join(p for p in (title, body) if p)
         if url:
             text += f"\n\n{url}"
+    elif t == "file":
+        if not args.file:
+            raise CliError("bad_args", "legacy type file needs --file <path>")
+        attachment = _attachment_from_file(args.file)
+        text = body or title or "File: %s" % attachment["filename"]
+        payload = {"body": text, "format": "plain", "attachment": attachment}
     else:  # file-ref
         text = "\n\n".join(p for p in (title, url, body) if p)
-    if not text.strip():
-        raise CliError("bad_args", f"legacy type {t} needs --title/--body/--url")
-    payload = {"body": text, "format": "plain"}
+        if not text.strip():
+            raise CliError("bad_args", f"legacy type {t} needs --title/--body/--url")
+        payload = {"body": text, "format": "plain"}
     validate_payload("message.created", payload)
     return "message.created", payload
 
@@ -3986,6 +4040,118 @@ def _receive_relationship(
     return code, result
 
 
+def _materialize_attachments(ctx: "Ctx", relationship_ids: list[str]) -> dict[str, int]:
+    """Write pending attachment bytes to disk.
+
+    Finds attachments rows with stored_path NULL (recorded by the
+    message.created projection), decodes the base64 from the stored
+    event payload, verifies size and SHA-256, and writes the file to
+    <state_dir>/attachments/<relationship_id>/<event_id>_<filename>
+    with mode 600. Updates stored_path on success; leaves the row
+    pending on any failure so the next receive retries.
+
+    Returns {"materialized": n, "failed": m}. Never raises: a failed
+    attachment must not fail the receive run.
+    """
+    import base64
+    import binascii
+    import hashlib
+    import json
+    import os
+
+    result = {"materialized": 0, "failed": 0}
+    if not relationship_ids:
+        return result
+    placeholders = ",".join("?" for _ in relationship_ids)
+    try:
+        rows = ctx.conn.execute(
+            "SELECT a.event_id, a.relationship_id, a.filename, a.size,"
+            " a.sha256, p.payload"
+            " FROM attachments a JOIN event_payloads p"
+            " ON p.event_id = a.event_id"
+            f" WHERE a.stored_path IS NULL AND a.relationship_id IN ({placeholders});",
+            tuple(relationship_ids),
+        ).fetchall()
+    except Exception:
+        return result
+    for row in rows:
+        event_id = row["event_id"]
+        rid = row["relationship_id"]
+        try:
+            payload = json.loads(row["payload"])
+            data_b64 = payload["attachment"]["data"]
+            raw = base64.b64decode(data_b64, validate=True)
+        except (ValueError, KeyError, TypeError, binascii.Error):
+            result["failed"] += 1
+            continue
+        if len(raw) != row["size"] or hashlib.sha256(raw).hexdigest() != row["sha256"]:
+            result["failed"] += 1
+            continue
+        safe_name = os.path.basename(row["filename"]) or "attachment"
+        if safe_name in (".", ".."):
+            safe_name = "attachment"
+        target_dir = ctx.state_dir / "attachments" / rid
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            # 0o700 on the per-relationship dir: attachments are private.
+            os.chmod(target_dir, 0o700)
+            target = target_dir / f"{event_id}_{safe_name}"
+            # Write to a temp name then rename: no torn files on crash.
+            tmp = target.with_name(target.name + ".tmp")
+            with open(tmp, "wb") as fh:
+                fh.write(raw)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+            os.chmod(target, 0o600)
+        except OSError:
+            result["failed"] += 1
+            continue
+        try:
+            ctx.conn.execute(
+                "UPDATE attachments SET stored_path = ? WHERE event_id = ?;",
+                (str(target), event_id),
+            )
+            ctx.conn.commit()
+            result["materialized"] += 1
+        except Exception:
+            result["failed"] += 1
+    return result
+
+
+def cmd_attachments_list(args: argparse.Namespace) -> int:
+    """List received attachments and where they were written."""
+    ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
+    try:
+        if args.relationship:
+            rid = ctx.resolve_relationship(args.relationship)["relationship_id"]
+            rows = ctx.conn.execute(
+                "SELECT event_id, filename, size, content_type, sha256,"
+                " stored_path, received_at FROM attachments"
+                " WHERE relationship_id = ? ORDER BY received_at;",
+                (rid,),
+            ).fetchall()
+        else:
+            rows = ctx.conn.execute(
+                "SELECT event_id, relationship_id, filename, size, content_type,"
+                " sha256, stored_path, received_at FROM attachments"
+                " ORDER BY received_at;",
+            ).fetchall()
+        if args.json:
+            print(_canon_text({"attachments": [dict(r) for r in rows]}))
+        else:
+            for r in rows:
+                status = r["stored_path"] or "(pending materialization)"
+                print(
+                    f"{r['filename']} ({r['size']} bytes, {r['content_type'] or 'unknown type'})"
+                    f"\n  event: {r['event_id']}\n  file: {status}"
+                )
+            if not rows:
+                print("no attachments received")
+        return 0
+    finally:
+        ctx.close()
+
+
 def cmd_receive(args: argparse.Namespace) -> int:
     ctx = Ctx(Path(args.state_dir) if args.state_dir else resolve_state_dir())
     try:
@@ -4028,6 +4194,15 @@ def cmd_receive(args: argparse.Namespace) -> int:
             for key in totals:
                 totals[key] += int(result.get(key, 0) or 0)
         exit_code = _receive_exit_precedence(codes)
+        # Materialize any attachment bytes that arrived with this receive.
+        # Best-effort: failures stay pending for the next run and never
+        # fail the receive itself.
+        try:
+            att = _materialize_attachments(ctx, rids)
+            totals["attachments_materialized"] = att["materialized"]
+            totals["attachments_failed"] = att["failed"]
+        except Exception:
+            pass
         # Proactive retention: enforce plaintext-cache periods on every
         # receive run. The purge function existed but no runtime path ever
         # called it, so expired plaintext could linger indefinitely.
@@ -4973,6 +5148,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--thread", default=None)
     p_send.add_argument("--reply-to", default=None)
     p_send.add_argument("--body", default=None)
+    p_send.add_argument(
+        "--file", default=None,
+        help="attach a local file to a message.created event (at most 128 KiB); "
+        "--body/--title become the caption",
+    )
     p_send.add_argument("--format", default=None, choices=("plain", "markdown-safe"))
     p_send.add_argument("--title", default=None)
     p_send.add_argument("--url", default=None)
@@ -5081,6 +5261,14 @@ def build_parser() -> argparse.ArgumentParser:
         "event_id", help="event_id (or scheduled_id) of the notification")
     _add_common(p_sack)
     p_sack.set_defaults(func=cmd_surface_ack)
+
+    p_att = subs.add_parser(
+        "attachments", help="list files received as message attachments")
+    att_subs = p_att.add_subparsers(dest="attachments_cmd", required=True)
+    p_att_list = att_subs.add_parser("list", help="list received attachments")
+    p_att_list.add_argument("--relationship", default=None)
+    _add_common(p_att_list)
+    p_att_list.set_defaults(func=cmd_attachments_list)
 
     p_policy = subs.add_parser(
         "policy", help="get or set per-relationship delivery policy")

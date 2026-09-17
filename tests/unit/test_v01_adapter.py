@@ -560,3 +560,82 @@ def test_legacy_error_carries_code_not_content():
     )
     assert "super secret body" not in str(err)
     assert "super secret body" not in err.detail
+
+
+# ---------------------------------------------------------------------------
+# adapt_v01: file attachments
+# ---------------------------------------------------------------------------
+
+
+def _file_envelope(key: bytes, data: bytes, **overrides) -> dict:
+    att = {
+        "filename": "report.pdf",
+        "size": len(data),
+        "content_type": "application/pdf",
+        "data": base64.b64encode(data).decode("ascii"),
+    }
+    env = make_envelope(key, type="file", attachment=att)
+    env.update(overrides)
+    # Re-sign after overrides (make_envelope signs before we add attachment).
+    env.pop("sig", None)
+    canonical = json.dumps(
+        {k: v for k, v in env.items() if k != "sig"},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    env["sig"] = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    return env
+
+
+def _adapt_file(key: bytes, data: bytes, **overrides):
+    raw = seal(_file_envelope(key, data, **overrides))
+    verified = verify_v01(raw, key, policy=make_policy(), filename="f.json")
+    return adapt_v01(verified, PAIR, SeqAssigner())
+
+
+def test_adapt_file_carries_attachment():
+    data = b"%PDF-1.4 tiny"
+    event = _adapt_file(_fresh_key(), data)
+    assert event["legacy_type"] == "file"
+    att = event["payload"]["attachment"]
+    assert att["filename"] == "report.pdf"
+    assert att["size"] == len(data)
+    assert att["data"] == base64.b64encode(data).decode("ascii")
+    assert att["sha256"] == hashlib.sha256(data).hexdigest()
+    # The adapted payload still validates as message.created.
+    from muse_agent_social.validation import validate_payload
+
+    validate_payload("message.created", {
+        "body": event["payload"]["body"],
+        "format": "plain",
+        "attachment": att,
+    })
+
+
+def test_adapt_file_oversize_downgrades_to_body_only():
+    from muse_agent_social.validation import MAX_ATTACHMENT_BYTES
+
+    data = b"x" * (MAX_ATTACHMENT_BYTES + 1)
+    event = _adapt_file(_fresh_key(), data)
+    assert event["legacy_type"] == "file"
+    assert "attachment" not in event["payload"]
+    # Original bytes preserved verbatim for manual recovery.
+    assert event["raw_v01"] is not None
+
+
+def test_adapt_file_malformed_attachment_downgrades():
+    key = _fresh_key()
+    env = make_envelope(key, type="file",
+                        attachment={"filename": "x", "size": 3,
+                                    "data": "!!!bad!!!"})
+    env.pop("sig", None)
+    canonical = json.dumps(
+        {k: v for k, v in env.items() if k != "sig"},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    env["sig"] = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    raw = seal(env)
+    verified = verify_v01(raw, key, policy=make_policy(), filename="f.json")
+    event = adapt_v01(verified, PAIR, SeqAssigner())
+    assert "attachment" not in event["payload"]

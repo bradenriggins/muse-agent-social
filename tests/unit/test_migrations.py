@@ -1,6 +1,6 @@
 """Unit tests for schema migration atomicity and version correctness.
 
-Covers: fresh migration reaches version 4 with all artifacts, re-running
+Covers: fresh migration reaches version 5 with all artifacts, re-running
 is a no-op, a failed migration rolls back to the prior version (no
 half-applied DDL), concurrent first-run migrations converge, and the
 projection track guarantees the v4 relationship column and the approval
@@ -31,9 +31,9 @@ def _columns(conn, table):
     return [r["name"] for r in conn.execute(f"PRAGMA table_info({table});")]
 
 
-def test_fresh_migrate_reaches_v4(fresh):
-    assert migrations.migrate(fresh) == 4
-    assert get_user_version(fresh) == 4
+def test_fresh_migrate_reaches_v5(fresh):
+    assert migrations.migrate(fresh) == 5
+    assert get_user_version(fresh) == 5
     assert "prior_peer_identity_id" in _columns(fresh, "relationships")
     for col in ("expires_at", "consumed_at"):
         assert col in _columns(fresh, "human_approvals"), col
@@ -48,9 +48,9 @@ def test_fresh_migrate_reaches_v4(fresh):
 
 
 def test_migrate_is_idempotent(fresh):
-    assert migrations.migrate(fresh) == 4
-    assert migrations.migrate(fresh) == 4
-    assert get_user_version(fresh) == 4
+    assert migrations.migrate(fresh) == 5
+    assert migrations.migrate(fresh) == 5
+    assert get_user_version(fresh) == 5
 
 
 def test_failed_migration_rolls_back_to_prior_version(tmp_path, monkeypatch):
@@ -82,7 +82,7 @@ def test_failed_migration_rolls_back_to_prior_version(tmp_path, monkeypatch):
     # Retry after the sabotage is gone converges to v4.
     c2 = db.connect(tmp_path / "m.db")
     try:
-        assert migrations.migrate(c2) == 4
+        assert migrations.migrate(c2) == 5
         assert "prior_peer_identity_id" in _columns(c2, "relationships")
     finally:
         c2.close()
@@ -108,10 +108,10 @@ def test_concurrent_migrate_converges(tmp_path):
         t.start()
     for t in threads:
         t.join(timeout=60)
-    assert results == [4, 4, 4, 4]
+    assert results == [5, 5, 5, 5]
     check = db.connect(path)
     try:
-        assert get_user_version(check) == 4
+        assert get_user_version(check) == 5
         assert "prior_peer_identity_id" in _columns(check, "relationships")
     finally:
         check.close()
@@ -121,9 +121,9 @@ def test_migrate_projections_repeatable_and_backfills_v4(tmp_path):
     c = db.connect(tmp_path / "m.db")
     try:
         migrations.migrate(c)
-        assert projections.migrate_projections(c) == 4
-        assert projections.migrate_projections(c) == 4
-        assert get_user_version(c) == 4
+        assert projections.migrate_projections(c) == 5
+        assert projections.migrate_projections(c) == 5
+        assert get_user_version(c) == 5
         assert "prior_peer_identity_id" in _columns(c, "relationships")
         for col in ("expires_at", "consumed_at"):
             assert col in _columns(c, "human_approvals"), col
@@ -140,7 +140,7 @@ def test_migrate_projections_adds_missing_v4_column(tmp_path):
         c.execute("ALTER TABLE relationships DROP COLUMN prior_peer_identity_id;")
         c.commit()
         assert "prior_peer_identity_id" not in _columns(c, "relationships")
-        assert projections.migrate_projections(c) == 4
+        assert projections.migrate_projections(c) == 5
         assert "prior_peer_identity_id" in _columns(c, "relationships")
     finally:
         c.close()
@@ -186,14 +186,14 @@ def test_migrate_recovers_from_reset_user_version(tmp_path):
 
     c = db.connect(tmp_path / "m.db")
     try:
-        assert mig.migrate(c) == 4
+        assert mig.migrate(c) == 5
         # Simulate the wedge: column present, version reset.
         assert "attestation" in _columns(c, "human_requests")
         c.execute("PRAGMA user_version = 0;")
-        assert mig.migrate(c) == 4
+        assert mig.migrate(c) == 5
         assert "attestation" in _columns(c, "human_requests")
         # And repeated runs stay clean.
-        assert mig.migrate(c) == 4
+        assert mig.migrate(c) == 5
     finally:
         c.close()
 
@@ -205,7 +205,7 @@ def test_migrate_refuses_missing_append_only_trigger(tmp_path):
 
     c = db.connect(tmp_path / "m.db")
     try:
-        assert mig.migrate(c) == 4
+        assert mig.migrate(c) == 5
         c.execute("DROP TRIGGER events_no_update;")
         with pytest.raises(db.DbError, match="append-only trigger"):
             mig.migrate(c)
@@ -220,7 +220,7 @@ def test_migrate_schema_too_new_is_labeled(tmp_path):
 
     c = db.connect(tmp_path / "m.db")
     try:
-        assert mig.migrate(c) == 4
+        assert mig.migrate(c) == 5
         c.execute("PRAGMA user_version = 999;")
         with pytest.raises(db.SchemaTooNewError, match="newer than supported"):
             mig.migrate(c)
@@ -253,10 +253,10 @@ def test_migrate_projections_v3_column_idempotent(tmp_path):
     c = db.connect(tmp_path / "m.db")
     try:
         # Skeleton track first: v3 column present via _ensure_v3_attestation.
-        assert mig.migrate(c) == 4
+        assert mig.migrate(c) == 5
         c.execute("PRAGMA user_version = 1;")
-        assert projections.migrate_projections(c) == 4
-        assert projections.migrate_projections(c) == 4
+        assert projections.migrate_projections(c) == 5
+        assert projections.migrate_projections(c) == 5
         assert "attestation" in _columns(c, "human_requests")
     finally:
         c.close()

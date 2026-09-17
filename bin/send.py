@@ -36,12 +36,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--type",
         required=True,
-        choices=("note", "link", "article", "file-ref"),
+        choices=("note", "link", "article", "file-ref", "file"),
     )
     ap.add_argument("--title", required=True)
     ap.add_argument("--body", default="")
     ap.add_argument("--url", default="")
-    ap.add_argument("--file", default="", help="read body from a local file")
+    ap.add_argument(
+        "--file",
+        default="",
+        help="read body from a local file (for --type file: the file to attach)",
+    )
     ap.add_argument("--dry-run", action="store_true")
     # v0.1 path flags: accepted, ignored (v0.2 owns its state dir).
     ap.add_argument("--config", default="")
@@ -63,12 +67,21 @@ def map_argv(args: argparse.Namespace) -> list[str]:
         "--title",
         args.title,
     ]
-    body = args.body
-    if args.file:
-        with open(args.file, encoding="utf-8") as fh:
-            body = fh.read()
-    if body:
-        argv += ["--body", body]
+    if args.type == "file":
+        # For the file type, --file is the attachment itself, not a body
+        # source. It passes through to `mas send --file`.
+        if not args.file:
+            raise ValueError("--type file needs --file <path>")
+        argv += ["--file", args.file]
+        if args.body:
+            argv += ["--body", args.body]
+    else:
+        body = args.body
+        if args.file:
+            with open(args.file, encoding="utf-8") as fh:
+                body = fh.read()
+        if body:
+            argv += ["--body", body]
     if args.url:
         argv += ["--url", args.url]
     if args.dry_run:

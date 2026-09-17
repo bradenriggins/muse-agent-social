@@ -85,8 +85,12 @@ LEGACY_FIELD_SET = frozenset(
     }
 )
 
+#: Optional v0.1 envelope field carrying an inline file attachment
+#: (type "file"). May be present or absent; never required.
+LEGACY_OPTIONAL_FIELDS = frozenset({"attachment"})
+
 #: Legacy message types, all of which adapt to message.created.
-LEGACY_TYPES = frozenset({"note", "link", "article", "file-ref"})
+LEGACY_TYPES = frozenset({"note", "link", "article", "file-ref", "file"})
 
 #: Raw sealed bytes size limit, applied before parse or decrypt.
 MAX_V01_BYTES = 262144
@@ -286,11 +290,13 @@ class LegacyPolicy:
 
 
 def _looks_like_legacy_dict(obj: Any) -> bool:
+    keys = set(obj.keys()) if isinstance(obj, dict) else set()
     return (
         isinstance(obj, dict)
         and type(obj.get("v")) is int
         and obj.get("v") == 1
-        and set(obj.keys()) == LEGACY_FIELD_SET
+        and keys <= LEGACY_FIELD_SET | LEGACY_OPTIONAL_FIELDS
+        and LEGACY_FIELD_SET <= keys
     )
 
 
@@ -425,7 +431,8 @@ def _check_schema(envelope: Any) -> None:
         raise LegacyError("V01_MISSING_NONCE", "nonce is absent")
     if "sig" not in envelope:
         raise LegacyError("V01_HMAC_INVALID", "sig is absent")
-    if set(envelope.keys()) != LEGACY_FIELD_SET:
+    keys = set(envelope.keys())
+    if not (LEGACY_FIELD_SET <= keys <= LEGACY_FIELD_SET | LEGACY_OPTIONAL_FIELDS):
         raise LegacyError("V01_FIELDSET_MISMATCH", "key set is not the legacy set")
     for key in (
         "id",
@@ -623,6 +630,49 @@ def _synthetic_event_id(pair_id: str, legacy_id: str) -> str:
     return str(uuid.uuid5(namespace, legacy_id))
 
 
+def _adapt_v01_attachment(attachment: Any) -> dict | None:
+    """Map a v0.1 attachment dict onto the v0.2 attachment contract.
+
+    Returns the v0.2 attachment dict (with sha256 computed from the decoded
+    bytes), or None when the attachment is missing, malformed, or larger
+    than the v0.2 sealed-envelope budget allows.
+    """
+    from muse_agent_social.validation import MAX_ATTACHMENT_BYTES
+
+    if not isinstance(attachment, dict):
+        return None
+    filename = attachment.get("filename")
+    size = attachment.get("size")
+    data = attachment.get("data")
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or "/" in filename
+        or "\\" in filename
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or size > MAX_ATTACHMENT_BYTES
+        or not isinstance(data, str)
+    ):
+        return None
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(raw) != size:
+        return None
+    return {
+        "filename": filename,
+        "size": size,
+        "content_type": attachment.get("content_type")
+        if isinstance(attachment.get("content_type"), str)
+        else "application/octet-stream",
+        "data": data,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def adapt_v01(
     verified: VerifiedLegacy, pair_id: str, seq_assigner: SeqAssigner
 ) -> dict:
@@ -644,9 +694,21 @@ def adapt_v01(
         "legacy_title": envelope["title"],
     }
     # No new semantics invented: file-ref does not become an attachment,
-    # link does not become a preview.
+    # link does not become a preview. But v0.1's `file` type IS a file, so
+    # it maps onto the v0.2 attachment contract when it fits the sealed
+    # envelope budget; oversized files adapt to a body-only message (the
+    # original bytes stay preserved verbatim in raw_v01 for manual recovery).
     if legacy_type in ("link", "article", "file-ref"):
         payload["legacy_url"] = envelope.get("url", "")
+    elif legacy_type == "file":
+        adapted = _adapt_v01_attachment(envelope.get("attachment"))
+        if adapted is not None:
+            payload["attachment"] = adapted
+        else:
+            payload["body"] = (
+                payload["body"]
+                or "File attachment omitted: exceeds the v0.2 128 KiB limit."
+            )
 
     return {
         "event_id": _synthetic_event_id(pair_id, envelope["id"]),

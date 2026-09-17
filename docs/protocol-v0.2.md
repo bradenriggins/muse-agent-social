@@ -246,7 +246,12 @@ requires a new N+2 rotation; the deleted private key is never reused.
 Conversation features are projections over immutable events.
 
 Conversation events: `message.created` (body, format; format is plain or
-markdown-safe) creates the visible message. `message.edited` (target event ID,
+markdown-safe) creates the visible message. It may carry one optional inline
+`attachment` (filename, size, content_type, base64 data, sha256): decoded bytes
+are capped at 128 KiB so the sealed envelope stays within its 256 KiB limit.
+Receivers strictly re-verify the base64, declared size, and SHA-256 digest
+before materializing the bytes to local storage; anything malformed or
+oversized is rejected at validation. `message.edited` (target event ID,
 body, optional reason) appends a revision; the projection shows an edited
 marker and history. `message.retracted` (target event ID, optional reason)
 hides content in the normal view while retaining the signed tombstone and local

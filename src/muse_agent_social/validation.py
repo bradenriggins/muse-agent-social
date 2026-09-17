@@ -10,6 +10,9 @@ secret values or payload content.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import os
 from collections import deque
@@ -24,6 +27,7 @@ from referencing import Registry, Resource
 
 __all__ = [
     "MAX_ENVELOPE_BYTES",
+    "MAX_ATTACHMENT_BYTES",
     "ValidationError",
     "validate",
     "validate_payload",
@@ -33,6 +37,14 @@ __all__ = [
 
 # Whole sealed envelope, UTF-8 encoded, is at most 262,144 bytes.
 MAX_ENVELOPE_BYTES = 262144
+
+# Decoded attachment bytes per message.created. 128 KiB base64-encodes to
+# ~174 KiB, which keeps the sealed envelope under MAX_ENVELOPE_BYTES with
+# margin for headers, wraps, and signatures.
+MAX_ATTACHMENT_BYTES = 131072
+
+#: 64 lowercase hex chars (a SHA-256 digest in canonical form).
+_HEX64 = regex.compile(r"[0-9a-f]{64}\Z")
 
 
 class ValidationError(Exception):
@@ -237,6 +249,35 @@ def _check_poll_choices(obj: Any) -> None:
             raise ValidationError(f"choices[{i}]", "too_long_bytes")
 
 
+def _check_attachment(obj: Any) -> None:
+    """Enforce attachment invariants the JSON Schema cannot express.
+
+    Strict base64 (no whitespace, standard alphabet), decoded length must
+    equal the declared size, and the size must respect MAX_ATTACHMENT_BYTES.
+    Raises ValidationError with a stable code; never echoes content.
+    """
+    att = obj.get("attachment")
+    if not isinstance(att, dict):
+        return
+    data = att.get("data")
+    if not isinstance(data, str):
+        return
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValidationError("attachment.data", "not_base64")
+    size = att.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or len(raw) != size:
+        raise ValidationError("attachment.size", "size_mismatch")
+    if size > MAX_ATTACHMENT_BYTES:
+        raise ValidationError("attachment.size", "too_large")
+    digest = att.get("sha256")
+    if not isinstance(digest, str) or not _HEX64.match(digest):
+        raise ValidationError("attachment.sha256", "bad_digest")
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise ValidationError("attachment.sha256", "digest_mismatch")
+
+
 def validate_payload(event_type: str, payload: Any) -> None:
     """Validate a decrypted typed payload for *event_type*.
 
@@ -257,6 +298,8 @@ def validate_payload(event_type: str, payload: Any) -> None:
         _check_emoji(payload)
     elif event_type == "poll.created":
         _check_poll_choices(payload)
+    elif event_type == "message.created":
+        _check_attachment(payload)
 
 
 def check_envelope_size(data: bytes) -> None:
